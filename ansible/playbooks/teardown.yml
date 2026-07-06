@@ -7,6 +7,7 @@
 - name: Stop Spur daemons
   # Include the accounting host too, in case it is a dedicated node not in either group.
   hosts: "spur_controllers:spur_agents:{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  become: true
   gather_facts: no
   tasks:
     - name: Stop and disable Spur systemd services

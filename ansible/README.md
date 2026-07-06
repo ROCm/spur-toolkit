@@ -67,7 +67,9 @@ ansible-galaxy collection install -r requirements.yml
 python3 -m pip install --user netaddr
 ```
 
-Target hosts need: SSH reachable, sudo or root, `systemd`, and (for the `install.sh` fallback path only) `curl` + `tar`.
+Target hosts need: SSH reachable, sudo or root, `systemd`, and (for the `install.sh` fallback path only) `curl` + `tar`. Every play runs with `become: true`, so a non-root `ansible_user` with passwordless (or `ansible_become_password`-supplied) sudo works the same as `ansible_user=root` — this is required since `spur_home`/`spur_install_dir` default under `/root`, which a non-root user can't write to without becoming root.
+
+Password-based SSH (`ansible_password`, via `sshpass`) works too — set `ansible_user`/`ansible_password` in `[all:vars]` or per-host. `ansible.cfg`'s `ssh_args` intentionally omits `BatchMode=yes`: that option suppresses SSH's password prompt entirely and silently breaks password auth even though sshpass is supplying the answer.
 
 ### 4. Write your inventory
 
@@ -240,7 +242,7 @@ Job submission still works without accounting — only `sacct`/fairshare are una
 
 ---
 
-## Variables (defaults in `group_vars/all.yml`)
+## Variables (defaults in `inventory/group_vars/all.yml`)
 
 | Variable | Default | What it does |
 |---|---|---|

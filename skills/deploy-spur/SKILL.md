@@ -33,9 +33,10 @@ Defaults (override only if the user asks):
 | `TRANSPORT` | `direct` (LAN) — or `wireguard` for an encrypted mesh |
 | SSH user | `root` (unless the user specifies otherwise) |
 
-> These commands assume passwordless `sudo` (or SSH as root). If the SSH user is non-root, prefix privileged commands with `sudo` and confirm they have it. systemd unit installs, apt, and `/etc/systemd/system` writes all require root.
->
-> **Non-root SSH + install dir under `/root`:** when `SPUR_INSTALL_DIR` is `/root/.local/bin` (the default) but you SSH as a non-root user, `/root` is mode 700 — the SSH user cannot even *execute* the binaries. In that case **every `spur`/`sbatch`/… CLI invocation must also be `sudo`-prefixed**, not just the file-writing steps. Alternatively set `SPUR_INSTALL_DIR` to a world-readable path (e.g. `/usr/local/bin`). Writing unit files and `spur.conf` needs `sudo tee` or scp-to-`/tmp`-then-`sudo install`, since heredoc redirects run as the SSH user.
+> Every command below is written to work whether the SSH user is `root` or a non-root user with (passwordless) `sudo` — confirm `sudo -n true` succeeds during Step 1's preflight. `SPUR_HOME`/`SPUR_INSTALL_DIR` default under `/root`, which is mode `0700`: a non-root user cannot even `cd`/execute/`test -x` into it, let alone write there, and **no `chown` of a subdirectory fixes this** (the block is on traversing `/root` itself). So:
+> - Every remote command that reads/writes under `/root`, `/etc/systemd/system`, or runs `spur`/`sbatch`/`sacct`/etc. must be `sudo`-prefixed — not just the file-writing steps. This applies uniformly (as root, `sudo` is a harmless no-op).
+> - `scp` and heredoc redirects (`cat > /path <<EOF`) run as the plain SSH user and cannot land a file directly under `/root` even with the SSH user later `sudo`-reading it. Copy to `/tmp` first, then `sudo install`/`sudo mv` it into place.
+> - Alternatively, set `SPUR_INSTALL_DIR`/`SPUR_HOME` to a world-traversable path (e.g. `/opt/spur`) up front to sidestep all of this — but then every install/`sudo` note below is still harmless, just unnecessary.
 
 ## Step 0: gather inputs (MANDATORY — do not skip)
 
@@ -130,29 +131,30 @@ Two sources, same as the playbook. `SPUR_BINARY_SRC` (a local dir holding pre-bu
 for tgt in "${HOSTS_ALL[@]}"; do
   ssh "$tgt" "
     set -euo pipefail
-    mkdir -p ${SPUR_HOME} ${SPUR_HOME}/state ${SPUR_HOME}/log ${SPUR_HOME}/etc ${SPUR_INSTALL_DIR}
+    sudo mkdir -p ${SPUR_HOME} ${SPUR_HOME}/state ${SPUR_HOME}/log ${SPUR_HOME}/etc ${SPUR_INSTALL_DIR}
   "
   if [ -n "$SPUR_BINARY_SRC" ]; then
-    # Push pre-built binaries from the operator box.
+    # Push pre-built binaries from the operator box. scp can't land a file directly under
+    # /root (it runs as the plain SSH user), so stage in /tmp and sudo-install from there.
     for b in spur spurctld spurd spurdbd; do
-      scp -q "${SPUR_BINARY_SRC}/${b}" "${tgt}:${SPUR_INSTALL_DIR}/${b}"
+      scp -q "${SPUR_BINARY_SRC}/${b}" "${tgt}:/tmp/${b}.spur-push"
+      ssh "$tgt" "sudo install -m 0755 /tmp/${b}.spur-push ${SPUR_INSTALL_DIR}/${b} && rm -f /tmp/${b}.spur-push"
     done
-    ssh "$tgt" "chmod 0755 ${SPUR_INSTALL_DIR}/spur ${SPUR_INSTALL_DIR}/spurctld ${SPUR_INSTALL_DIR}/spurd ${SPUR_INSTALL_DIR}/spurdbd"
   else
     ssh "$tgt" "
       set -euo pipefail
-      if [ ! -x ${SPUR_INSTALL_DIR}/spur ]; then
+      if ! sudo test -x ${SPUR_INSTALL_DIR}/spur; then
         curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh \
-          | INSTALL_DIR=${SPUR_INSTALL_DIR} bash -s -- ${SPUR_VERSION}
+          | sudo INSTALL_DIR=${SPUR_INSTALL_DIR} bash -s -- ${SPUR_VERSION}
       fi
     "
   fi
   # Verify + create Slurm-compatible symlinks (the single `spur` binary dispatches on argv[0]).
   ssh "$tgt" "
     set -euo pipefail
-    test -x ${SPUR_INSTALL_DIR}/spur || { echo 'spur binary missing after install' >&2; exit 1; }
+    sudo test -x ${SPUR_INSTALL_DIR}/spur || { echo 'spur binary missing after install' >&2; exit 1; }
     for n in sbatch squeue sinfo scancel sacct scontrol salloc srun; do
-      ln -sf ${SPUR_INSTALL_DIR}/spur ${SPUR_INSTALL_DIR}/\$n
+      sudo ln -sf ${SPUR_INSTALL_DIR}/spur ${SPUR_INSTALL_DIR}/\$n
     done
     echo 'spur installed + symlinks created'
   "
@@ -201,11 +203,11 @@ Stop via systemd if a unit exists, and belt-and-suspenders `pkill -x` (exact nam
 for tgt in "${HOSTS_ALL[@]}"; do
   ssh "$tgt" '
     for svc in spurd spurctld spurdbd; do
-      systemctl stop "$svc" 2>/dev/null || true
+      sudo systemctl stop "$svc" 2>/dev/null || true
     done
-    pkill -x spurd 2>/dev/null || true
-    pkill -x spurctld 2>/dev/null || true
-    pkill -x spurdbd 2>/dev/null || true
+    sudo pkill -x spurd 2>/dev/null || true
+    sudo pkill -x spurctld 2>/dev/null || true
+    sudo pkill -x spurdbd 2>/dev/null || true
     for i in $(seq 1 10); do
       pgrep -x spurctld >/dev/null || pgrep -x spurd >/dev/null || pgrep -x spurdbd >/dev/null || exit 0
       sleep 0.5
@@ -217,7 +219,7 @@ done
 # Wipe Raft state on controllers BEFORE start (so spurctld does not rewrite the log we delete).
 if [ "$SPUR_WIPE_STATE" = true ]; then
   for tgt in "${CONTROLLERS[@]}"; do
-    ssh "$tgt" "rm -rf ${SPUR_HOME}/state && mkdir -p ${SPUR_HOME}/state"
+    ssh "$tgt" "sudo rm -rf ${SPUR_HOME}/state && sudo mkdir -p ${SPUR_HOME}/state"
   done
 fi
 ```
@@ -235,20 +237,22 @@ if [ "$ACCOUNTING" = true ]; then
     export DEBIAN_FRONTEND=noninteractive
     # Install PostgreSQL (Debian/Ubuntu). For RHEL, swap in dnf + postgresql-server + initdb.
     if ! command -v psql >/dev/null 2>&1; then
-      apt-get update -qq
-      apt-get install -y -qq postgresql postgresql-contrib
+      sudo apt-get update -qq
+      sudo apt-get install -y -qq postgresql postgresql-contrib
     fi
-    systemctl enable --now postgresql
+    sudo systemctl enable --now postgresql
     # Create role + DB idempotently via the postgres superuser.
     sudo -u postgres psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='${ACCT_DB_USER}'\" | grep -q 1 \
       || sudo -u postgres psql -c \"CREATE ROLE ${ACCT_DB_USER} LOGIN PASSWORD '${ACCT_DB_PASSWORD}'\"
     sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${ACCT_DB_NAME}'\" | grep -q 1 \
       || sudo -u postgres psql -c \"CREATE DATABASE ${ACCT_DB_NAME} OWNER ${ACCT_DB_USER}\"
-    test -x ${SPUR_INSTALL_DIR}/spurdbd || { echo 'spurdbd binary missing — install it or set ACCOUNTING=false' >&2; exit 1; }
+    sudo test -x ${SPUR_INSTALL_DIR}/spurdbd || { echo 'spurdbd binary missing — install it or set ACCOUNTING=false' >&2; exit 1; }
   "
 
   # Install + start the spurdbd systemd unit. --migrate creates the accounting tables.
-  ssh "$ACCT_HOST" "cat > /etc/systemd/system/spurdbd.service <<UNIT
+  # Written to /tmp then sudo-installed: a plain heredoc redirect can't land a file
+  # under /etc/systemd/system when the SSH user isn't root.
+  ssh "$ACCT_HOST" "cat > /tmp/spurdbd.service.tmp <<'UNIT'
 [Unit]
 Description=Spur Accounting Daemon (spurdbd)
 After=network-online.target postgresql.service
@@ -266,9 +270,10 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
-  systemctl enable spurdbd
-  systemctl restart spurdbd
+  sudo mv /tmp/spurdbd.service.tmp /etc/systemd/system/spurdbd.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable spurdbd
+  sudo systemctl restart spurdbd
   for i in \$(seq 1 30); do ss -tlnH | grep -q ':${SPUR_ACCT_PORT}\b' && { echo 'spurdbd up'; break; }; sleep 1; [ \$i -eq 30 ] && { echo 'spurdbd did not bind ${SPUR_ACCT_PORT}' >&2; exit 1; }; done
   "
 fi
@@ -340,11 +345,14 @@ default = true
 nodes = "${part_csv}"
 max_time = "INFINITE"
 EOF
-  scp -q "$tmp" "$ctl:${SPUR_HOME}/etc/spur.conf"
+  # scp can't land a file directly under /root — stage in /tmp and sudo-move it into place.
+  scp -q "$tmp" "$ctl:/tmp/spur.conf.push"
+  ssh "$ctl" "sudo mkdir -p ${SPUR_HOME}/etc && sudo mv /tmp/spur.conf.push ${SPUR_HOME}/etc/spur.conf"
   rm -f "$tmp"
 
-  # Install + (re)start the spurctld systemd unit.
-  ssh "$ctl" "cat > /etc/systemd/system/spurctld.service <<UNIT
+  # Install + (re)start the spurctld systemd unit. Same /tmp-then-sudo-mv pattern as spur.conf —
+  # a plain heredoc redirect can't write to /etc/systemd/system as a non-root SSH user.
+  ssh "$ctl" "cat > /tmp/spurctld.service.tmp <<'UNIT'
 [Unit]
 Description=Spur Controller Daemon (spurctld)
 After=network-online.target
@@ -363,9 +371,10 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
-  systemctl enable spurctld
-  systemctl restart spurctld
+  sudo mv /tmp/spurctld.service.tmp /etc/systemd/system/spurctld.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable spurctld
+  sudo systemctl restart spurctld
   "
 done
 
@@ -381,8 +390,7 @@ done
 if $ha_enabled; then
   ssh "${CONTROLLERS[0]}" "
     for i in \$(seq 1 60); do
-      # NOTE: prefix with sudo if the install dir is under /root and you SSH non-root.
-      out=\$(${SPUR_INSTALL_DIR}/spur nodes 2>&1); rc=\$?
+      out=\$(sudo ${SPUR_INSTALL_DIR}/spur nodes 2>&1); rc=\$?
       # Ready only when the command SUCCEEDS and the output has a real node table.
       # Gate on rc==0 too — a Permission denied / crash must NOT be read as 'leader up'.
       if [ \$rc -eq 0 ] && ! echo \"\$out\" | grep -qE 'no leader|not the Raft leader|cannot reach leader|transport error|Connection refused|Permission denied'; then
@@ -418,7 +426,9 @@ done
 ```bash
 CTL0="${IP[${CONTROLLERS[0]}]}"
 for ag in "${AGENTS[@]}"; do
-  ssh "$ag" "cat > /etc/systemd/system/spurd.service <<UNIT
+  # /tmp-then-sudo-mv: a plain heredoc redirect can't write to /etc/systemd/system as a
+  # non-root SSH user.
+  ssh "$ag" "cat > /tmp/spurd.service.tmp <<'UNIT'
 [Unit]
 Description=Spur Node Agent (spurd)
 After=network-online.target
@@ -437,9 +447,10 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
-  systemctl enable spurd
-  systemctl restart spurd
+  sudo mv /tmp/spurd.service.tmp /etc/systemd/system/spurd.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable spurd
+  sudo systemctl restart spurd
   for i in \$(seq 1 30); do ss -tlnH | grep -q ':${SPUR_AGENT_PORT}\b' && exit 0; sleep 1; done
   echo 'spurd did not bind ${SPUR_AGENT_PORT}' >&2; exit 1
   "
@@ -453,7 +464,7 @@ done
 ```bash
 for ag in "${AGENTS[@]}"; do
   for i in $(seq 1 30); do
-    if ssh "${CONTROLLERS[0]}" "${SPUR_INSTALL_DIR}/spur show node ${SHORT[$ag]} >/dev/null 2>&1"; then
+    if ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/spur show node ${SHORT[$ag]} >/dev/null 2>&1"; then
       echo "${SHORT[$ag]} registered"; break
     fi
     [ $i -eq 30 ] && { echo "${SHORT[$ag]} never registered" >&2; exit 1; }
@@ -467,17 +478,22 @@ done
 ### Single-node job (every deploy)
 
 ```bash
-ssh "${CONTROLLERS[0]}" "cat > /tmp/spur-test-single.sh <<'EOF'
+ssh "${CONTROLLERS[0]}" "
+sudo rm -f /tmp/spur-test-single.sh   # a same-named file from an earlier/unrelated deploy on a
+                                       # shared host can be root-owned; the plain cat> below would
+                                       # then fail *silently* (no set -e here) and re-run the stale
+                                       # script instead of this one.
+cat > /tmp/spur-test-single.sh <<'EOF'
 #!/bin/bash
 #SBATCH --job-name=spur-test-single
 echo \"ran on \$(hostname) at \$(date)\"
 EOF
-chmod +x /tmp/spur-test-single.sh
+chmod +x /tmp/spur-test-single.sh || { echo 'failed to write test script' >&2; exit 1; }
 cd /tmp   # predictable, world-accessible WorkDir; job stdout -> /tmp/spur-<JOBID>.out. Do NOT cd into a 0700 dir like /root/spur when SSHing non-root.
-jid=\$(${SPUR_INSTALL_DIR}/spur submit /tmp/spur-test-single.sh | grep -oE '[0-9]+')
+jid=\$(sudo ${SPUR_INSTALL_DIR}/spur submit /tmp/spur-test-single.sh | grep -oE '[0-9]+')
 echo \"JOBID=\$jid\"
 for i in \$(seq 1 30); do
-  st=\$(${SPUR_INSTALL_DIR}/spur show job \$jid 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
+  st=\$(sudo ${SPUR_INSTALL_DIR}/spur show job \$jid 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
   case \"\$st\" in COMPLETED) echo OK; break ;; FAILED|CANCELLED|TIMEOUT|NODE_FAIL) echo \"BAD: \$st\" >&2; exit 1 ;; esac
   sleep 1
 done
@@ -493,7 +509,9 @@ Output lands in `spur-<JOBID>.out` on whichever agent ran the job, in the job's 
 
 ```bash
 N=${#AGENTS[@]}
-ssh "${CONTROLLERS[0]}" "cat > /tmp/spur-test-multi.sh <<'EOF'
+ssh "${CONTROLLERS[0]}" "
+sudo rm -f /tmp/spur-test-multi.sh   # see single-node note on stale-file collisions
+cat > /tmp/spur-test-multi.sh <<'EOF'
 #!/bin/bash
 #SBATCH --job-name=spur-test-multi
 #SBATCH -N __N__
@@ -501,27 +519,38 @@ ssh "${CONTROLLERS[0]}" "cat > /tmp/spur-test-multi.sh <<'EOF'
 echo \"node \$SPUR_TASK_OFFSET of \$SPUR_NUM_NODES on \$(hostname); peers=\$SPUR_PEER_NODES\"
 EOF
 sed -i 's/__N__/${N}/' /tmp/spur-test-multi.sh
-chmod +x /tmp/spur-test-multi.sh
+chmod +x /tmp/spur-test-multi.sh || { echo 'failed to write test script' >&2; exit 1; }
 cd /tmp   # predictable WorkDir (see single-node note); output -> /tmp/spur-<JOBID>.out per node
-jid=\$(${SPUR_INSTALL_DIR}/spur submit /tmp/spur-test-multi.sh | grep -oE '[0-9]+')
+jid=\$(sudo ${SPUR_INSTALL_DIR}/spur submit /tmp/spur-test-multi.sh | grep -oE '[0-9]+')
 echo \"JOBID=\$jid\"
 for i in \$(seq 1 60); do
-  st=\$(${SPUR_INSTALL_DIR}/spur show job \$jid 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
+  st=\$(sudo ${SPUR_INSTALL_DIR}/spur show job \$jid 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
   case \"\$st\" in COMPLETED) echo OK; break ;; FAILED|CANCELLED|TIMEOUT|NODE_FAIL) echo \"BAD: \$st\" >&2; exit 1 ;; esac
   sleep 1
 done
+if [ \"\$st\" != COMPLETED ]; then
+  echo \"multi-node job stuck in state '\$st' after 60s. Likely cause: a leftover per-job scratch\" >&2
+  echo \"file (.spur_job_<id>.sh) in an agent's WorkDir from an earlier deploy/job-id reset that\" >&2
+  echo \"can't be overwritten, so that agent rejects dispatch ('failed to write job script') and\" >&2
+  echo \"the job sits in COMPLETING forever (node stays 'mix', not 'idle'). Fix: sudo cancel the\" >&2
+  echo \"job (sudo ${SPUR_INSTALL_DIR}/spur cancel \$jid), sudo rm -f any stale .spur_job_*.sh in\" >&2
+  echo \"/tmp on each agent, and resubmit.\" >&2
+  exit 1
+fi
 "
-# Multi-node writes locally on each node — fetch from every agent.
+# Multi-node writes locally on each node, in the job's WorkDir (here /tmp, since the submit
+# above cd'd there) — NOT ${SPUR_HOME}. Fetch from every agent, checking both locations since
+# WorkingDirectory=${SPUR_HOME} in the spurd unit is only a fallback if WorkDir is unavailable.
 for ag in "${AGENTS[@]}"; do
   echo "=== ${SHORT[$ag]} ==="
-  ssh "$ag" "ls ${SPUR_HOME}/spur-*.out 2>/dev/null | xargs -r tail -n +1"
+  ssh "$ag" "sudo find /tmp ${SPUR_HOME} -maxdepth 2 -name 'spur-*.out' 2>/dev/null -exec sudo cat {} \;"
 done
 ```
 
 ### Accounting check (when `ACCOUNTING=true`)
 
 ```bash
-ssh "${CONTROLLERS[0]}" "${SPUR_INSTALL_DIR}/sacct | head"   # sacct works from any controller (gRPC to spurdbd)
+ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/sacct | head"   # sacct works from any controller (gRPC to spurdbd)
 ssh "$ACCT_HOST" "sudo -u postgres psql -d ${ACCT_DB_NAME} -tAc 'SELECT count(*) FROM jobs;'"   # postgres lives on ACCT_HOST
 ```
 Expect a row per completed job. (With `ACCOUNTING=false`, `sacct` is expected to fail — that's fine; jobs still run.)
@@ -529,8 +558,8 @@ Expect a row per completed job. (With `ACCOUNTING=false`, `sacct` is expected to
 ## Step 10: verify
 
 ```bash
-ssh "${CONTROLLERS[0]}" "${SPUR_INSTALL_DIR}/spur nodes"
-ssh "${CONTROLLERS[0]}" "${SPUR_INSTALL_DIR}/spur queue"
+ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/spur nodes"
+ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/spur queue"
 
 # Every daemon should be systemd-active.
 for ctl in "${CONTROLLERS[@]}"; do ssh "$ctl" "systemctl is-active spurctld"; done
@@ -559,12 +588,12 @@ done
 ```bash
 for tgt in "${HOSTS_ALL[@]}"; do
   ssh "$tgt" "
-    for svc in spurd spurctld spurdbd; do systemctl disable --now \$svc 2>/dev/null || true; done
-    pkill -x spurd 2>/dev/null; pkill -x spurctld 2>/dev/null; pkill -x spurdbd 2>/dev/null
-    rm -f /etc/systemd/system/spurd.service /etc/systemd/system/spurctld.service /etc/systemd/system/spurdbd.service
-    systemctl daemon-reload 2>/dev/null || true
-    rm -rf ${SPUR_HOME}
-    rm -f /root/spur-*.out ${SPUR_INSTALL_DIR}/spur-*.out /tmp/spur-*.out
+    for svc in spurd spurctld spurdbd; do sudo systemctl disable --now \$svc 2>/dev/null || true; done
+    sudo pkill -x spurd 2>/dev/null; sudo pkill -x spurctld 2>/dev/null; sudo pkill -x spurdbd 2>/dev/null
+    sudo rm -f /etc/systemd/system/spurd.service /etc/systemd/system/spurctld.service /etc/systemd/system/spurdbd.service
+    sudo systemctl daemon-reload 2>/dev/null || true
+    sudo rm -rf ${SPUR_HOME}
+    sudo rm -f /root/spur-*.out ${SPUR_INSTALL_DIR}/spur-*.out /tmp/spur-*.out
   "
 done
 ```
@@ -593,10 +622,12 @@ To also remove accounting data (destructive): `ssh "$ACCT_HOST" "sudo -u postgre
 ### Spur quirks
 - **Output file `spur-<N>.out` goes to the job's `WorkDir` = the CWD at submit time.** Submitting from `/tmp` writes `/tmp/spur-<N>.out`; submitting from the SSH user's home writes it there. Do NOT `cd` into a 0700 dir (e.g. `/root/spur`) when SSHing as a non-root user — the `cd` fails and WorkDir silently becomes the user's home. Pin the submit CWD to `/tmp` for predictability, and search `/tmp /home /root ${SPUR_HOME}` when hunting for output.
 - **`spur nodes` collapses by partition.** To verify per-host registration, loop `spur show node <name>`.
-- **`spur show node <name>` is a prefix match**, not exact. Colliding prefixes (`gpu-a` vs `gpu-ab`) return both; disambiguate with `awk -v n=<name> '/^NodeName=/{p=($0=="NodeName="n)} p'`.
+- **`spur show node <name>` does not filter server-side at all — it prints every registered node regardless of the argument.** (Tested against Spur 0.3.0; treat the "prefix match" framing as describing symptom, not mechanism.) Always pipe through `awk -v n=<name> '/^NodeName=/{p=($0=="NodeName="n)} p'` to isolate one node's block — this is required for correctness, not just to break prefix ties.
 - **`spur show job` uses `JobState=COMPLETED` (uppercase).** Parse `JobState=[A-Z]+`.
 - **Raft port 6821 is hardcoded** in spurctld (not a CLI flag). Preflight must include it.
 - **Harmless log spam `invalid transition from Completed to Completed`** on followers after multi-node jobs — the job actually succeeded.
+- **`$SPUR_NUM_NODES` is not set in the job environment** (as of Spur 0.3.0) even in multi-node jobs — only `$SPUR_TASK_OFFSET` and `$SPUR_PEER_NODES` are populated. A smoke-test script referencing it will print an empty value; don't treat that as a failure signal.
+- **A per-job scratch file (e.g. `.spur_job_<id>.sh`) can be left behind in an agent's WorkDir** and, on a shared/reused host, block a later job with a different id from writing its own script (`agent rejected job: failed to write job script`). The job then sits in `COMPLETING` forever and the node shows `mix` instead of `idle` — there's no automatic timeout/recovery. Fix by `spur cancel <jobid>` and removing the stale scratch file by hand; teardown (Step 11) does not clean these up since it only removes `${SPUR_HOME}` and `*.out` files, not arbitrary WorkDirs.
 
 ### Multi-node / HA specifics
 - **Agent `--hostname` must match the `[[nodes]]` name in `spur.conf`** and `spur show node <name>`. Use `hostname -s` consistently.

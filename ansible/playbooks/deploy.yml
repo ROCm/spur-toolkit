@@ -15,6 +15,7 @@
   # Include the accounting host so a dedicated (non-controller/agent) accounting
   # node still gets the spurdbd binary.
   hosts: "spur_controllers:spur_agents:{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  become: true
   gather_facts: yes
   any_errors_fatal: true
   roles:
@@ -22,6 +23,7 @@
 
 - name: Configure WireGuard mesh (when spur_transport == wireguard)
   hosts: spur_controllers:spur_agents
+  become: true
   gather_facts: no
   any_errors_fatal: true
   roles:
@@ -34,6 +36,7 @@
   # cluster; it runs on spur_accounting_host (default: first controller, but may be
   # any managed host incl. a dedicated node). Set spur_accounting_enabled=false to skip.
   hosts: "{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  become: true
   gather_facts: yes
   any_errors_fatal: true
   roles:
@@ -42,6 +45,7 @@
 
 - name: Start controller
   hosts: spur_controllers
+  become: true
   gather_facts: no
   any_errors_fatal: true
   roles:
@@ -49,6 +53,7 @@
 
 - name: Start agents
   hosts: spur_agents
+  become: true
   gather_facts: no
   any_errors_fatal: true
   serial: 0      # parallel
@@ -57,6 +62,7 @@
 
 - name: Verify with test jobs
   hosts: spur_controllers[0]
+  become: true
   gather_facts: no
   roles:
     - role: spur_verify
