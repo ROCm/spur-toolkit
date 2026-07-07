@@ -1,0 +1,13 @@
+{
+  "name": "spur-toolkit",
+  "version": "0.1.0",
+  "description": "Tools to deploy and debug Spur, an AI-native job scheduler.",
+  "author": {
+    "name": "ROCm"
+  },
+  "homepage": "https://github.com/ROCm/spur-toolkit",
+  "repository": "https://github.com/ROCm/spur-toolkit",
+  "license": "Apache-2.0",
+  "keywords": ["spur", "rocm", "deployment", "ansible"],
+  "skills": "./skills/"
+}

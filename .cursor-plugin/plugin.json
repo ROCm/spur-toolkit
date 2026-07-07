@@ -1,0 +1,9 @@
+{
+  "name": "spur-toolkit",
+  "version": "0.1.0",
+  "description": "Tools to deploy and debug Spur, an AI-native job scheduler.",
+  "author": {
+    "name": "ROCm"
+  },
+  "skills": "./skills/"
+}
