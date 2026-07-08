@@ -104,7 +104,8 @@
   when: spur_accounting_enabled | bool
 
 - name: Locate the PostgreSQL config file
-  ansible.builtin.shell: "find /etc/postgresql -maxdepth 2 -name postgresql.conf | head -1"
+  # /etc/postgresql/<version>/main/postgresql.conf is 3 levels below /etc/postgresql.
+  ansible.builtin.shell: "find /etc/postgresql -maxdepth 3 -name postgresql.conf | head -1"
   args:
     executable: /bin/bash
   register: pg_conf_find

@@ -35,6 +35,16 @@
       changed_when: false
       failed_when: spur_pre_upgrade_health.rc != 0
 
+# spur_controller re-renders spur.conf on every controller it touches, which
+# needs ansible_hostname for every agent (the [[nodes]] block) — gather facts
+# for the whole cluster up front rather than only as each play's hosts are
+# reached, the same as deploy.yml's first play does.
+- name: Gather facts across the whole cluster
+  hosts: spur_controllers:spur_agents
+  become: true
+  gather_facts: yes
+  tasks: []
+
 - name: Rolling upgrade — controllers, one at a time (preserves Raft quorum)
   hosts: spur_controllers
   become: true
