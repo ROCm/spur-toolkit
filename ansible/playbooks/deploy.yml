@@ -43,8 +43,11 @@
   gather_facts: yes
   any_errors_fatal: true
   roles:
+    # No role-level `when` here: spur_accounting's pre-merge spurdbd cleanup tasks
+    # are intentionally unconditional (see the role's tasks/main.yml), and a
+    # role-level `when` would AND itself onto every task in the role, including
+    # those — gating happens per-task inside the role instead.
     - role: spur_accounting
-      when: spur_accounting_enabled | bool
 
 - name: Start controller
   hosts: spur_controllers

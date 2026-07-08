@@ -86,6 +86,7 @@ SPUR_BINARY_SRC=                                     # e.g. /tmp/spur-bin to pus
 SPUR_CONTROLLER_PORT=6817; SPUR_AGENT_PORT=6818; SPUR_RAFT_PORT=6821; ACCT_DB_PORT=5432
 SPUR_CLUSTER_NAME=spur-cluster; SPUR_LOG_LEVEL=info; SPUR_WIPE_STATE=false
 ACCT_DB_NAME=spur; ACCT_DB_USER=spur; ACCT_DB_PASSWORD=spur
+ROLLING_BATCH_SIZE=1                                  # Step 12 only — agents upgraded per batch
 
 HOSTS_ALL=( $(printf '%s\n' "${CONTROLLERS[@]}" "${AGENTS[@]}" | sort -u) )
 ha_enabled=false; [ ${#CONTROLLERS[@]} -gt 1 ] && ha_enabled=true
@@ -236,10 +237,13 @@ Because every controller — not just `ACCT_HOST` — connects to this Postgres 
 
 ```bash
 # pg_hba lines granting each controller's IP access to the spur DB — built locally,
-# same pattern as the [[nodes]] blocks / CSVs in Step 6.
-pg_hba_lines=""
+# same pattern as the [[nodes]] blocks / CSVs in Step 6. Each is its own dedup-append
+# statement (grep -qxF before appending) so re-running Step 5 doesn't pile up duplicate
+# lines the way a bare `tee -a` would — mirrors Ansible's lineinfile exact-match semantics.
+pg_hba_appends=""
 for h in "${CONTROLLERS[@]}"; do
-  pg_hba_lines+="host    ${ACCT_DB_NAME}    ${ACCT_DB_USER}    ${IP[$h]:-${h#*@}}/32    scram-sha-256"$'\n'
+  line="host    ${ACCT_DB_NAME}    ${ACCT_DB_USER}    ${IP[$h]:-${h#*@}}/32    scram-sha-256"
+  pg_hba_appends+="grep -qxF '${line}' \"\$pg_hba\" || echo '${line}' | sudo tee -a \"\$pg_hba\" >/dev/null"$'\n'
 done
 
 if [ "$ACCOUNTING" = true ]; then
@@ -259,11 +263,12 @@ if [ "$ACCOUNTING" = true ]; then
       || sudo -u postgres psql -c \"CREATE DATABASE ${ACCT_DB_NAME} OWNER ${ACCT_DB_USER}\"
 
     # Listen on all interfaces and allow every controller's IP to authenticate.
-    pg_conf=\$(sudo find /etc/postgresql -maxdepth 2 -name postgresql.conf | head -1)
+    # /etc/postgresql/<version>/main/postgresql.conf is 3 levels below /etc/postgresql.
+    pg_conf=\$(sudo find /etc/postgresql -maxdepth 3 -name postgresql.conf | head -1)
     pg_hba=\$(dirname \"\$pg_conf\")/pg_hba.conf
     sudo sed -i \"s/^#\\?\\s*listen_addresses\\s*=.*/listen_addresses = '*'/\" \"\$pg_conf\"
     grep -q listen_addresses \"\$pg_conf\" || echo \"listen_addresses = '*'\" | sudo tee -a \"\$pg_conf\" >/dev/null
-    printf '%s' '${pg_hba_lines}' | sudo tee -a \"\$pg_hba\" >/dev/null
+    ${pg_hba_appends}
     sudo systemctl restart postgresql
     for i in \$(seq 1 30); do ss -tlnH | grep -q ':${ACCT_DB_PORT}\b' && { echo 'postgres up'; break; }; sleep 1; [ \$i -eq 30 ] && { echo 'postgres did not bind ${ACCT_DB_PORT}' >&2; exit 1; }; done
   "
@@ -611,7 +616,7 @@ To also remove accounting data (destructive): `ssh "$ACCT_HOST" "sudo -u postgre
 
 ## Step 12: rolling upgrade (only when asked to upgrade a live cluster)
 
-Use this instead of re-running Steps 1–9 when jobs are currently running and a full-cluster daemon bounce (which Steps 1-9 do — no draining, no batching) is not acceptable. Assumes the cluster is already up and healthy; refuse to proceed otherwise. Requires `SPUR_BINARY_SRC` pointing at the new build (rebuild all three binaries together — same caveat as any upgrade).
+Use this instead of re-running Steps 1–9 when jobs are currently running and a full-cluster daemon bounce (which Steps 1-9 do — no draining, no batching) is not acceptable. Assumes the cluster is already up and healthy; refuse to proceed otherwise. Requires `SPUR_BINARY_SRC` pointing at the new build (rebuild all three binaries together — same caveat as any upgrade). Only exercised so far with `TRANSPORT=direct`; the `IP[]` map this step reuses from Step 3 still needs to hold real addresses (`WG_IP[]` per Step 2b) for a wireguard cluster — re-derive it in this shell session first if it isn't already populated.
 
 ```bash
 # Guard rail: refuse a rolling upgrade if state would be wiped, or the cluster

@@ -2,8 +2,10 @@
 # Optional accounting stack: PostgreSQL only. Accounting itself now runs
 # in-process inside every spurctld (the standalone spurdbd daemon was folded
 # into spurctld upstream) and is served on the controller's own gRPC port.
-# Everything here is gated on spur_accounting_enabled so
-# `-e spur_accounting_enabled=false` skips the stack entirely.
+# Every task below is gated on spur_accounting_enabled (per-task, not at the
+# play's role-inclusion level — see deploy.yml) so `-e spur_accounting_enabled=false`
+# skips the Postgres stack, EXCEPT the pre-merge spurdbd cleanup tasks just below,
+# which intentionally run regardless.
 #
 # Because accounting lives inside each spurctld process rather than a single
 # co-located daemon, every controller — not just spur_accounting_host — needs a
@@ -155,6 +157,6 @@
 - name: Wait for PostgreSQL to accept TCP connections on {{ spur_accounting_db_port }}
   ansible.builtin.wait_for:
     port: "{{ spur_accounting_db_port }}"
-    host: "0.0.0.0"
+    host: "127.0.0.1"
     timeout: 30
   when: spur_accounting_enabled | bool

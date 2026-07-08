@@ -29,6 +29,21 @@
           Use deploy.yml for an intentional Raft reinit.
       when: spur_wipe_state | bool
 
+    # spur_wg_address is only ever populated by the spur_wireguard role's own
+    # set_fact (deploy.yml invokes it explicitly); this playbook doesn't run that
+    # role, so spur_controller/spur_agent's `hostvars[item].spur_wg_address` lookup
+    # would hit an undefined variable partway through a host and abort mid-upgrade.
+    # Fail fast here instead, before any host is touched.
+    - name: Fail if spur_transport is wireguard (not yet supported by rolling_upgrade.yml)
+      ansible.builtin.fail:
+        msg: >-
+          rolling_upgrade.yml does not yet support spur_transport=wireguard (it
+          doesn't re-derive spur_wg_address the way deploy.yml does). Use deploy.yml
+          for a wireguard cluster — it accepts the same spur_binary_src and is
+          non-destructive by default (spur_wipe_state=false), just without
+          rolling/drained batching.
+      when: spur_transport == 'wireguard'
+
     - name: Check the cluster is healthy before starting
       ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
       register: spur_pre_upgrade_health
