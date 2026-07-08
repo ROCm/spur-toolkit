@@ -12,9 +12,10 @@
 #   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini
 
 - name: Preflight + install Spur on all hosts
-  # Include the accounting host so a dedicated (non-controller/agent) accounting
-  # node still gets the spurdbd binary.
-  hosts: "spur_controllers:spur_agents:{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  # Accounting is embedded in spurctld now — a dedicated (non-controller/non-agent)
+  # accounting host runs only Postgres and needs no spur binaries, so it is not
+  # included here (spur_accounting role handles it independently).
+  hosts: "spur_controllers:spur_agents"
   become: true
   gather_facts: yes
   any_errors_fatal: true
@@ -30,11 +31,13 @@
     - role: spur_wireguard
       when: spur_transport == 'wireguard'
 
-- name: Deploy accounting stack (postgres + spurdbd) on the accounting host
-  # Runs BEFORE the controller so spurdbd is listening when spurctld starts and
-  # first tries to reach accounting. Accounting is a single service for the whole
-  # cluster; it runs on spur_accounting_host (default: first controller, but may be
-  # any managed host incl. a dedicated node). Set spur_accounting_enabled=false to skip.
+- name: Deploy accounting stack (PostgreSQL) on the accounting host
+  # Runs BEFORE the controllers so Postgres is reachable when spurctld starts and
+  # first tries to connect its embedded accounting service. Accounting is a single
+  # database for the whole cluster; Postgres runs on spur_accounting_host (default:
+  # first controller, but may be any managed host incl. a dedicated node). Every
+  # controller connects to it directly over the network. Set
+  # spur_accounting_enabled=false to skip the stack entirely.
   hosts: "{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
   become: true
   gather_facts: yes

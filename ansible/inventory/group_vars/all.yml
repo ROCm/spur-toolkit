@@ -20,10 +20,14 @@ spur_controller_port: 6817
 spur_agent_port: 6818
 spur_raft_port: 6821
 
-# Accounting (PostgreSQL + spurdbd). OPTIONAL — set spur_accounting_enabled: false to skip.
-# Single service for the whole cluster. Runs on spur_accounting_host (default: the
-# first controller), which may be any managed host — a controller, an agent, or a
-# dedicated node. Controllers report usage to it over gRPC; it owns the local postgres.
+# Accounting (PostgreSQL, embedded in spurctld). OPTIONAL — set
+# spur_accounting_enabled: false to skip. Single database for the whole cluster;
+# Postgres runs on spur_accounting_host (default: the first controller), which may
+# be any managed host — a controller, an agent, or a dedicated node. There is no
+# separate accounting daemon anymore (spurdbd was folded into spurctld upstream) —
+# every controller's spurctld connects to this Postgres directly and serves
+# accounting on its own gRPC port (6817), so Postgres must accept remote TCP
+# connections from every controller, not just localhost.
 spur_accounting_enabled: true
 # spur_accounting_host: set in inventory to pin the accounting node (any managed
 # host). Left unset here so an inventory value wins; defaults to the first
@@ -31,7 +35,12 @@ spur_accounting_enabled: true
 spur_accounting_db_name: spur
 spur_accounting_db_user: spur
 spur_accounting_db_password: spur
-spur_accounting_port: 6819
+spur_accounting_db_port: 5432
+
+# Set true (per-run, via -e) to force spur_install to re-pull/re-copy binaries onto
+# a host that already has them — used by rolling_upgrade.yml. deploy.yml leaves
+# this false so a fresh-install re-run doesn't needlessly reinstall.
+spur_force_reinstall: false
 
 # Logging
 spur_log_level: info
@@ -43,10 +52,10 @@ spur_wipe_state: false
 # In HA mode:
 #   - every controller is given a node_id (its 1-based position in groups['spur_controllers'])
 #   - spur.conf gets `peers = ["ctl1:6821", "ctl2:6821", ...]` (same order on every host)
-#   - agents are pointed at the FIRST controller; openraft forwards writes to the leader,
-#     but agents do not yet fail over to a different controller if the first one dies
-#     (Spur 0.3.0 limitation — `spurd --controller` takes a single URL). Put an L4 VIP /
-#     DNS round-robin in front of port 6817 for real failover. See README.
+#   - agents and the CLI are given every controller's address (comma-separated);
+#     spurd/spur-cli rotate to the next endpoint if one is unreachable, so a single
+#     surviving controller is enough — no VIP/DNS round-robin needed for basic
+#     failover (server-side leader forwarding handles writes from any controller).
 spur_ha_enabled: "{{ (groups.get('spur_controllers', []) | length) > 1 }}"
 
 # Whether the controller node also runs spurd (lets controller be a compute target).

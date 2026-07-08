@@ -1,7 +1,41 @@
 ---
-# Optional accounting stack: PostgreSQL + spurdbd. Runs on the first controller only
-# (accounting is a single service for the whole cluster). Everything is gated on
-# spur_accounting_enabled so `-e spur_accounting_enabled=false` skips the stack entirely.
+# Optional accounting stack: PostgreSQL only. Accounting itself now runs
+# in-process inside every spurctld (the standalone spurdbd daemon was folded
+# into spurctld upstream) and is served on the controller's own gRPC port.
+# Everything here is gated on spur_accounting_enabled so
+# `-e spur_accounting_enabled=false` skips the stack entirely.
+#
+# Because accounting lives inside each spurctld process rather than a single
+# co-located daemon, every controller — not just spur_accounting_host — needs a
+# network path to this database, so Postgres is configured to accept remote
+# TCP connections from every controller (scoped by IP, not opened globally).
+
+# --- Migration cleanup: this host is where a pre-merge deployment would have
+# --- run the standalone spurdbd daemon. Unconditional (not gated on
+# --- spur_accounting_enabled) so disabling accounting during an upgrade still
+# --- cleans up an old spurdbd left running from before the merge.
+- name: Stop and disable any leftover spurdbd from a pre-merge deployment
+  ansible.builtin.systemd:
+    name: spurdbd
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: Remove leftover spurdbd systemd unit file
+  ansible.builtin.file:
+    path: /etc/systemd/system/spurdbd.service
+    state: absent
+  register: spur_spurdbd_unit_removed
+
+- name: Reload systemd after removing the spurdbd unit
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: spur_spurdbd_unit_removed.changed
+
+- name: Remove leftover spurdbd binary from a pre-merge deployment
+  ansible.builtin.file:
+    path: "{{ spur_install_dir }}/spurdbd"
+    state: absent
 
 - name: Install PostgreSQL
   ansible.builtin.apt:
@@ -58,45 +92,68 @@
     - spur_accounting_enabled | bool
     - spur_db_check.stdout | trim != "1"
 
-- name: Verify spurdbd binary is present
-  ansible.builtin.stat:
-    path: "{{ spur_install_dir }}/spurdbd"
-  register: spurdbd_bin
+# --- Remote access: every controller's embedded accounting service connects
+# --- directly to this Postgres, so it must accept TCP from each of them.
+- name: Compute each controller's advertised address (for pg_hba, may include this host)
+  ansible.builtin.set_fact:
+    spur_controller_pg_addrs: >-
+      {{ (spur_controller_pg_addrs | default([])) +
+         [ hostvars[item].spur_wg_address if spur_transport == 'wireguard'
+           else (hostvars[item].ansible_host | default(hostvars[item].ansible_default_ipv4.address)) ] }}
+  loop: "{{ groups['spur_controllers'] }}"
   when: spur_accounting_enabled | bool
 
-- name: Fail if spurdbd binary is missing
-  ansible.builtin.fail:
-    msg: >-
-      spurdbd binary not found at {{ spur_install_dir }}/spurdbd. The upstream
-      install.sh should install it alongside spur/spurctld/spurd — re-run the
-      installer or disable accounting with spur_accounting_enabled=false.
+- name: Locate the PostgreSQL config file
+  ansible.builtin.shell: "find /etc/postgresql -maxdepth 2 -name postgresql.conf | head -1"
+  args:
+    executable: /bin/bash
+  register: pg_conf_find
+  changed_when: false
+  when: spur_accounting_enabled | bool
+
+- name: Set PostgreSQL config paths
+  ansible.builtin.set_fact:
+    spur_pg_conf_file: "{{ pg_conf_find.stdout }}"
+    spur_pg_hba_file: "{{ pg_conf_find.stdout | dirname }}/pg_hba.conf"
   when:
     - spur_accounting_enabled | bool
-    - not spurdbd_bin.stat.exists
+    - pg_conf_find.stdout | default('') | length > 0
 
-- name: Install spurdbd systemd unit
-  ansible.builtin.template:
-    src: spurdbd.service.j2
-    dest: /etc/systemd/system/spurdbd.service
-    mode: "0644"
-  register: spurdbd_unit
+- name: Fail if PostgreSQL config could not be located
+  ansible.builtin.fail:
+    msg: "Could not find postgresql.conf under /etc/postgresql — is the postgresql service actually installed?"
+  when:
+    - spur_accounting_enabled | bool
+    - spur_pg_conf_file is not defined
+
+- name: Listen on all interfaces so remote controllers can reach accounting
+  ansible.builtin.lineinfile:
+    path: "{{ spur_pg_conf_file }}"
+    regexp: "^#?\\s*listen_addresses\\s*="
+    line: "listen_addresses = '*'"
+  register: spur_pg_listen
   when: spur_accounting_enabled | bool
 
-- name: Reload systemd so the unit is picked up
-  ansible.builtin.systemd:
-    daemon_reload: true
+- name: Allow each controller to authenticate to the spur database over the network
+  ansible.builtin.lineinfile:
+    path: "{{ spur_pg_hba_file }}"
+    line: "host    {{ spur_accounting_db_name }}    {{ spur_accounting_db_user }}    {{ item }}/32    scram-sha-256"
+    insertbefore: BOF
+  loop: "{{ spur_controller_pg_addrs | default([]) | unique }}"
+  register: spur_pg_hba
   when: spur_accounting_enabled | bool
 
-- name: Enable and (re)start spurdbd
+- name: Restart PostgreSQL to apply listen/auth changes
   ansible.builtin.systemd:
-    name: spurdbd
-    enabled: true
+    name: postgresql
     state: restarted
-  when: spur_accounting_enabled | bool
+  when:
+    - spur_accounting_enabled | bool
+    - (spur_pg_listen.changed | default(false)) or (spur_pg_hba.results | default([]) | selectattr('changed') | list | length > 0)
 
-- name: Wait for spurdbd to listen on {{ spur_accounting_port }}
+- name: Wait for PostgreSQL to accept TCP connections on {{ spur_accounting_db_port }}
   ansible.builtin.wait_for:
-    port: "{{ spur_accounting_port }}"
-    host: "127.0.0.1"
+    port: "{{ spur_accounting_db_port }}"
+    host: "0.0.0.0"
     timeout: 30
   when: spur_accounting_enabled | bool

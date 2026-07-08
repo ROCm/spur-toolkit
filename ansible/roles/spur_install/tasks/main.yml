@@ -65,9 +65,11 @@
 
 # Two install sources:
 #   1. spur_binary_src (a directory on the Ansible control node holding pre-built
-#      spur/spurctld/spurd/spurdbd) — used for air-gapped installs and when the
+#      spur/spurctld/spurd) — used for air-gapped installs and when the
 #      upstream repo has no published GitHub release yet. Takes precedence.
 #   2. upstream install.sh — downloads the latest published release.
+# Both are unconditional when spur_force_reinstall is set (rolling upgrades need
+# to overwrite an already-installed binary with a newer build of the same name).
 - name: Copy pre-built Spur binaries from control node
   ansible.builtin.copy:
     src: "{{ spur_binary_src }}/{{ item }}"
@@ -77,7 +79,6 @@
     - spur
     - spurctld
     - spurd
-    - spurdbd
   when: spur_binary_src | default('') | length > 0
 
 - name: Install Spur via upstream installer
@@ -89,7 +90,7 @@
     executable: /bin/bash
   when:
     - spur_binary_src | default('') | length == 0
-    - not spur_bin_stat.stat.exists
+    - (not spur_bin_stat.stat.exists) or (spur_force_reinstall | default(false) | bool)
   register: install_run
   changed_when: install_run.rc == 0
 
