@@ -41,7 +41,7 @@ The run ends by submitting a test job — check the `spur nodes` output and job 
 
 `deploy.yml` is idempotent — re-running it on a healthy cluster re-applies config and restarts daemons.
 
-**Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Tear down](#tear-down) · [Gotchas](#hard-won-gotchas-baked-into-these-roles)
+**Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Tear down](#tear-down) · [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -57,7 +57,7 @@ This produces, under `target/release/`:
 
 | Binary | Role |
 |---|---|
-| `spur` | multi-call CLI, symlinked to 18 Slurm-compatible names (`sbatch`, `squeue`, `sacct`, … — full list in [Gotchas](#hard-won-gotchas-baked-into-these-roles)) |
+| `spur` | multi-call CLI, symlinked to 18 Slurm-compatible names (`sbatch`, `squeue`, `sacct`, `sacctmgr`, `scontrol`, `salloc`, `srun`, `sinfo`, `scancel`, `sattach`, `scrontab`, `sdiag`, `smd`, `sprio`, `sreport`, `sshare`, `sstat`, `strigger`) |
 | `spurctld` | controller / scheduler / Raft — also serves accounting in-process on the same gRPC port when `[accounting].database_url` is set |
 | `spurd` | node agent |
 
@@ -310,50 +310,21 @@ Stops/disables the systemd services and reaps stray daemons. Leaves PostgreSQL i
 
 ---
 
-## Hard-won gotchas baked into these roles
+## Troubleshooting
 
-Real bugs hit during validation — listed so anyone reading the playbook understands why the roles look the way they do. If you hit a new one, add it here and (where applicable) encode the fix in the roles.
+Things you might see while running or operating a cluster, and what they mean.
 
-### Daemon / process management
-- **Daemons run as systemd units**, not `nohup` — `/etc/systemd/system/spur{ctld,d}.service` (`spurdbd.service` only exists as a leftover from a pre-merge deployment, cleaned up by `spur_accounting` on the accounting host), `enabled` (survive reboot), `Restart=on-failure`. The roles `daemon-reload` after templating a unit and use `state: restarted` so a redeploy always picks up new binaries/config.
-- **`-D` is `--foreground`, not "daemonize"** (`crates/spurctld/src/main.rs`). The systemd units correctly run the binary in the foreground under `Type=simple` — don't add `-D`.
-- **`pkill -f spurd` also kills `spurctld`** (substring match). Teardown uses `pkill -x` (exact name) only.
-- **Stop-before-wipe ordering.** The controller role stops spurctld *before* wiping `~/spur/state`, so the daemon can't rewrite the Raft log mid-delete.
+| Symptom | What's going on |
+|---|---|
+| `spurctld` logs an `ERROR` on restart — `Can not initialize last_log_id=... vote=...:committed` | Harmless — normal on any restart with existing Raft state. Judge health from `spur nodes` / jobs / `sacct`, not this line. |
+| `spurd` logs `failed to load spur.conf ... /etc/spur/spur.conf` on startup | Harmless — `spurd` is configured entirely via CLI flags and never reads a config file. Always present. |
+| `invalid transition from Completed to Completed` after a multi-node job | Harmless — a follower's redundant terminal-state report, rejected by the leader. The job succeeded. |
+| `spur nodes` shows fewer rows than I have hosts | It collapses by partition — the NODES column is a count, not one row per host. Use `spur show node <name>` to check a specific host. |
+| Playbook fails during the accounting apt install with a dpkg-lock error | Another `apt`/unattended-upgrade is running. Wait for it to finish (don't force-clear the lock unless `apt-get` is genuinely hung). |
+| Can't find a job's output file | It lands in the job's working directory as `spur-<JOBID>.out`, on **whichever agent ran it** (no shared-FS assumption). Default working dir is `{{ spur_home }}`. |
+| `spur --version` errors | Not a supported flag — use `spur nodes` / `spur show ...` to confirm the CLI works. |
+| Job IDs restarted at 1 and old `sacct` history looks overwritten | You deployed with `spur_wipe_state=true`, which resets the Raft job-id counter. Use `spur_wipe_state=false` (the default) to preserve history. |
 
-### Install
-- **`install.sh` now works** (ROCm/spur publishes releases) — omitting `spur_binary_src` downloads one automatically. Verified live: `spur_version: latest`/`nightly` both resolve and install correctly. Use `spur_binary_src` instead when you need mainline changes not yet released, an air-gapped install, or a custom build — the symlink + verify tasks run on both paths identically.
-- **`spur --version` is not a supported flag** — it errors. The roles check for the binary with `stat`, not by running `--version`.
-- **All 18 Slurm-compat symlink names** the `spur` multi-call binary recognizes via argv[0] dispatch are created regardless of install source: `sbatch`, `squeue`, `sinfo`, `scancel`, `sacct`, `sacctmgr`, `scontrol`, `salloc`, `srun`, `sattach`, `scrontab`, `sdiag`, `smd`, `sprio`, `sreport`, `sshare`, `sstat`, `strigger`.
-- **A stale dpkg lock** during the accounting apt install means another apt/unattended-upgrade is running — wait for it (or clear a genuinely hung `apt-get`); don't `--force`.
+**Ports** the cluster listens on (open these between hosts): `6817` controller API + accounting, `6818` agents, `6821` Raft. `6821` is fixed in Spur 0.3.0.
 
-### Accounting
-- **Accounting is embedded in `spurctld`** — served on the controller's own gRPC port whenever `[accounting].database_url` is non-empty, so Postgres must be reachable and migrated *before* spurctld starts. `spur_accounting` runs before the controller role for this reason.
-- **Every controller needs network access to Postgres, not just localhost** — each spurctld connects to the database directly (no single co-located daemon brokering it anymore), so `spur_accounting` configures `listen_addresses`/`pg_hba.conf` for every controller's IP.
-- **Migrations run automatically on spurctld startup** against the configured `database_url`; a failed migration disables accounting for that controller rather than crashing it (scheduling still works, `sacct` won't).
-- **With `spur_wipe_state=true`, the Raft job-id counter resets each deploy**, so re-deploys reuse job ids 1, 2, … which upsert onto the same accounting rows. Set `spur_wipe_state=false` to preserve job history.
-- **Upgrading a pre-merge cluster** leaves a stale `spurdbd` unit/binary/process behind if nothing removes it. `spur_accounting` stops/disables/deletes both unconditionally (even with `spur_accounting_enabled=false`) on the accounting host; `spur_install` (every controller/agent) separately sweeps a stray `spurdbd` *binary* fleet-wide, since the old `spur_binary_src` push copied it everywhere even though it only ever ran as a service on the accounting host.
-
-### Spur quirks
-- **Job stdout lands in spurd's working directory at startup** — the `spurd` unit sets `WorkingDirectory={{ spur_home }}`, so output is predictably at `{{ spur_home }}/spur-<JOBID>.out`, even though `spur show job` reports the submitter's `WorkDir=`.
-- **The single-node job's host is unpredictable** — the backfill scheduler picks any idle node, so `spur_verify` searches every agent rather than assuming the controller.
-- **No shared-FS assumption in multi-node verify** — the play fetches `spur-<JOBID>.out` from each agent, not just the controller.
-- **`spur nodes` collapses by partition** — the "NODES" column is a count, not one row per host. Loop `spur show node <name>` to confirm each expected host registered.
-- **`spur show job` uses `JobState=COMPLETED` (uppercase)**, not `State: Completed`. The wait-loop greps `JobState=[A-Z]+`.
-- **Harmless log spam `invalid transition from Completed to Completed`** on followers after a multi-node job (`crates/spurctld/src/cluster.rs`) — the leader already reported terminal state, the follower's redundant report is rejected. The job succeeded.
-- **Harmless `ERROR`-level openraft log line on every spurctld restart** — `Can not initialize last_log_id=Some(...) vote=...:committed`. Normal on a restart with existing Raft state; judge success from `spur nodes`/job/accounting behavior, not this line.
-- **Harmless spurd startup warning `failed to load spur.conf ... path=/etc/spur/spur.conf`** — `spurd` takes all its config via CLI flags and never reads a config file; always present.
-- **Raft port 6821 is hardcoded** in spurctld, not a flag in 0.3.0. Preflight checks it alongside 6817/6818.
-
-### Multi-node / HA specifics
-- **Agent `--hostname` must match the `[[nodes]]` name in `spur.conf`.** Both sides use `ansible_hostname` (short).
-- **HA needs a leader-elected wait**, not just a port-listening one. `spurctld` binds `:6817` instantly but returns `Status::unavailable("no leader elected yet")` until quorum forms; the controller role loops on that message in `spur nodes` until it clears.
-- **`peers` list order matters across controllers.** `node_id` is the 1-based position; openraft refuses to start if a node's `node_id` doesn't match its position. Both are derived from `groups['spur_controllers']` — don't reorder that group between deploys without wiping state.
-- **`delegate_facts: true` evaluates `set_fact` on the controller, not the delegated target.** Use `hostvars[item].ansible_hostname` when setting a per-host fact via `delegate_to`.
-- **`ansible.builtin.command` runs without a shell** — `command -v X` fails (bash builtin). Use `ansible.builtin.shell` with `executable: /bin/bash`.
-
-### Rolling upgrade specifics
-- **`spur node drain` doesn't kill running jobs** — it stops new scheduling and transitions the node `DRAINING → DRAINED` once its running jobs finish on their own. `rolling_upgrade.yml` polls for `DRAINED` before touching the agent's binary or restarting `spurd`.
-- **`spurd` deregisters gracefully on SIGTERM**, so `systemctl restart spurd` doesn't leave a stale node entry — but only do this after the node is actually drained, or its running jobs get evicted (`NODE_FAIL`).
-- **A drained node stays drained after `spurd` restarts** — draining is server-side state, not tied to the agent process. `rolling_upgrade.yml` explicitly `RESUME`s each node after its upgrade; skip that and upgraded capacity sits idle.
-- **Controllers restart one at a time (`serial: 1`), never in parallel**, so Raft quorum is never lost — with 3 controllers, restarting 1 still leaves 2 for quorum.
-- **`rolling_upgrade.yml` refuses to run under `spur_transport=wireguard`** — it doesn't re-derive `spur_wg_address` the way `deploy.yml` does. Use `deploy.yml` for a wireguard cluster instead.
+For **why the roles are written the way they are** (implementation rationale, hard-won Ansible/Spur quirks encoded into the tasks), see [`CONTRIBUTING.md`](CONTRIBUTING.md) — that's maintainer reference, not needed to deploy.
