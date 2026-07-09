@@ -365,7 +365,7 @@ These are real bugs we hit during validation — listed so anyone reading the pl
 ### Install
 - **Upstream `install.sh` returns 403** because ROCm/spur has no published release yet. Use `spur_binary_src` to push locally-built binaries. The symlink + verify tasks run on both paths.
 - **`spur --version` is not a supported flag** — it errors. The roles check for the binary with `stat`, not by running `--version`.
-- **Slurm-compat symlinks** (`sbatch`/`squeue`/`sinfo`/`scancel`/`sacct`/`scontrol`/`salloc`/`srun` → `spur`) are created regardless of install source; the `spur` multi-call binary dispatches on argv[0].
+- **Slurm-compat symlinks** — all 18 names the `spur` multi-call binary recognizes via argv[0] dispatch (`sbatch`, `squeue`, `sinfo`, `scancel`, `sacct`, `sacctmgr`, `scontrol`, `salloc`, `srun`, `sattach`, `scrontab`, `sdiag`, `smd`, `sprio`, `sreport`, `sshare`, `sstat`, `strigger`) → `spur` — are created regardless of install source.
 - **A stale dpkg lock** during the accounting apt install means another apt/unattended-upgrade is running — wait for it (or clear a genuinely hung `apt-get`); don't `--force`.
 
 ### Accounting

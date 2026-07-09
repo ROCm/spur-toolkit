@@ -125,9 +125,19 @@
     - sinfo
     - scancel
     - sacct
+    - sacctmgr
     - scontrol
     - salloc
     - srun
+    - sattach
+    - scrontab
+    - sdiag
+    - smd
+    - sprio
+    - sreport
+    - sshare
+    - sstat
+    - strigger
 
 - name: Show install result
   ansible.builtin.debug:

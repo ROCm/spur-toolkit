@@ -158,7 +158,7 @@ for tgt in "${HOSTS_ALL[@]}"; do
   ssh "$tgt" "
     set -euo pipefail
     sudo test -x ${SPUR_INSTALL_DIR}/spur || { echo 'spur binary missing after install' >&2; exit 1; }
-    for n in sbatch squeue sinfo scancel sacct scontrol salloc srun; do
+    for n in sbatch squeue sinfo scancel sacct sacctmgr scontrol salloc srun sattach scrontab sdiag smd sprio sreport sshare sstat strigger; do
       sudo ln -sf ${SPUR_INSTALL_DIR}/spur ${SPUR_INSTALL_DIR}/\$n
     done
     echo 'spur installed + symlinks created'
@@ -722,7 +722,7 @@ Notes:
 - **This skill uses systemd**, not `nohup`. Units are `/etc/systemd/system/spur{ctld,d}.service` (`spurdbd.service` only exists as a leftover from a pre-merge deployment — see Step 5b), `enabled` (survive reboot), `Restart=on-failure`. Always `systemctl daemon-reload` after writing a unit.
 - **`spur --version` is NOT supported** — it errors. Check the binary with `test -x`, not by running `--version`.
 - **`install.sh` returns 403 when the repo has no published release.** Set `SPUR_BINARY_SRC` to a local dir of pre-built binaries and the skill scp's them instead.
-- **Slurm-compat symlinks** (`sbatch`/`squeue`/`sinfo`/`scancel`/`sacct`/`scontrol`/`salloc`/`srun` → `spur`) are created on every install path. The `spur` multi-call binary dispatches on argv[0].
+- **Slurm-compat symlinks** — all 18 names the `spur` multi-call binary recognizes via argv[0] dispatch (`sbatch`, `squeue`, `sinfo`, `scancel`, `sacct`, `sacctmgr`, `scontrol`, `salloc`, `srun`, `sattach`, `scrontab`, `sdiag`, `smd`, `sprio`, `sreport`, `sshare`, `sstat`, `strigger`) → `spur` — are created on every install path.
 - **`pkill -f spurd` also kills `spurctld`** (substring match). Always `pkill -x` (exact name).
 
 ### Accounting
