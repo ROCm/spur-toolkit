@@ -300,6 +300,14 @@ ssh "$ACCT_HOST" "
 "
 ```
 
+The old pre-merge `spur_binary_src` push (Step 2) copied `spurdbd` to every host in `HOSTS_ALL`, not just `ACCT_HOST` — it only ever *ran* as a service on `ACCT_HOST`, but a stray unused binary can be left on other controllers/agents too. Sweep it everywhere while you're at it:
+
+```bash
+for tgt in "${HOSTS_ALL[@]}"; do
+  ssh "$tgt" "sudo rm -f ${SPUR_INSTALL_DIR}/spurdbd"
+done
+```
+
 Run this before (or as part of) Step 5, then proceed to Step 6 — the regenerated `spur.conf` (below) already drops the old `host = ...` key.
 
 ## Step 6: render spur.conf + install spurctld systemd unit on every controller

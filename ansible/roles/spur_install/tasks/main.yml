@@ -58,6 +58,16 @@
     - "{{ spur_home }}/etc"
     - "{{ spur_install_dir }}"
 
+# This role runs on every controller and agent, not just the accounting host —
+# a pre-merge deployment's binary push could have landed a spurdbd binary on any
+# of them (the old spur_install binary list included it), even though only the
+# accounting host ever ran it as a service. spur_accounting only cleans up the
+# systemd unit/process on the accounting host; sweep the stray binary everywhere.
+- name: Remove leftover spurdbd binary from a pre-merge deployment
+  ansible.builtin.file:
+    path: "{{ spur_install_dir }}/spurdbd"
+    state: absent
+
 - name: Check for existing spur binary
   ansible.builtin.stat:
     path: "{{ spur_install_dir }}/spur"
