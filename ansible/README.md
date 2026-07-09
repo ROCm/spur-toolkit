@@ -27,7 +27,15 @@ ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=
 
 # Without PostgreSQL accounting (jobs still run, sacct/fairshare unavailable):
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD" -e spur_accounting_enabled=false
+
+# PostgreSQL on a DEDICATED accounting node (not a controller/agent): put that
+# host in its own [spur_accounting_node] group in the inventory, and name it with
+# -e (a play's hosts: field doesn't reliably read inventory [all:vars]). It runs
+# only Postgres — no spur daemons — and every controller connects to it remotely.
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD" -e spur_accounting_host=acct-0
 ```
+
+By default (no `spur_accounting_host` set) PostgreSQL runs on the **first controller** — fine for most clusters. See [Accounting](#accounting-postgresql-embedded-in-spurctld) for the dedicated-node inventory layout and details.
 
 The run ends by submitting a test job — check the `spur nodes` output and job stdout near the end. Real inventories are git-ignored (see `.gitignore`); only `inventory/*.example.ini` templates are tracked.
 
@@ -216,11 +224,26 @@ Enabled by default (`spur_accounting_enabled: true`). There's no separate accoun
 3. Configures Postgres to accept remote TCP connections (`listen_addresses`, `pg_hba.conf`) from every controller's IP — each controller's embedded accounting service connects to Postgres directly over the network, not just the one that happens to be co-located with it.
 4. Writes every controller's `spur.conf` with an `[accounting]` block pointing `database_url` at that host.
 
-**Dedicated accounting node:** set `spur_accounting_host` to any managed host — controller, agent, or a standalone host in its own group (e.g. `[spur_accounting_node]`). Pass it via `-e` (a play's `hosts:` field doesn't reliably read inventory `[all:vars]`):
+**Dedicated accounting node:** set `spur_accounting_host` to any managed host — controller, agent, or a standalone host in its own group. Put that host in an `[spur_accounting_node]` group (it needs no spur binaries — only Postgres runs there):
+
+```ini
+[spur_controllers]
+ctl ansible_host=10.0.0.10 ansible_user=root
+
+[spur_agents]
+gpu-1 ansible_host=10.0.0.11 ansible_user=root
+
+[spur_accounting_node]
+acct-0 ansible_host=10.0.0.20 ansible_user=root   ; Postgres only, no spur daemons
+```
+
+Then name it via `-e` (a play's `hosts:` field doesn't reliably read inventory `[all:vars]`):
 
 ```bash
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_accounting_host=acct-0
 ```
+
+Every controller connects to it over the network (the role opens `listen_addresses`/`pg_hba.conf` for each controller's IP). If the host's PostgreSQL isn't on the default port, pass `-e spur_accounting_db_port=<port>`.
 
 The playbook writes `SPUR_CONTROLLER_ADDR` (listing every controller) to `/etc/environment` on **controller nodes**, so the whole CLI — `squeue`/`sinfo`/`scontrol` and `sacct`/`sacctmgr`/`sreport`/`sshare` alike — works there with no per-command flags; accounting rides the same address, there's no separate env for it anymore. On non-controller nodes, or to override: `export SPUR_CONTROLLER_ADDR=http://<a-controller>:6817[,http://<another>:6817,...]`.
 
