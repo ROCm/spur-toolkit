@@ -130,7 +130,7 @@ Fail-fast rules:
 
 ## Step 2: install Spur binaries on all hosts (idempotent)
 
-Two sources, same as the playbook. `SPUR_BINARY_SRC` (a local dir holding pre-built `spur`, `spurctld`, `spurd`) takes precedence — use it when the upstream repo has no published release (`install.sh` returns 403) or for air-gapped installs. Otherwise curl `install.sh`.
+Two sources, same as the playbook. ROCm/spur publishes releases (https://github.com/ROCm/spur/releases) — `install.sh` (no `SPUR_BINARY_SRC` set) downloads one automatically (`SPUR_VERSION=latest` by default, or `nightly` for a mainline build, or a specific `vX.Y.Z`). Set `SPUR_BINARY_SRC` to a local dir holding pre-built `spur`, `spurctld`, `spurd` instead when you need mainline changes not yet released, an air-gapped install, or a custom build.
 
 ```bash
 for tgt in "${HOSTS_ALL[@]}"; do
@@ -721,7 +721,7 @@ Notes:
 ### Install / systemd
 - **This skill uses systemd**, not `nohup`. Units are `/etc/systemd/system/spur{ctld,d}.service` (`spurdbd.service` only exists as a leftover from a pre-merge deployment — see Step 5b), `enabled` (survive reboot), `Restart=on-failure`. Always `systemctl daemon-reload` after writing a unit.
 - **`spur --version` is NOT supported** — it errors. Check the binary with `test -x`, not by running `--version`.
-- **`install.sh` returns 403 when the repo has no published release.** Set `SPUR_BINARY_SRC` to a local dir of pre-built binaries and the skill scp's them instead.
+- **`install.sh` now works** (ROCm/spur publishes releases) — leaving `SPUR_BINARY_SRC` unset downloads one automatically. Set `SPUR_BINARY_SRC` to a local dir of pre-built binaries instead for mainline changes not yet released, air-gapped installs, or a custom build.
 - **Slurm-compat symlinks** — all 18 names the `spur` multi-call binary recognizes via argv[0] dispatch (`sbatch`, `squeue`, `sinfo`, `scancel`, `sacct`, `sacctmgr`, `scontrol`, `salloc`, `srun`, `sattach`, `scrontab`, `sdiag`, `smd`, `sprio`, `sreport`, `sshare`, `sstat`, `strigger`) → `spur` — are created on every install path.
 - **`pkill -f spurd` also kills `spurctld`** (substring match). Always `pkill -x` (exact name).
 

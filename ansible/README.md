@@ -7,7 +7,9 @@ Three playbooks: `deploy.yml` stands up a Spur cluster in every supported shape 
 Run from this repo's `ansible/` directory. `spur` (the upstream source) is a separate repo — clone and build it wherever's convenient, then point `spur_binary_src` straight at the build output (no need to copy it anywhere; the role only ever reads the three named files `spur`/`spurctld`/`spurd` out of that directory).
 
 ```bash
-# 1. Build spur (only needed until ROCm/spur publishes releases — see Build prerequisites)
+# 1. Build spur (see Build prerequisites for why — TL;DR: picks up mainline
+#    changes not yet in a tagged release; skip this and see Build prerequisites
+#    if a published release already covers what you need)
 git clone https://github.com/ROCm/spur.git && cd spur
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
 sudo apt install -y protobuf-compiler build-essential
@@ -45,7 +47,9 @@ The run ends by submitting a test job — check the `spur nodes` output and job 
 
 ## Build prerequisites
 
-No published GitHub release yet, so upstream `install.sh` returns 403 — build locally, on a machine matching your targets' architecture/libc (the lab targets are Ubuntu 22.04 x86-64). rustup auto-selects the toolchain version pinned in `rust-toolchain.toml` the first time you run `cargo` in the repo, so there's no manual version matching.
+ROCm/spur now publishes releases — check **https://github.com/ROCm/spur/releases** for the latest tag. If one already covers what you need, you can skip building entirely: omit `spur_binary_src` and the playbook falls back to upstream `install.sh`, which downloads it for you (`spur_version: latest` by default; set `nightly` for a build off the mainline branch, or a specific `vX.Y.Z`).
+
+Building locally (the Quick start path above) is still worth it when you need mainline changes not yet in a tagged release, an air-gapped install, or a custom patch — build on a machine matching your targets' architecture/libc (the lab targets are Ubuntu 22.04 x86-64). rustup auto-selects the toolchain version pinned in `rust-toolchain.toml` the first time you run `cargo` in the repo, so there's no manual version matching.
 
 > Already have Rust from somewhere other than rustup (distro package, asdf, …)? Compare `rustc --version` against `rust-toolchain.toml`'s `channel` — a mismatch can fail the build in ways that don't look version-related.
 
@@ -59,7 +63,7 @@ This produces, under `target/release/`:
 
 > A pre-merge build (before upstream folded `spurdbd` into `spurctld`) also produces a `spurdbd` binary. Harmless if it's sitting in the same directory as the other three — the role only ever reads `spur`/`spurctld`/`spurd` by exact name.
 
-Omit `spur_binary_src` and the playbook falls back to upstream `install.sh` — only works once ROCm/spur publishes releases.
+Omit `spur_binary_src` and the playbook falls back to downloading a published release via upstream `install.sh` instead (see [Build prerequisites](#build-prerequisites)).
 
 ## Ansible control node
 
@@ -317,7 +321,7 @@ Real bugs hit during validation — listed so anyone reading the playbook unders
 - **Stop-before-wipe ordering.** The controller role stops spurctld *before* wiping `~/spur/state`, so the daemon can't rewrite the Raft log mid-delete.
 
 ### Install
-- **Upstream `install.sh` returns 403** because ROCm/spur has no published release yet. Use `spur_binary_src` to push locally-built binaries — the symlink + verify tasks run on both paths.
+- **`install.sh` now works** (ROCm/spur publishes releases) — omitting `spur_binary_src` downloads one automatically. Verified live: `spur_version: latest`/`nightly` both resolve and install correctly. Use `spur_binary_src` instead when you need mainline changes not yet released, an air-gapped install, or a custom build — the symlink + verify tasks run on both paths identically.
 - **`spur --version` is not a supported flag** — it errors. The roles check for the binary with `stat`, not by running `--version`.
 - **All 18 Slurm-compat symlink names** the `spur` multi-call binary recognizes via argv[0] dispatch are created regardless of install source: `sbatch`, `squeue`, `sinfo`, `scancel`, `sacct`, `sacctmgr`, `scontrol`, `salloc`, `srun`, `sattach`, `scrontab`, `sdiag`, `smd`, `sprio`, `sreport`, `sshare`, `sstat`, `strigger`.
 - **A stale dpkg lock** during the accounting apt install means another apt/unattended-upgrade is running — wait for it (or clear a genuinely hung `apt-get`); don't `--force`.
