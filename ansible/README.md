@@ -30,12 +30,20 @@ cd spur
 Spur has no published GitHub release yet, so the upstream `install.sh` returns 403. Build the binaries yourself on a machine matching the targets' architecture/libc (the lab targets are Ubuntu 22.04 x86-64), then push them with the playbook (Step 3).
 
 ```bash
-# Prerequisites (Rust toolchain is pinned in rust-toolchain.toml):
-sudo apt install -y protobuf-compiler
+# Install Rust via rustup if you don't already have it. rustup automatically
+# picks up the exact toolchain version pinned in rust-toolchain.toml the first
+# time you run cargo inside the repo — no separate version-matching needed.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+# Other prerequisites:
+sudo apt install -y protobuf-compiler build-essential
 
 # Build the three daemons/CLI in release mode:
 cargo build --release -p spur-cli -p spurctld -p spurd
 ```
+
+> Already have Rust installed via something other than rustup (a distro package, asdf, etc.)? Run `rustc --version` and compare against the `channel` in `rust-toolchain.toml` — a mismatch can fail the build in ways that look unrelated to versioning. rustup handles this automatically; other installers won't switch versions for you.
 
 This produces, under `target/release/`:
 
