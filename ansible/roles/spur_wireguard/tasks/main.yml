@@ -41,12 +41,29 @@
     state: present
   when: ansible_os_family == 'RedHat'
 
-# The controller always gets .1 (assigned by `spur net init`). Agents get a
-# unique address from their position in the mesh: .2, .3, ... A per-host
-# spur_wg_address set in inventory always wins.
+# The controller always gets .1 (assigned by `spur net init`). Every other mesh
+# member (agents, then login-only nodes) gets a unique address by position:
+# .2, .3, ... A per-host spur_wg_address set in inventory always wins.
 - name: Build ordered agent list (non-controller agents)
   ansible.builtin.set_fact:
     spur_wg_agents: "{{ groups['spur_agents'] | difference(groups['spur_controllers']) }}"
+
+# Login-only hosts: in [spur_login] but NOT already a controller/agent (those
+# already get a mesh address above). Login nodes join the mesh so interactive
+# `srun` can stream job output directly from agents over the tunnel.
+- name: Build ordered login-node list (login-only, not already controller/agent)
+  ansible.builtin.set_fact:
+    spur_wg_login: >-
+      {{ groups.get('spur_login', [])
+         | difference(groups['spur_controllers'])
+         | difference(groups['spur_agents']) }}
+
+# Everything that joins the mesh (as opposed to the controller, which inits it):
+# agents first, then login-only nodes. Used for the join/pubkey/peer-registration
+# steps below so login nodes go through the identical flow as agents.
+- name: Build combined joiner list (agents + login-only nodes)
+  ansible.builtin.set_fact:
+    spur_wg_joiners: "{{ spur_wg_agents + spur_wg_login }}"
 
 - name: Set controller WG address to the mesh .1
   ansible.builtin.set_fact:
@@ -60,6 +77,15 @@
     spur_wg_address: "{{ spur_wg_cidr | ansible.utils.ipaddr('network') | ansible.utils.ipmath(spur_wg_agents.index(inventory_hostname) + 2) }}"
   when:
     - inventory_hostname in spur_wg_agents
+    - spur_wg_address is not defined
+
+# Login-only nodes continue the numbering after the agents so addresses never
+# collide: first login node = .(len(agents)+2), next = +1, and so on.
+- name: Assign each login-only node a unique WG address (after the agents)
+  ansible.builtin.set_fact:
+    spur_wg_address: "{{ spur_wg_cidr | ansible.utils.ipaddr('network') | ansible.utils.ipmath(spur_wg_agents | length + spur_wg_login.index(inventory_hostname) + 2) }}"
+  when:
+    - inventory_hostname in spur_wg_login
     - spur_wg_address is not defined
 
 - name: Initialize WireGuard mesh on the controller
@@ -92,16 +118,17 @@
     spur_wg_controller_pubkey: "{{ hostvars[groups['spur_controllers'][0]]['wg_ctl_pubkey'].stdout | trim }}"
     spur_wg_controller_endpoint: "{{ hostvars[groups['spur_controllers'][0]]['ansible_host'] | default(groups['spur_controllers'][0]) }}:{{ spur_wg_port }}"
 
-- name: Assert each agent has a WG address before join
+- name: Assert each joiner (agent or login node) has a WG address before join
   ansible.builtin.assert:
     that:
       - spur_wg_address is defined
-    fail_msg: "Agent {{ inventory_hostname }} has no spur_wg_address; set it in inventory or check spur_wg_cidr."
-  when: inventory_hostname in spur_wg_agents
+    fail_msg: "{{ inventory_hostname }} has no spur_wg_address; set it in inventory or check spur_wg_cidr."
+  when: inventory_hostname in spur_wg_joiners
 
-- name: Join WireGuard mesh on agents
+- name: Join WireGuard mesh on agents and login nodes
   # `spur net join` needs --prefix-len to match spur_wg_cidr (defaults to 16),
-  # else the interface address/AllowedIPs are wrong. Logs to stderr.
+  # else the interface address/AllowedIPs are wrong. Logs to stderr. Login nodes
+  # join identically to agents — they just don't run a daemon afterward.
   ansible.builtin.shell: |
     set -euo pipefail
     if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
@@ -118,26 +145,26 @@
     executable: /bin/bash
   register: wg_agent_join
   changed_when: "'SPUR_WG_ALREADY_UP' not in wg_agent_join.stdout"
-  when: inventory_hostname in spur_wg_agents
+  when: inventory_hostname in spur_wg_joiners
 
-- name: Read agent WG public key
+- name: Read joiner WG public key
   ansible.builtin.command: "wg show {{ spur_wg_interface }} public-key"
   register: wg_agent_pubkey
   changed_when: false
-  when: inventory_hostname in spur_wg_agents
+  when: inventory_hostname in spur_wg_joiners
 
-- name: Capture agent pubkey
+- name: Capture joiner pubkey
   ansible.builtin.set_fact:
     spur_wg_pubkey: "{{ wg_agent_pubkey.stdout | trim }}"
-  when: inventory_hostname in spur_wg_agents
+  when: inventory_hostname in spur_wg_joiners
 
-- name: Register all agents as peers on the controller
+- name: Register all joiners (agents + login nodes) as peers on the controller
   ansible.builtin.command: >-
     {{ spur_install_dir }}/spur net add-peer
       --key {{ hostvars[item]['spur_wg_pubkey'] }}
       --allowed-ip {{ hostvars[item]['spur_wg_address'] }}/32
       --interface {{ spur_wg_interface }}
-  loop: "{{ spur_wg_agents }}"
+  loop: "{{ spur_wg_joiners }}"
   when: inventory_hostname == groups['spur_controllers'][0]
   changed_when: true
 

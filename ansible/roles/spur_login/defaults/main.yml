@@ -1,0 +1,10 @@
+---
+# Login (submission) node role. A login node is a pure client host: it runs the
+# spur CLI + Slurm symlinks (installed by spur_install) but NO daemon — no spurctld,
+# no spurd. It exists so users can SSH in and submit/query jobs. This role only
+# wires up SPUR_CONTROLLER_ADDR; binary install and (under wireguard) mesh join are
+# handled by spur_install / spur_wireguard, same as any other host.
+#
+# Enabled purely by inventory: put hosts in the [spur_login] group. No group ->
+# the login plays match zero hosts and no-op, so login nodes are opt-in / off by
+# default.

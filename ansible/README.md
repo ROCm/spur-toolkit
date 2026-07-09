@@ -41,7 +41,7 @@ The run ends by submitting a test job — check the `spur nodes` output and job 
 
 `deploy.yml` is idempotent — re-running it on a healthy cluster re-applies config and restarts daemons.
 
-**Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Tear down](#tear-down) · [Troubleshooting](#troubleshooting)
+**Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Login nodes](#login-submission-nodes) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Tear down](#tear-down) · [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -182,6 +182,28 @@ gpu-2 ansible_host=10.0.0.22 ansible_user=root
 **Client-side failover is automatic.** `spurd --controller` and the CLI's `SPUR_CONTROLLER_ADDR` both accept a comma-separated endpoint list and rotate past a dead one, so the playbook points every agent — and each controller's own `/etc/environment` — at *every* controller, not just the first. A single surviving controller is enough; server-side leader forwarding handles writes from any endpoint in the list. No VIP/DNS round-robin needed for basic failover.
 
 A full HA inventory template lives at `inventory/hosts.ha.example.ini`.
+
+---
+
+## Login (submission) nodes
+
+**Optional, off by default.** A login node is a host users SSH into to submit and query jobs — it runs the `spur` CLI but **no daemon** (no `spurctld`, no `spurd`). Enable it purely by adding a `[spur_login]` group to your inventory; omit the group and nothing happens.
+
+```ini
+[spur_controllers]
+ctl ansible_host=10.0.0.10 ansible_user=root
+
+[spur_agents]
+gpu-1 ansible_host=10.0.0.11 ansible_user=root
+gpu-2 ansible_host=10.0.0.12 ansible_user=root
+
+[spur_login]
+login1 ansible_host=10.0.0.20 ansible_user=root   ; users SSH here to run sbatch/squeue/sacct/srun
+```
+
+On each login node the playbook installs the `spur` CLI + all 18 Slurm symlinks and writes `SPUR_CONTROLLER_ADDR` (every controller, comma-joined) to `/etc/environment` — nothing else. Users can then SSH in and run `sbatch`/`squeue`/`sacct`/`srun`/etc. with no per-command flags. A host already in `[spur_controllers]` or `[spur_agents]` doesn't need to be listed here (it's already a client); `[spur_login]` is for **dedicated** submission hosts.
+
+**Networking:** a login node needs outbound access to the controllers on `6817` (all CLI + accounting) and, for interactive `srun` live output, to the agents on `6818` (`srun` streams job output directly from the agent). Batch `sbatch` needs only the controller. Under `spur_transport=wireguard`, login nodes are automatically joined to the mesh so this works over the tunnel.
 
 ---
 

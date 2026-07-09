@@ -1,0 +1,46 @@
+---
+# Wire up the client env on a login node so `sbatch`/`squeue`/`sacct`/`srun`/etc.
+# work with no per-command flags. Identical to what the controller role writes on
+# controller nodes: every controller's address, comma-joined, so the CLI's built-in
+# endpoint rotation survives any single controller being down. Accounting rides the
+# same address (no separate env var since spurdbd was folded into spurctld).
+#
+# Under wireguard, spur_wireguard has already joined this host to the mesh and set
+# spur_controller_listen_ip on each controller to its .1/.N mesh address, so the
+# endpoint list below automatically uses mesh IPs — no special-casing needed here.
+- name: Resolve every controller's advertised address (for the client endpoint list)
+  ansible.builtin.set_fact:
+    spur_login_controller_ip: >-
+      {{ hostvars[item].spur_wg_address if spur_transport == 'wireguard'
+         else (hostvars[item].ansible_host | default(hostvars[item].ansible_default_ipv4.address)) }}
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_controllers'] }}"
+  run_once: true
+
+- name: Set SPUR_CONTROLLER_ADDR in /etc/environment (login nodes)
+  vars:
+    all_controller_endpoints: >-
+      {{ groups['spur_controllers']
+         | map('extract', hostvars, 'spur_login_controller_ip')
+         | map('regex_replace', '^(.*)$', 'http://\1:' ~ spur_controller_port)
+         | join(',') }}
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^SPUR_CONTROLLER_ADDR='
+    line: "SPUR_CONTROLLER_ADDR={{ all_controller_endpoints }}"
+
+# Accounting no longer has its own address/port — it rides SPUR_CONTROLLER_ADDR.
+# Strip any leftover SPUR_ACCOUNTING_ADDR from a pre-merge deployment of this host.
+- name: Remove stale SPUR_ACCOUNTING_ADDR from /etc/environment (login nodes)
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^SPUR_ACCOUNTING_ADDR='
+    state: absent
+
+- name: Show login node result
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: login node ready — spur CLI installed, SPUR_CONTROLLER_ADDR set.
+      Users can SSH in and run sbatch/squeue/sacct/srun. (Interactive `srun` live output
+      needs outbound access to agents on port {{ spur_agent_port }}.)

@@ -76,6 +76,7 @@ Once gathered, define the arrays the rest of the skill uses:
 ```bash
 CONTROLLERS=( user@host1 user@host2 user@host3 )   # ordered — index = Raft node_id - 1; ORDER MUST BE STABLE
 AGENTS=(     user@host4 )                            # may overlap CONTROLLERS (hyperconverged) or be disjoint
+LOGIN=(      )                                        # OPTIONAL dedicated submission/login nodes: CLI only, no daemon. Empty = none.
 SSH_USER=root
 TRANSPORT=direct                                     # or wireguard
 ACCOUNTING=true                                      # or false
@@ -90,7 +91,7 @@ SPUR_CLUSTER_NAME=spur-cluster; SPUR_LOG_LEVEL=info; SPUR_WIPE_STATE=false
 ACCT_DB_NAME=spur; ACCT_DB_USER=spur; ACCT_DB_PASSWORD=spur
 ROLLING_BATCH_SIZE=1                                  # Step 12 only — agents upgraded per batch
 
-HOSTS_ALL=( $(printf '%s\n' "${CONTROLLERS[@]}" "${AGENTS[@]}" | sort -u) )
+HOSTS_ALL=( $(printf '%s\n' "${CONTROLLERS[@]}" "${AGENTS[@]}" "${LOGIN[@]}" | sort -u) )
 ha_enabled=false; [ ${#CONTROLLERS[@]} -gt 1 ] && ha_enabled=true
 ```
 
@@ -490,6 +491,23 @@ UNIT
   "
 done
 ```
+
+## Step 7b: configure login (submission) nodes (only when `LOGIN` is non-empty)
+
+A login node is a pure client: the `spur` CLI (installed in Step 2) + the controller env, **no daemon**. Users SSH in and run `sbatch`/`squeue`/`sacct`/`srun`. Just set `SPUR_CONTROLLER_ADDR` (same comma-joined controller list the controllers get in Step 6) — accounting rides that address, no separate env. Nothing else to install or start.
+
+```bash
+if [ ${#LOGIN[@]} -gt 0 ]; then
+  for lg in "${LOGIN[@]}"; do
+    ssh "$lg" "
+      sudo sed -i '/^SPUR_CONTROLLER_ADDR=/d;/^SPUR_ACCOUNTING_ADDR=/d' /etc/environment
+      echo 'SPUR_CONTROLLER_ADDR=${ctl_endpoints_csv}' | sudo tee -a /etc/environment >/dev/null
+    "
+  done
+fi
+```
+
+> Networking: a login node needs outbound access to the controllers on `${SPUR_CONTROLLER_PORT}` (all CLI + accounting) and, for interactive `srun` live output, to the agents on `${SPUR_AGENT_PORT}` (`srun` streams output directly from the agent). Under `TRANSPORT=wireguard`, run Step 2b's join on each login node too (assign it a mesh IP and `spur net add-peer` it on the controller) so this works over the tunnel.
 
 ## Step 8: wait for every agent to register
 

@@ -14,8 +14,10 @@
 - name: Preflight + install Spur on all hosts
   # Accounting is embedded in spurctld now — a dedicated (non-controller/non-agent)
   # accounting host runs only Postgres and needs no spur binaries, so it is not
-  # included here (spur_accounting role handles it independently).
-  hosts: "spur_controllers:spur_agents"
+  # included here (spur_accounting role handles it independently). Login nodes DO
+  # need the CLI binaries, so they're included (the group is empty by default,
+  # making login nodes opt-in).
+  hosts: "spur_controllers:spur_agents:spur_login"
   become: true
   gather_facts: yes
   any_errors_fatal: true
@@ -23,7 +25,9 @@
     - role: spur_install
 
 - name: Configure WireGuard mesh (when spur_transport == wireguard)
-  hosts: spur_controllers:spur_agents
+  # Login nodes join the mesh too, so interactive `srun` can stream job output
+  # directly from agents over the tunnel.
+  hosts: spur_controllers:spur_agents:spur_login
   become: true
   gather_facts: no
   any_errors_fatal: true
@@ -65,6 +69,18 @@
   serial: 0      # parallel
   roles:
     - role: spur_agent
+
+# Login (submission) nodes: opt-in via the [spur_login] inventory group (empty ->
+# this play matches zero hosts and no-ops). No daemon runs here — just the CLI
+# (installed above) + the client env pointing at the controllers. Runs after the
+# controllers so SPUR_CONTROLLER_ADDR points at a live control plane.
+- name: Configure login (submission) nodes
+  hosts: spur_login
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  roles:
+    - role: spur_login
 
 - name: Verify with test jobs
   hosts: spur_controllers[0]
