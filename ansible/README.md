@@ -1,6 +1,33 @@
 # Spur — Ansible Deployment
 
-Two playbooks: `deploy.yml` stands up a Spur cluster in every supported shape from inventory; `rolling_upgrade.yml` upgrades an already-running cluster's binaries with no full-cluster outage. Daemons run as **systemd services** (survive reboot), Slurm-compatible CLI names are symlinked, and optional **PostgreSQL accounting** (embedded in `spurctld`) is on by default. `deploy.yml` is idempotent — re-running it on a healthy cluster re-applies config and restarts daemons.
+Two playbooks: `deploy.yml` stands up a Spur cluster in every supported shape from inventory; `rolling_upgrade.yml` upgrades an already-running cluster's binaries with no full-cluster outage. Daemons run as **systemd services**, Slurm-compatible CLI names are symlinked, and optional **PostgreSQL accounting** (embedded in `spurctld`) is on by default.
+
+## Quick start
+
+Run from this repo's `ansible/` directory. `spur` (the upstream source) is a separate repo — clone and build it wherever's convenient, then point `spur_binary_src` straight at the build output (no need to copy it anywhere; the role only ever reads the three named files `spur`/`spurctld`/`spurd` out of that directory).
+
+```bash
+# 1. Build spur (only needed until ROCm/spur publishes releases — see Build prerequisites)
+git clone https://github.com/ROCm/spur.git && cd spur
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
+sudo apt install -y protobuf-compiler build-essential
+cargo build --release -p spur-cli -p spurctld -p spurd
+SPUR_BUILD="$(pwd)/target/release"
+cd -
+
+# 2. Ansible + inventory
+python3 -m pip install --user 'ansible-core>=2.14'
+cp inventory/hosts.example.ini inventory/hosts.ini
+$EDITOR inventory/hosts.ini
+
+# 3. Deploy
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD"
+
+# Without PostgreSQL accounting (jobs still run, sacct/fairshare unavailable):
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD" -e spur_accounting_enabled=false
+```
+
+The run ends by submitting a test job — check the `spur nodes` output and job stdout near the end. Real inventories are git-ignored (see `.gitignore`); only `inventory/*.example.ini` templates are tracked.
 
 | Shape | Inventory pattern | Transport |
 |---|---|---|
@@ -10,35 +37,15 @@ Two playbooks: `deploy.yml` stands up a Spur cluster in every supported shape fr
 | HA — multi-controller Raft | **≥ 3 hosts** in `spur_controllers` (any number in `spur_agents`); auto-enabled | direct or wireguard |
 | HA — separate compute | `spur_controllers` and `spur_agents` are **disjoint** host sets | direct or wireguard |
 
-**Contents:** [Quickstart](#quickstart) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Tear down](#tear-down) · [Gotchas](#hard-won-gotchas-baked-into-these-roles) · [Verified](#verified)
+`deploy.yml` is idempotent — re-running it on a healthy cluster re-applies config and restarts daemons.
+
+**Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Tear down](#tear-down) · [Gotchas](#hard-won-gotchas-baked-into-these-roles)
 
 ---
 
-## Quickstart
+## Build prerequisites
 
-**clone → build binaries → stage them → write inventory → run the playbook.**
-
-### 1. Clone the repo
-
-```bash
-git clone https://github.com/ROCm/spur.git
-cd spur
-```
-
-### 2. Build the three binaries
-
-No published GitHub release yet, so upstream `install.sh` returns 403 — build locally, on a machine matching your targets' architecture/libc (the lab targets are Ubuntu 22.04 x86-64).
-
-```bash
-# Rust toolchain — rustup auto-selects the version pinned in rust-toolchain.toml
-# the first time you run cargo in the repo, so no manual version matching needed.
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-
-sudo apt install -y protobuf-compiler build-essential
-
-cargo build --release -p spur-cli -p spurctld -p spurd
-```
+No published GitHub release yet, so upstream `install.sh` returns 403 — build locally, on a machine matching your targets' architecture/libc (the lab targets are Ubuntu 22.04 x86-64). rustup auto-selects the toolchain version pinned in `rust-toolchain.toml` the first time you run `cargo` in the repo, so there's no manual version matching.
 
 > Already have Rust from somewhere other than rustup (distro package, asdf, …)? Compare `rustc --version` against `rust-toolchain.toml`'s `channel` — a mismatch can fail the build in ways that don't look version-related.
 
@@ -50,24 +57,15 @@ This produces, under `target/release/`:
 | `spurctld` | controller / scheduler / Raft — also serves accounting in-process on the same gRPC port when `[accounting].database_url` is set |
 | `spurd` | node agent |
 
-> A pre-merge build (before upstream folded `spurdbd` into `spurctld`) also produces a `spurdbd` binary. Harmless to include in `spur_binary_src` alongside the other three — it's ignored.
+> A pre-merge build (before upstream folded `spurdbd` into `spurctld`) also produces a `spurdbd` binary. Harmless if it's sitting in the same directory as the other three — the role only ever reads `spur`/`spurctld`/`spurd` by exact name.
 
-Stage them where the control node can read them:
+Omit `spur_binary_src` and the playbook falls back to upstream `install.sh` — only works once ROCm/spur publishes releases.
 
-```bash
-mkdir -p /tmp/spur-bin
-cp target/release/spur target/release/spurctld target/release/spurd /tmp/spur-bin/
-```
+## Ansible control node
 
-You point the playbook at this directory with `spur_binary_src` (Step 4). Omit it and the playbook falls back to upstream `install.sh` — only works once ROCm/spur publishes releases.
-
-### 3. Install Ansible on the control node
-
-The control node is wherever you run `ansible-playbook` — your workstation is fine, it doesn't need to join the cluster.
+The control node is wherever you run `ansible-playbook` — your workstation is fine, it doesn't need to join the cluster. WireGuard transport additionally needs the `ansible.utils` collection and `netaddr`:
 
 ```bash
-python3 -m pip install --user 'ansible-core>=2.14'
-# WireGuard transport only: also needs the ansible.utils collection + netaddr
 ansible-galaxy collection install -r requirements.yml
 python3 -m pip install --user netaddr
 ```
@@ -77,29 +75,11 @@ Target hosts need: SSH reachable, sudo or root, `systemd`, and (only for the `in
 - Every play runs with `become: true`, so a non-root `ansible_user` with passwordless sudo (or `ansible_become_password` supplied) works the same as `ansible_user=root`. This is required — `spur_home`/`spur_install_dir` default under `/root`, unwritable by a non-root user without becoming root.
 - Password-based SSH works too: set `ansible_user`/`ansible_password` (via `sshpass`) in `[all:vars]` or per-host. `ansible.cfg` deliberately omits `-o BatchMode=yes` — that flag suppresses SSH's password prompt outright and silently breaks password auth even with `sshpass` supplying the answer.
 
-### 4. Write your inventory
-
-```bash
-cd ansible
-cp inventory/hosts.example.ini inventory/hosts.ini
-$EDITOR inventory/hosts.ini
-```
-
-Real inventories are git-ignored (see `.gitignore`) — only the `*.example.ini` templates are tracked, so host addresses/credentials never get committed. Point `spur_binary_src` at the Step 2 directory, either in `[all:vars]` or via `-e` on the command line.
-
-### 5. Run it
-
-```bash
-ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin
-```
-
-The run ends by submitting a single-node test job (and, with ≥ 2 agents, a multi-node `-N` job) and, if accounting is enabled, recording them in PostgreSQL. Check the `spur nodes` output and job stdout near the end.
-
 ---
 
 ## Example commands per scenario
 
-Base pattern: `ansible-playbook playbooks/deploy.yml -i <inventory> -e spur_binary_src=/tmp/spur-bin [extra flags]`. Drop `spur_binary_src` once upstream publishes releases.
+Base pattern: `ansible-playbook playbooks/deploy.yml -i <inventory> -e spur_binary_src=<path> [extra flags]`.
 
 | Scenario | Inventory | Extra flags |
 |---|---|---|
@@ -218,13 +198,7 @@ ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_accounting_
 
 The playbook writes `SPUR_CONTROLLER_ADDR` (listing every controller) to `/etc/environment` on **controller nodes**, so the whole CLI — `squeue`/`sinfo`/`scontrol` and `sacct`/`sacctmgr`/`sreport`/`sshare` alike — works there with no per-command flags; accounting rides the same address, there's no separate env for it anymore. On non-controller nodes, or to override: `export SPUR_CONTROLLER_ADDR=http://<a-controller>:6817[,http://<another>:6817,...]`.
 
-Skip the whole stack:
-
-```bash
-ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_accounting_enabled=false
-```
-
-Job submission still works without accounting — only `sacct`/fairshare are unavailable.
+Job submission still works without accounting (`-e spur_accounting_enabled=false`, shown in [Quick start](#quick-start)) — only `sacct`/fairshare are unavailable.
 
 > Default DB credentials are `spur`/`spur`/`spur` — fine for a lab, **change `spur_accounting_db_password` for anything real.**
 
@@ -256,7 +230,7 @@ Job submission still works without accounting — only `sacct`/fairshare are una
 Override per-run with `-e key=value` (repeatable):
 
 ```bash
-ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin -e spur_wipe_state=true
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release -e spur_wipe_state=true
 ```
 
 ---
@@ -271,9 +245,7 @@ Non-destructive by default (`spur_wipe_state=false` preserves job state/registra
 
 ```bash
 cargo build --release -p spur-cli -p spurctld -p spurd   # rebuild all three together, see caveat below
-cp target/release/{spur,spurctld,spurd} /tmp/spur-bin/
-
-ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release
 ```
 
 - **Binaries roll out by content, not version string** — Ansible compares checksums, so an unchanged re-run is a near no-op.
@@ -287,19 +259,17 @@ Upgrades one host at a time so the cluster keeps scheduling and running jobs thr
 
 ```bash
 cargo build --release -p spur-cli -p spurctld -p spurd
-cp target/release/{spur,spurctld,spurd} /tmp/spur-bin/
-
-ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin
+ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release
 ```
 
 Reuses the same `spur_install`/`spur_controller`/`spur_agent`/`spur_verify` roles `deploy.yml` uses — no duplicated install/config/health-check logic:
 
-1. **Guard rail** — refuses to start if `spur_wipe_state=true`, or the cluster isn't already healthy (leader elected, `spur nodes` reachable).
+1. **Guard rail** — refuses to start if `spur_wipe_state=true`, if `spur_transport=wireguard` (not yet supported by this playbook), or if the cluster isn't already healthy (leader elected, `spur nodes` reachable).
 2. **Controllers, one at a time** (`serial: 1`, aborts the whole run on first failure) — force-reinstall, restart `spurctld`, reuse the existing HA-aware "wait for Raft leader" task as the health gate before the next controller. Client-side failover (every agent/CLI is pointed at *every* controller) keeps the rest serving while one is down.
 3. **Agents, in configurable batches** (`spur_rolling_batch_size`, default `1`) — `spur node drain <node>`, poll until `DRAINED` (no running jobs left), force-reinstall, restart `spurd`, wait for re-registration, `scontrol update NodeName=<node> State=RESUME`.
 4. **Verify** — submits a real test job at the end to confirm the upgraded cluster actually schedules work.
 
-Same rebuild-all-three caveat applies. `spur_rolling_batch_size` trades speed for blast radius: `1` (default) disrupts at most one agent's capacity at a time; higher upgrades faster but drains more capacity concurrently.
+Same rebuild-all-three caveat applies. `spur_rolling_batch_size` trades speed for blast radius: `1` (default) disrupts at most one agent's capacity at a time; higher upgrades faster but drains more capacity concurrently. A single-controller cluster has no other controller to fail over to during its own restart, so a rolling upgrade of it is still a short outage — real zero-downtime needs HA (≥ 3 controllers).
 
 ---
 
@@ -381,25 +351,5 @@ Real bugs hit during validation — listed so anyone reading the playbook unders
 - **`spur node drain` doesn't kill running jobs** — it stops new scheduling and transitions the node `DRAINING → DRAINED` once its running jobs finish on their own. `rolling_upgrade.yml` polls for `DRAINED` before touching the agent's binary or restarting `spurd`.
 - **`spurd` deregisters gracefully on SIGTERM**, so `systemctl restart spurd` doesn't leave a stale node entry — but only do this after the node is actually drained, or its running jobs get evicted (`NODE_FAIL`).
 - **A drained node stays drained after `spurd` restarts** — draining is server-side state, not tied to the agent process. `rolling_upgrade.yml` explicitly `RESUME`s each node after its upgrade; skip that and upgraded capacity sits idle.
-- **Controllers restart one at a time (`serial: 1`), never in parallel**, so Raft quorum is never lost. This is why HA production needs ≥ 3 controllers: a single-controller cluster has nothing to fail over to during its own restart, so a rolling upgrade of it is still a (short) outage.
-
----
-
-## Verified
-
-`spur 0.3.0`, Ubuntu 22.04, validated across all four topologies on a 4-node cluster (fresh install — PostgreSQL purged beforehand), Ansible run from an operator workstation. Every scenario ran basic commands, drove a sample job to `COMPLETED`, confirmed all daemons `active` under systemd, and recorded jobs in PostgreSQL via `sacct`:
-
-- **Single-node** — controller + agent on one host; job COMPLETED, accounted.
-- **Multi-node** — 1 controller + 2 agents; `-N 2` job fanned across both nodes, accounted.
-- **HA hyperconverged** — 3 controllers (Raft) + 3 agents; leader elected, `-N 3` job across all three, accounted.
-- **HA + separate compute** — 3 dedicated controllers (no agent) + 1 dedicated agent; leader elected, controllers ran no `spurd`, job ran on the separate compute node, accounted.
-- **Accounting disabled** (`-e spur_accounting_enabled=false`) — PostgreSQL skipped, job still COMPLETED.
-
-WireGuard transport is supported via `roles/spur_wireguard`, enabled with `-e spur_transport=wireguard`. It's **single-controller only** (`spur net init` auto-assigns the controller `.1`; no multi-controller mesh command), so HA runs over `direct`. Agents auto-assign `.2`, `.3`, … Requires the `ansible.utils` collection.
-
-**Merged-accounting migration and `rolling_upgrade.yml` are verified on a narrower footprint** — a live 2-node lab (single controller + 2 agents, `direct` transport, accounting co-located with the controller, accounting enabled, default `spur_rolling_batch_size`), not the full 4-topology matrix:
-
-- Migrating an already-running pre-merge cluster (separate `spurdbd`) to the merged-accounting build via `deploy.yml` — `spurdbd` fully removed, `pg_hba.conf`/`spur.conf` regenerated correctly, job history preserved, jobs COMPLETED post-migration.
-- A genuinely fresh install directly onto the merged-accounting build via `deploy.yml` (not a migration) — same checks, from a clean slate.
-- `rolling_upgrade.yml` upgrading a merged-accounting cluster to a further build, from both states above, with **real in-flight jobs**: the agent drain genuinely blocked on running jobs (`DRAINING` held for their full duration, reaching `DRAINED` only once they completed) rather than being a formality, and nodes correctly `RESUME`d afterward with no stuck `DRAIN` state.
-- **Not yet lab-verified:** HA (≥ 3 controllers) or wireguard transport with either the migration path or `rolling_upgrade.yml` (the latter explicitly refuses to run under `spur_transport=wireguard` rather than risk an unverified path), a dedicated (non-controller/non-agent) accounting host, `spur_accounting_enabled=false`, and `spur_rolling_batch_size > 1`.
+- **Controllers restart one at a time (`serial: 1`), never in parallel**, so Raft quorum is never lost — with 3 controllers, restarting 1 still leaves 2 for quorum.
+- **`rolling_upgrade.yml` refuses to run under `spur_transport=wireguard`** — it doesn't re-derive `spur_wg_address` the way `deploy.yml` does. Use `deploy.yml` for a wireguard cluster instead.

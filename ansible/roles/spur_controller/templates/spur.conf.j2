@@ -14,7 +14,7 @@ peers = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['spur_controll
 plugin = "backfill"
 interval_secs = 1
 
-{% if spur_accounting_enabled | default(true) %}
+{% if spur_accounting_enabled | default(true) | bool %}
 [accounting]
 # Accounting runs in-process inside spurctld (served on the same port as the
 # controller API) and reaches Postgres over the network — spur_accounting_listen_ip
