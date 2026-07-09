@@ -1,0 +1,121 @@
+---
+# Decommission one or more compute nodes from a running Spur cluster.
+#
+# Runtime + light host cleanup — no controller restart, no state wipe (agents are
+# not Raft members, so removing one never needs a Raft reinit). Per node:
+#   1. drain it (stop new scheduling; running jobs finish on their own)
+#   2. wait until it reports DRAINED
+#   3. stop + disable spurd on the node itself (if reachable in inventory)
+#   4. spur node remove --force (authoritative, WAL-durable removal)
+# then remind the operator to drop it from [spur_agents] in inventory.
+#
+# Run:
+#   ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4
+#
+# Names are the node names as they appear in `spur nodes` (each agent's
+# ansible_hostname — the same value spur.conf uses). Draining/removal are done
+# from the first controller; the spurd stop is attempted on the matching
+# inventory host when one exists (an already-dead host is fine — it's skipped).
+
+- name: Guard rails + node decommission
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    remove_list: "{{ nodes_to_remove | default('') | split(',') | map('trim') | select | list }}"
+  tasks:
+    - name: Require nodes_to_remove
+      ansible.builtin.assert:
+        that:
+          - remove_list | length > 0
+        fail_msg: >-
+          Pass the node(s) to remove, e.g.
+          -e nodes_to_remove=gpu-3,gpu-4
+        quiet: true
+
+    - name: Check the cluster is healthy before starting
+      ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
+      register: rn_health
+      changed_when: false
+      failed_when: rn_health.rc != 0
+
+    - name: Drain each node (stop new scheduling; running jobs finish first)
+      ansible.builtin.command: >-
+        {{ spur_install_dir }}/spur node drain {{ item }}
+        --reason "ansible decommission"
+      loop: "{{ remove_list }}"
+      changed_when: true
+
+    - name: Wait for each node to fully drain
+      ansible.builtin.shell: |
+        for i in $(seq 1 120); do
+          st=$({{ spur_install_dir }}/spur show node {{ item }} 2>/dev/null \
+               | awk -v n="{{ item }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
+               | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
+          [ "$st" = "DRAINED" ] && exit 0
+          sleep 1
+        done
+        echo "timed out waiting for {{ item }} to drain (last state: $st)"
+        exit 1
+      args:
+        executable: /bin/bash
+      loop: "{{ remove_list }}"
+      changed_when: false
+
+- name: Stop the agent on each removed node (best effort, if in inventory)
+  # Map each requested name back to the inventory host whose spur_node_name /
+  # ansible_hostname matches, and stop spurd there. A node that isn't in the
+  # current inventory (or is unreachable) is simply skipped — step 4 below still
+  # removes it from the controller's view.
+  hosts: spur_agents
+  become: true
+  gather_facts: yes
+  tasks:
+    - name: Stop + disable spurd on nodes being removed
+      ansible.builtin.systemd:
+        name: spurd
+        state: stopped
+        enabled: false
+      when: >-
+        (nodes_to_remove | default('') | split(',') | map('trim') | list)
+        | intersect([ansible_hostname, inventory_hostname]) | length > 0
+      failed_when: false
+
+- name: Remove each node from the cluster + remind about inventory
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: true
+  gather_facts: no
+  vars:
+    remove_list: "{{ nodes_to_remove | default('') | split(',') | map('trim') | select | list }}"
+  tasks:
+    # Belt-and-suspenders: spurd deregisters gracefully on SIGTERM, so a node
+    # whose agent we just stopped is usually already gone from the controller.
+    # This `remove` is what actually removes a node whose host was unreachable
+    # (never got the SIGTERM). Treat "node not found" as success — it means the
+    # node is already absent, which is the goal.
+    - name: spur node remove --force (authoritative, WAL-durable)
+      ansible.builtin.command: >-
+        {{ spur_install_dir }}/spur node remove {{ item }}
+        --force --reason "ansible decommission"
+      loop: "{{ remove_list }}"
+      register: rn_remove
+      changed_when: "'not found' not in (rn_remove.stderr | default(''))"
+      failed_when:
+        - rn_remove.rc != 0
+        - "'not found' not in (rn_remove.stderr | default(''))"
+
+    - name: Confirm nodes are gone
+      ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
+      register: rn_after
+      changed_when: false
+
+    - name: Result + inventory reminder
+      ansible.builtin.debug:
+        msg:
+          - "Removed from the running cluster: {{ remove_list | join(', ') }}"
+          - "IMPORTANT: also delete these hosts from [spur_agents] in your inventory,"
+          - "otherwise a future `deploy.yml` run will re-add them. No re-deploy is"
+          - "needed just to complete the removal — it's already done."
+          - "Current nodes:"
+          - "{{ rn_after.stdout_lines }}"

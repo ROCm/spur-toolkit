@@ -1,0 +1,23 @@
+---
+# Manage Spur accounting entities (accounts, users, QoS) declaratively.
+#
+# Runtime-only — talks to the running controller's embedded accounting service
+# via `sacctmgr`. No daemon restart, no disruption; safe to run anytime.
+#
+# Define spur_qos / spur_accounts / spur_users (and optional *_absent lists) in
+# inventory group_vars or pass with -e. `sacctmgr add` upserts, so this is
+# idempotent — re-running applies the same desired state.
+#
+# Run:
+#   ansible-playbook playbooks/manage_accounts.yml -i inventory/hosts.ini
+#
+# Everything is applied on one controller (accounting is served in-process by
+# every spurctld, so any controller reaches the same database).
+
+- name: Manage Spur accounting entities
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  roles:
+    - role: spur_accounting_mgmt

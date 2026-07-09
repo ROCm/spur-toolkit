@@ -1,6 +1,6 @@
 # Spur — Ansible Deployment
 
-Three playbooks: `deploy.yml` stands up a Spur cluster in every supported shape from inventory; `rolling_upgrade.yml` upgrades an already-running cluster's binaries with no full-cluster outage; `teardown.yml` stops it. Daemons run as **systemd services**, Slurm-compatible CLI names are symlinked, and optional **PostgreSQL accounting** (embedded in `spurctld`) is on by default.
+Lifecycle playbooks: `deploy.yml` stands up a Spur cluster in every supported shape from inventory; `rolling_upgrade.yml` upgrades an already-running cluster's binaries with no full-cluster outage; `teardown.yml` stops it. Plus day-2 [admin operations](#admin-operations) — `manage_accounts.yml`, `remove_nodes.yml`, `healthcheck.yml`. Daemons run as **systemd services**, Slurm-compatible CLI names are symlinked, and optional **PostgreSQL accounting** (embedded in `spurctld`) is on by default.
 
 ## Quick start
 
@@ -41,7 +41,7 @@ The run ends by submitting a test job — check the `spur nodes` output and job 
 
 `deploy.yml` is idempotent — re-running it on a healthy cluster re-applies config and restarts daemons.
 
-**Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Login nodes](#login-submission-nodes) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Tear down](#tear-down) · [Troubleshooting](#troubleshooting)
+**Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Login nodes](#login-submission-nodes) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Admin operations](#admin-operations) · [Tear down](#tear-down) · [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -259,6 +259,8 @@ Override per-run with `-e key=value` (repeatable):
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release -e spur_wipe_state=true
 ```
 
+The day-2 admin playbooks take their own structured vars (`spur_accounts` / `spur_qos` / `spur_users` for `manage_accounts.yml`, `nodes_to_remove` for `remove_nodes.yml`) — documented under [Admin operations](#admin-operations) rather than in the table above, since they're per-playbook lists, not global cluster settings.
+
 ---
 
 ## Upgrading
@@ -318,6 +320,53 @@ spur queue        # job queue
 spur submit job.sh
 sacct             # accounting (when enabled) — Slurm-compatible symlink to spur
 ```
+
+---
+
+## Admin operations
+
+Day-2 playbooks for routine cluster administration. All are safe to run against a live cluster.
+
+### Manage accounts / users / QoS — `manage_accounts.yml`
+
+Declaratively apply accounting entities. Runtime-only (talks to the controller's embedded accounting via `sacctmgr`) — **no restart, no disruption**, and idempotent (`sacctmgr add` upserts). Define the desired state in a group_vars file or pass with `-e`:
+
+```yaml
+# e.g. inventory/group_vars/all.yml (or a dedicated accounts.yml)
+spur_qos:
+  - { name: high, priority: 100, maxwall: 1440 }
+spur_accounts:
+  - { name: research, description: "Research group", fairshare: 100 }
+  - { name: ml, parent: research, fairshare: 50 }
+spur_users:
+  - { name: alice, account: ml, defaultaccount: ml }
+```
+
+```bash
+ansible-playbook playbooks/manage_accounts.yml -i inventory/hosts.ini
+```
+
+Removals go in `spur_qos_absent` / `spur_accounts_absent` / `spur_users_absent` (name-only; users also take `account`). The playbook applies in FK-safe order automatically — qos/accounts before users on add, users before accounts on remove (an account can't be deleted while a user association still references it). Requires accounting enabled.
+
+### Decommission compute nodes — `remove_nodes.yml`
+
+Cleanly remove agents from a running cluster: drain → wait until `DRAINED` (running jobs finish first) → stop `spurd` on the node → `spur node remove`. No state wipe (agents aren't Raft members).
+
+```bash
+ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4
+```
+
+Names are as they appear in `spur nodes`. After it runs, **delete those hosts from `[spur_agents]` in your inventory** or a later `deploy.yml` will re-add them (the playbook prints this reminder). Adding nodes is just `deploy.yml` with the new hosts in inventory — no separate playbook needed.
+
+### Health check — `healthcheck.yml`
+
+Read-only cluster diagnostics — daemons active, controller reachable + leader elected, accounting/Postgres up, agent ports listening, disk/Raft-state size. Never changes anything; exits non-zero (with a per-host problem list) if anything's wrong, so it's usable as a cron/monitoring probe.
+
+```bash
+ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini
+```
+
+> **Partitions** are not yet manageable this way — Spur has no runtime partition CLI (unlike Slurm's `scontrol create/update/delete partition`), so partition changes still mean editing the `[[partitions]]` blocks in the controller role's `spur.conf` template and re-running `deploy.yml` (a brief controller restart). Tracked upstream as a Spur feature request.
 
 ---
 

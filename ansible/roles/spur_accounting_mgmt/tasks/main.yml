@@ -1,0 +1,94 @@
+---
+# Apply declarative accounting entities (QoS, accounts, users) via `sacctmgr`.
+# Runs against a single controller — accounting is served in-process by spurctld,
+# so any controller's CLI reaches it. No daemon restart, no disruption.
+#
+# `sacctmgr add` upserts, so we apply every listed entity unconditionally and
+# report changed=false (the CLI output can't distinguish create from update).
+# Ordering matters and is enforced by task order: qos -> accounts -> users on
+# apply; users -> accounts -> qos on removal (associations FK onto accounts).
+#
+# Each task builds argv as: [sacctmgr, add|delete, <entity>, name=<n>, k=v, ...]
+# where the k=v pairs are exactly the recognized keys (spur_acctmgr_keys) present
+# in the item dict. `select('in', item)` keeps recognized keys the item sets;
+# zip+join turns them back into "key=value" strings without shell quoting.
+
+- name: Accounting management requires accounting to be enabled
+  ansible.builtin.assert:
+    that:
+      - spur_accounting_enabled | bool
+    fail_msg: >-
+      manage_accounts.yml needs accounting enabled (spur_accounting_enabled=true) —
+      accounts/users/QoS live in the PostgreSQL accounting DB. Nothing to manage
+      with accounting disabled.
+    quiet: true
+  run_once: true
+
+# --- Additions / updates (upsert), FK-safe order: qos, accounts, users ---
+
+- name: Add/update QoS
+  vars:
+    kept: "{{ spur_acctmgr_keys.qos | select('in', item) | list }}"
+  ansible.builtin.command:
+    argv: "{{ [spur_install_dir ~ '/sacctmgr', 'add', 'qos', 'name=' ~ item.name] + (kept | zip(kept | map('extract', item) | list) | map('join', '=') | list) }}"
+  loop: "{{ spur_qos }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+
+- name: Add/update accounts
+  vars:
+    kept: "{{ spur_acctmgr_keys.account | select('in', item) | list }}"
+  ansible.builtin.command:
+    argv: "{{ [spur_install_dir ~ '/sacctmgr', 'add', 'account', 'name=' ~ item.name] + (kept | zip(kept | map('extract', item) | list) | map('join', '=') | list) }}"
+  loop: "{{ spur_accounts }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+
+- name: Add/update users
+  vars:
+    kept: "{{ spur_acctmgr_keys.user | select('in', item) | list }}"
+  ansible.builtin.command:
+    argv: "{{ [spur_install_dir ~ '/sacctmgr', 'add', 'user', 'name=' ~ item.name] + (kept | zip(kept | map('extract', item) | list) | map('join', '=') | list) }}"
+  loop: "{{ spur_users }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+
+# --- Removals, reverse (FK-safe) order: users, accounts, qos ---
+# A user association references its account; delete the association before the
+# account or the DELETE is rejected by the foreign key.
+
+- name: Remove users
+  ansible.builtin.command:
+    argv: "{{ [spur_install_dir ~ '/sacctmgr', 'delete', 'user', 'name=' ~ item.name] + (['account=' ~ item.account] if item.account is defined else []) }}"
+  loop: "{{ spur_users_absent }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+
+- name: Remove accounts
+  ansible.builtin.command:
+    argv: "{{ [spur_install_dir ~ '/sacctmgr', 'delete', 'account', 'name=' ~ item.name] }}"
+  loop: "{{ spur_accounts_absent }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+
+- name: Remove QoS
+  ansible.builtin.command:
+    argv: "{{ [spur_install_dir ~ '/sacctmgr', 'delete', 'qos', 'name=' ~ item.name] }}"
+  loop: "{{ spur_qos_absent }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+
+- name: Summary
+  ansible.builtin.debug:
+    msg: >-
+      Accounting applied on {{ inventory_hostname }}:
+      {{ spur_qos | length }} qos, {{ spur_accounts | length }} accounts,
+      {{ spur_users | length }} users added/updated;
+      {{ spur_users_absent | length }} users, {{ spur_accounts_absent | length }} accounts,
+      {{ spur_qos_absent | length }} qos removed.
