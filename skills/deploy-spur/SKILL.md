@@ -242,9 +242,19 @@ Because every controller — not just `ACCT_HOST` — connects to this Postgres 
 # same pattern as the [[nodes]] blocks / CSVs in Step 6. Each is its own dedup-append
 # statement (grep -qxF before appending) so re-running Step 5 doesn't pile up duplicate
 # lines the way a bare `tee -a` would — mirrors Ansible's lineinfile exact-match semantics.
+#
+# pg_hba.conf's address field is a literal IP/CIDR, not a hostname, so this can't just
+# reuse IP[$h] — CONTROLLERS[] entries are SSH targets and may legitimately be DNS
+# names (host_addr() in Step 3 doesn't resolve them, it only strips user@). Appending
+# "somehost.example.com/32" produces an unparseable pg_hba line and takes Postgres
+# down on the next restart. Ask each controller for its own real IP instead — this is
+# also the more correct choice regardless of hostnames: it's the address Postgres will
+# actually see as the connection's source, which may differ from whatever address SSH
+# uses to reach the host (a management VLAN, a NAT'd address, etc.).
 pg_hba_appends=""
 for h in "${CONTROLLERS[@]}"; do
-  line="host    ${ACCT_DB_NAME}    ${ACCT_DB_USER}    ${IP[$h]:-${h#*@}}/32    scram-sha-256"
+  ctl_ip=$(ssh "$h" "hostname -I | awk '{print \$1}'")
+  line="host    ${ACCT_DB_NAME}    ${ACCT_DB_USER}    ${ctl_ip}/32    scram-sha-256"
   pg_hba_appends+="sudo grep -qxF '${line}' \"\$pg_hba\" || echo '${line}' | sudo tee -a \"\$pg_hba\" >/dev/null"$'\n'
 done
 

@@ -96,12 +96,20 @@
 
 # --- Remote access: every controller's embedded accounting service connects
 # --- directly to this Postgres, so it must accept TCP from each of them.
+# pg_hba.conf's address field is a literal IP/CIDR, not a hostname — using
+# ansible_host here would break if it's ever set to a DNS name (a normal thing
+# to do in Ansible) rather than an IP, producing an unparseable pg_hba line and
+# taking Postgres down on the next restart/reload. ansible_default_ipv4.address
+# is also the more *correct* choice regardless: it's the host's actual
+# network-facing IP, which is what Postgres will see as the connection's source
+# address — ansible_host is merely how the control node reaches it for SSH and
+# may differ (a management VLAN, a NAT'd address, etc.).
 - name: Compute each controller's advertised address (for pg_hba, may include this host)
   ansible.builtin.set_fact:
     spur_controller_pg_addrs: >-
       {{ (spur_controller_pg_addrs | default([])) +
          [ hostvars[item].spur_wg_address if spur_transport == 'wireguard'
-           else (hostvars[item].ansible_host | default(hostvars[item].ansible_default_ipv4.address)) ] }}
+           else (hostvars[item].ansible_default_ipv4.address | default(hostvars[item].ansible_host)) ] }}
   loop: "{{ groups['spur_controllers'] }}"
   when: spur_accounting_enabled | bool
 
