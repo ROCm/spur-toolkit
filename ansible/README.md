@@ -357,7 +357,7 @@ Teardown stops and disables the systemd services and reaps any stray daemons. It
 These are real bugs we hit during validation — listed so anyone reading the playbook understands why the roles look the way they do.
 
 ### Daemon / process management
-- **Daemons run as systemd units**, not `nohup` — `/etc/systemd/system/spur{ctld,d}.service` (`spurdbd.service` only exists as a leftover from a pre-merge deployment, which `spur_accounting` cleans up), `enabled` (survive reboot), `Restart=on-failure`. The roles `daemon-reload` after templating a unit and use `state: restarted` so a redeploy always picks up new binaries/config.
+- **Daemons run as systemd units**, not `nohup` — `/etc/systemd/system/spur{ctld,d}.service` (`spurdbd.service` only exists as a leftover from a pre-merge deployment, which `spur_accounting` cleans up on the accounting host), `enabled` (survive reboot), `Restart=on-failure`. The roles `daemon-reload` after templating a unit and use `state: restarted` so a redeploy always picks up new binaries/config.
 - **`-D` is `--foreground`, not "daemonize"** (`crates/spurctld/src/main.rs`). The systemd units run the binary in the foreground under `Type=simple`, which is correct — do not add `-D`.
 - **`pkill -f spurd` also kills `spurctld`** (substring match). Teardown uses `pkill -x` (exact name) only.
 - **Stop-before-wipe ordering.** The controller role stops spurctld *before* wiping `~/spur/state`, so the daemon can't rewrite the Raft log mid-delete.
@@ -373,7 +373,7 @@ These are real bugs we hit during validation — listed so anyone reading the pl
 - **Every controller needs network access to Postgres, not just localhost** — each spurctld connects to the database directly (there's no longer a single co-located daemon brokering it), so `spur_accounting` configures `listen_addresses`/`pg_hba.conf` for every controller's IP.
 - **Migrations run automatically on spurctld startup** against the configured `database_url`; a failed migration disables accounting for that controller rather than crashing it (job scheduling still works, `sacct` won't).
 - **With `spur_wipe_state=true`, the Raft job-id counter resets each deploy**, so re-deploys reuse job ids 1, 2, … which upsert onto the same accounting rows. Set `spur_wipe_state=false` to preserve job history.
-- **Upgrading a pre-merge cluster** leaves a stale `spurdbd` systemd unit/binary/process behind if nothing removes it — `spur_accounting`'s tasks stop, disable, and delete both unconditionally (even if `spur_accounting_enabled=false`) so a re-deploy cleans it up automatically.
+- **Upgrading a pre-merge cluster** leaves a stale `spurdbd` systemd unit/binary/process behind if nothing removes it — `spur_accounting`'s tasks stop, disable, and delete both unconditionally (even if `spur_accounting_enabled=false`) on the accounting host. The old `spur_binary_src` push copied `spurdbd` to *every* host, not just the accounting host, even though it only ran as a service there — `spur_install` (runs on every controller/agent) separately sweeps the stray binary fleet-wide.
 
 ### Spur quirks
 - **Job stdout file lands in spurd's working directory at startup.** The `spurd` systemd unit sets `WorkingDirectory={{ spur_home }}` so output is predictably at `{{ spur_home }}/spur-<JOBID>.out`, even though `spur show job` reports the submitter's `WorkDir=`.
@@ -414,3 +414,10 @@ If you hit a new gotcha, please add it here and (where applicable) encode the fi
 - **Accounting disabled** (`-e spur_accounting_enabled=false`) — PostgreSQL skipped, job still COMPLETED.
 
 WireGuard transport is supported via `roles/spur_wireguard`. Enable it with `-e spur_transport=wireguard`. It is **single-controller only** (`spur net init` auto-assigns the controller `.1`; there is no multi-controller mesh command), so HA runs over `direct`. Agents auto-assign `.2`, `.3`, … Requires the `ansible.utils` collection (`ansible-galaxy collection install -r requirements.yml`).
+
+**Merged-accounting migration and `rolling_upgrade.yml` are verified on a narrower footprint than the above** — a live 2-node lab (single controller + 2 agents, `direct` transport, accounting co-located with the controller, accounting enabled, default `spur_rolling_batch_size`), not the full 4-topology matrix:
+
+- Migrating an already-running pre-merge cluster (separate `spurdbd`) to the merged-accounting build via `deploy.yml` — `spurdbd` fully removed, `pg_hba.conf`/`spur.conf` regenerated correctly, job history preserved, jobs COMPLETED post-migration.
+- A genuinely fresh install directly onto the merged-accounting build via `deploy.yml` (not a migration) — same checks, from a clean slate.
+- `rolling_upgrade.yml` upgrading a merged-accounting cluster to a further build, from both of the states above, with **real in-flight jobs**: confirmed the agent drain actually blocks on running jobs (observed `DRAINING` holding for the jobs' full duration, only reaching `DRAINED` once they completed) rather than being a formality, and that nodes correctly `RESUME` afterward with no stuck `DRAIN` state.
+- **Not yet lab-verified**: HA (≥ 3 controllers) or wireguard transport with either the migration path or `rolling_upgrade.yml` (the latter explicitly refuses to run under `spur_transport=wireguard` rather than risk an unverified path — see the Rolling upgrade section above), a dedicated (non-controller/non-agent) accounting host, `spur_accounting_enabled=false`, and `spur_rolling_batch_size > 1`.
