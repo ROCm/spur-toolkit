@@ -382,6 +382,8 @@ These are real bugs we hit during validation — listed so anyone reading the pl
 - **`spur nodes` collapses by partition** — the "NODES" column is a count, not one row per host. To confirm each expected host registered, loop `spur show node <name>`.
 - **`spur show job` uses `JobState=COMPLETED` (uppercase)**, not `State: Completed`. The wait-loop greps `JobState=[A-Z]+`.
 - **Harmless log spam `invalid transition from Completed to Completed`** on followers after a multi-node job (`crates/spurctld/src/cluster.rs`). The leader already reported terminal state; the follower's redundant report is rejected. The job succeeded.
+- **Harmless `ERROR`-level openraft log line on every spurctld restart** — `Can not initialize last_log_id=Some(...) vote=...:committed`. Normal on a restart with existing Raft state; judge success from `spur nodes`/job/accounting behavior, not this line.
+- **Harmless spurd startup warning `failed to load spur.conf ... path=/etc/spur/spur.conf`** — `spurd` takes all its config via CLI flags and never reads a config file; this warning is always present.
 - **Raft port 6821 is hardcoded** in spurctld and isn't a flag in 0.3.0. Preflight checks it alongside 6817/6818.
 
 ### Multi-node / HA specifics

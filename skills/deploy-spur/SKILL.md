@@ -39,6 +39,8 @@ Defaults (override only if the user asks):
 > - Every remote command that reads/writes under `/root`, `/etc/systemd/system`, or runs `spur`/`sbatch`/`sacct`/etc. must be `sudo`-prefixed — not just the file-writing steps. This applies uniformly (as root, `sudo` is a harmless no-op).
 > - `scp` and heredoc redirects (`cat > /path <<EOF`) run as the plain SSH user and cannot land a file directly under `/root` even with the SSH user later `sudo`-reading it. Copy to `/tmp` first, then `sudo install`/`sudo mv` it into place.
 > - Alternatively, set `SPUR_INSTALL_DIR`/`SPUR_HOME` to a world-traversable path (e.g. `/opt/spur`) up front to sidestep all of this — but then every install/`sudo` note below is still harmless, just unnecessary.
+>
+> **Password-based SSH works too** — every `ssh`/`scp` command in this skill is a plain invocation with no auth-method assumptions baked in, so if key-based auth isn't set up, prefix each one with `sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no ...` (and the `scp` equivalent). Do **not** add `-o BatchMode=yes` anywhere — it disables SSH's password prompt outright and silently breaks password auth even with `sshpass` supplying the answer.
 
 ## Step 0: gather inputs (MANDATORY — do not skip)
 
@@ -99,7 +101,7 @@ Run on every unique host. Abort the whole deploy on any failure.
 ```bash
 for tgt in "${HOSTS_ALL[@]}"; do
   echo "############ $tgt ############"
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$tgt" '
+  ssh -o ConnectTimeout=10 "$tgt" '
     set +e
     echo "host=$(hostname -s) fqdn=$(hostname -f)"
     echo "kernel=$(uname -r) nproc=$(nproc)"
@@ -243,7 +245,7 @@ Because every controller — not just `ACCT_HOST` — connects to this Postgres 
 pg_hba_appends=""
 for h in "${CONTROLLERS[@]}"; do
   line="host    ${ACCT_DB_NAME}    ${ACCT_DB_USER}    ${IP[$h]:-${h#*@}}/32    scram-sha-256"
-  pg_hba_appends+="grep -qxF '${line}' \"\$pg_hba\" || echo '${line}' | sudo tee -a \"\$pg_hba\" >/dev/null"$'\n'
+  pg_hba_appends+="sudo grep -qxF '${line}' \"\$pg_hba\" || echo '${line}' | sudo tee -a \"\$pg_hba\" >/dev/null"$'\n'
 done
 
 if [ "$ACCOUNTING" = true ]; then
@@ -618,6 +620,8 @@ To also remove accounting data (destructive): `ssh "$ACCT_HOST" "sudo -u postgre
 
 Use this instead of re-running Steps 1–9 when jobs are currently running and a full-cluster daemon bounce (which Steps 1-9 do — no draining, no batching) is not acceptable. Assumes the cluster is already up and healthy; refuse to proceed otherwise. Requires `SPUR_BINARY_SRC` pointing at the new build (rebuild all three binaries together — same caveat as any upgrade). Only exercised so far with `TRANSPORT=direct`; the `IP[]` map this step reuses from Step 3 still needs to hold real addresses (`WG_IP[]` per Step 2b) for a wireguard cluster — re-derive it in this shell session first if it isn't already populated.
 
+**This step only pushes new binaries and restarts daemons — it does not touch `spur.conf` or Postgres.** If the cluster is still on the pre-merge standalone-`spurdbd` architecture, do the Step 5b migration first (a full-flow, bounce-based operation: Steps 2/4/5b/5/6/7/8/9/10) and confirm it's healthy on the merged-accounting build *before* using this step for further low-disruption upgrades. Running this step against a still-unmigrated cluster would push a spurctld binary that expects the new embedded-accounting config shape without updating `spur.conf`/`pg_hba.conf` to match — don't do that.
+
 ```bash
 # Guard rail: refuse a rolling upgrade if state would be wiped, or the cluster
 # isn't already healthy.
@@ -721,6 +725,8 @@ Notes:
 - **`spur show job` uses `JobState=COMPLETED` (uppercase).** Parse `JobState=[A-Z]+`.
 - **Raft port 6821 is hardcoded** in spurctld (not a CLI flag). Preflight must include it.
 - **Harmless log spam `invalid transition from Completed to Completed`** on followers after multi-node jobs — the job actually succeeded.
+- **Harmless `ERROR`-level openraft log line on every spurctld restart** — `Can not initialize last_log_id=Some(...) vote=...:committed`. Despite the `ERROR` severity, this is normal on a restart with existing Raft state (single-node or HA); it doesn't indicate a problem — check `spur nodes`/job/accounting behavior, not this log line, to judge success.
+- **Harmless spurd startup warning `failed to load spur.conf ... path=/etc/spur/spur.conf`** — `spurd` is driven entirely by CLI flags and never actually reads a config file; this warning is always present and doesn't indicate misconfiguration.
 - **`$SPUR_NUM_NODES` is not set in the job environment** (as of Spur 0.3.0) even in multi-node jobs — only `$SPUR_TASK_OFFSET` and `$SPUR_PEER_NODES` are populated. A smoke-test script referencing it will print an empty value; don't treat that as a failure signal.
 - **A per-job scratch file (e.g. `.spur_job_<id>.sh`) can be left behind in an agent's WorkDir** and, on a shared/reused host, block a later job with a different id from writing its own script (`agent rejected job: failed to write job script`). The job then sits in `COMPLETING` forever and the node shows `mix` instead of `idle` — there's no automatic timeout/recovery. Fix by `spur cancel <jobid>` and removing the stale scratch file by hand; teardown (Step 11) does not clean these up since it only removes `${SPUR_HOME}` and `*.out` files, not arbitrary WorkDirs.
 
