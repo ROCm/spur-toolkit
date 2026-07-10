@@ -27,13 +27,17 @@
 - name: Configure WireGuard mesh (when spur_transport == wireguard)
   # Login nodes join the mesh too, so interactive `srun` can stream job output
   # directly from agents over the tunnel.
-  hosts: spur_controllers:spur_agents:spur_login
+  # Gate at the PLAY level via hosts: — when transport isn't wireguard the pattern
+  # matches no hosts (:!all removes everything) and the whole play is skipped as a
+  # single "no hosts matched" line. A role-level `when:` instead attaches to every
+  # task in the role and prints a "skipping" line per-task per-host (21 tasks x
+  # every node), which is slow and noisy on a large direct-transport cluster.
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if spur_transport == 'wireguard' else ':!all' }}"
   become: true
   gather_facts: no
   any_errors_fatal: true
   roles:
     - role: spur_wireguard
-      when: spur_transport == 'wireguard'
 
 - name: Deploy accounting stack (PostgreSQL) on the accounting host
   # Runs BEFORE the controllers so Postgres is reachable when spurctld starts and
