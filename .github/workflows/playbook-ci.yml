@@ -1,27 +1,21 @@
 # ============================================================================
-# FIRST DRAFT — playbook integration test for PRs.
+# Playbook integration test.
 #
-# Brings up a 6-node cluster of systemd-enabled Docker containers on a single
-# GitHub-hosted runner, downloads pre-built Spur binaries from a ROCm/spur
-# release, and runs deploy.yml against 3 controllers + 2 agents + 1 accounting
-# node. Rolling upgrade and the day-2 playbooks are stubbed as TODOs to add once
-# deploy is green.
+# On a single GitHub-hosted runner, brings up a 6-node cluster of
+# systemd-enabled Docker containers, downloads pre-built Spur binaries from
+# ROCm/spur, and exercises the playbooks end-to-end:
+#   - deploy.yml            : 3 controllers (HA/Raft) + 2 agents + 1 accounting
+#   - rolling_upgrade.yml   : upgrade the whole cluster to the newer build
+# Assertions: agents register, jobs run to COMPLETED, and the accounting
+# database_url is preserved byte-for-byte across the rolling upgrade.
 #
-# Status: EXPERIMENTAL. Temporarily runs on pull_request for fast iteration on
-# the systemd-in-Docker specifics (cgroup v2 on ubuntu-latest) and the ROCm/spur
-# build invocation. Once it is green a few times in a row, decide whether to keep
-# it gating PRs or narrow to workflow_dispatch / a schedule.
+# Day-2 playbooks (add_nodes/remove_nodes/manage_accounts/healthcheck/teardown)
+# are TODO — they build on the same running cluster.
 # ============================================================================
 name: playbook-ci
 
 on:
   workflow_dispatch: {}
-  # push trigger scoped to the CI branch so the workflow runs on the fork during
-  # iteration (pull_request runs in the BASE repo, which doesn't have this file
-  # on its default branch yet). Remove this push block before merging.
-  push:
-    branches:
-      - ci/playbook-integration-tests
   pull_request:
     paths:
       - 'ansible/**'
