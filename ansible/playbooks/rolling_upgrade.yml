@@ -97,7 +97,7 @@
         --reason "ansible rolling upgrade"
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: true
-      when: spur_node_name is defined
+      when: inventory_hostname in ansible_play_hosts
 
     # Draining stops new scheduling but lets running jobs finish on their own
     # (DRAINING -> DRAINED); only proceed once the node reports fully drained.
@@ -116,7 +116,7 @@
         executable: /bin/bash
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: false
-      when: spur_node_name is defined
+      when: inventory_hostname in ansible_play_hosts
 
   roles:
     - role: spur_install
@@ -137,7 +137,7 @@
         executable: /bin/bash
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: false
-      when: spur_node_name is defined
+      when: inventory_hostname in ansible_play_hosts
 
     # A drained node stays drained after spurd restarts — draining is server-side
     # state, not tied to the agent process. Without this, upgraded capacity sits
@@ -147,7 +147,7 @@
         {{ spur_install_dir }}/scontrol update NodeName={{ spur_node_name }} State=RESUME
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: true
-      when: spur_node_name is defined
+      when: inventory_hostname in ansible_play_hosts
 
 - name: Verify the upgraded cluster still schedules work
   hosts: "{{ groups['spur_controllers'][0] }}"
