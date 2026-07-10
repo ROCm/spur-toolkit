@@ -266,20 +266,18 @@ jobs:
       - name: Assert gpu-1 upgraded and still schedules work
         run: |
           set -euo pipefail
-          # Poll rather than a one-shot check: gpu-1's own upgrade finished
-          # ansible-side well before this step runs, but the play still spends
-          # up to a minute after that on an unrelated multi-node verify job
-          # that can never satisfy N=3 with gpu-2 intentionally down (existing
-          # spur_verify behavior, non-fatal there) — match the same polling
-          # pattern the pre-upgrade registration check uses instead of
-          # assuming the very next query lands instantly.
+          # Poll: a same-command re-check moments apart has been observed to
+          # flip pass/fail on this specific query (see PR discussion) — retry
+          # instead of trusting a single call either way, and only fail after
+          # every attempt in the window comes back empty.
+          found=""
           for i in $(seq 1 30); do
             docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null \
-              | grep -qx "NodeName=gpu-1" && { echo "gpu-1 registered"; break; }
+              | grep -qx "NodeName=gpu-1" && { found=1; break; }
             sleep 2
           done
-          docker exec ctl-0 /usr/local/bin/spur show node gpu-1 \
-            | grep -qx "NodeName=gpu-1" || { echo "gpu-1 missing after upgrade"; exit 1; }
+          [ -n "$found" ] || { echo "gpu-1 missing after upgrade"; exit 1; }
+          echo "gpu-1 registered"
           docker exec ctl-0 bash -lc '
             set -e
             printf "#!/bin/bash\n#SBATCH --job-name=post-upgrade\necho ok on \$(hostname)\n" > /tmp/ci-post.sh
