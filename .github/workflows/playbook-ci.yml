@@ -43,9 +43,14 @@ jobs:
       - name: Syntax check all playbooks
         working-directory: ansible
         run: |
+          # Some playbooks template their `hosts:` from a runtime -e var (e.g.
+          # add_nodes.yml/remove_nodes.yml need new_nodes/... ) and --syntax-check
+          # errors on an empty hosts pattern. Pass harmless dummy values so the
+          # syntax check can parse them; these never connect to anything.
+          DUMMY="-e new_nodes=ctl-0 -e remove_nodes=ctl-0"
           for pb in playbooks/*.yml; do
             echo "== syntax-check $pb =="
-            ansible-playbook --syntax-check -i ci/inventory/ci.ini "$pb" || exit 1
+            ansible-playbook --syntax-check -i ci/inventory/ci.ini $DUMMY "$pb" || exit 1
           done
 
   deploy-6node:
