@@ -72,7 +72,7 @@
              + (hc_port.failed | default(false)) | ternary(['agent port ' ~ spur_agent_port ~ ' not listening'], []) }}
 
 - name: Accounting host (PostgreSQL) health
-  hosts: "{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  hosts: "{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
   become: true
   gather_facts: no
   tasks:
@@ -121,7 +121,7 @@
           {{ hc_problems | default([]) + (hc_disk.stdout is search('LOW_DISK')) | ternary(['low disk (<1GB free) under ' ~ spur_home], []) }}
 
 - name: Summary
-  hosts: "spur_controllers:spur_agents:{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  hosts: "spur_controllers:spur_agents:{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
   become: no
   gather_facts: no
   tasks:

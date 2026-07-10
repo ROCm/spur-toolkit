@@ -10,7 +10,7 @@
   # deployment (accounting is embedded in spurctld now, no separate daemon).
   # Login nodes are included so their WireGuard interface is torn down too (they
   # run no daemon, so the systemd/pkill steps are harmless no-ops there).
-  hosts: "spur_controllers:spur_agents:spur_login:{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  hosts: "spur_controllers:spur_agents:spur_login:{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
   become: true
   gather_facts: no
   tasks:

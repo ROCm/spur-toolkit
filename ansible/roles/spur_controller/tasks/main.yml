@@ -19,7 +19,7 @@
 
 - name: Resolve the accounting host's advertised IP (for the [accounting] block)
   vars:
-    acct_host: "{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+    acct_host: "{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
   ansible.builtin.set_fact:
     spur_accounting_listen_ip: >-
       {{ hostvars[acct_host].spur_wg_address if spur_transport == 'wireguard'

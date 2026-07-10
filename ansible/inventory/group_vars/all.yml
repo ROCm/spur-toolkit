@@ -29,9 +29,17 @@ spur_raft_port: 6821
 # accounting on its own gRPC port (6817), so Postgres must accept remote TCP
 # connections from every controller, not just localhost.
 spur_accounting_enabled: true
-# spur_accounting_host: set in inventory to pin the accounting node (any managed
-# host). Left unset here so an inventory value wins; defaults to the first
-# controller via `| default(groups['spur_controllers'][0])` where referenced.
+# spur_accounting_host: which managed host runs Postgres. NOT set here so that an
+# explicit -e or inventory [all:vars] value keeps full precedence. Consumers
+# resolve it with this fallback chain (see deploy.yml / teardown.yml /
+# healthcheck.yml / spur_controller):
+#   spur_accounting_host                         (explicit -e or inventory var)
+#   | default(groups['spur_accounting_node'][0]) (dedicated DB node — just put the
+#                                                 host in [spur_accounting_node])
+#   | default(groups['spur_controllers'][0])     (co-located default)
+# So pinning a dedicated accounting node needs ONLY the [spur_accounting_node]
+# group — no separate var, and no -e whose timing at a play's hosts: line is
+# unreliable.
 spur_accounting_db_name: spur
 spur_accounting_db_user: spur
 spur_accounting_db_password: spur

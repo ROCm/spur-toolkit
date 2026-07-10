@@ -42,7 +42,7 @@
   # first controller, but may be any managed host incl. a dedicated node). Every
   # controller connects to it directly over the network. Set
   # spur_accounting_enabled=false to skip the stack entirely.
-  hosts: "{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  hosts: "{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
   become: true
   gather_facts: yes
   any_errors_fatal: true
