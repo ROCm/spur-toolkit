@@ -28,6 +28,20 @@
   run_once: true
   when: spur_accounting_enabled | bool
 
+# spur.conf's [[nodes]] block needs ansible_processor_vcpus, ansible_memtotal_mb,
+# and ansible_hostname for every agent. These are only available after fact-gathering.
+# Playbooks that target agents before the controller role (deploy.yml, rolling_upgrade.yml)
+# gather facts on all hosts up front, so this is a no-op there. add_nodes.yml only
+# gathers facts for the new nodes by the time the controller role runs, so any
+# pre-existing agents may be missing facts — this task fills the gap.
+- name: Gather facts for any agent missing them (needed for spur.conf [[nodes]] block)
+  ansible.builtin.setup:
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_agents'] }}"
+  run_once: true
+  when: hostvars[item].ansible_processor_vcpus is not defined
+
 - name: Resolve short node name for each agent (used by spur.conf and --hostname)
   ansible.builtin.set_fact:
     spur_node_name: >-
