@@ -155,13 +155,16 @@ jobs:
             echo "$n: systemd ready ($st)"
           done
 
-      - name: Install in-container preflight deps (curl/tar/iproute2/python3)
+      - name: Install in-container preflight deps (curl/tar/iproute2/python3/sudo)
         env:
           NODES: "ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0"
         run: |
           set -euo pipefail
+          # sudo: Ansible become defaults to sudo; the accounting role uses
+          # become_user: postgres, which needs it. The minimal systemd image
+          # doesn't ship sudo/curl/tar.
           for n in $NODES; do
-            docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3'
+            docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
           done
 
       - name: Install ansible + docker connection plugin
