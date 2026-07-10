@@ -1,11 +1,13 @@
 ---
+# Use spur_node_name (set for every agent by the controller role, with an
+# inventory_hostname fallback) rather than ansible_hostname, which is undefined
+# for an agent that was unreachable during the run.
 - name: Wait for agents to register with controller
-  # `spur nodes` collapses by partition; use `spur show node <name>` per host instead.
   ansible.builtin.shell: |
     set -e
     for i in $(seq 1 30); do
       missing=0
-      for h in {{ groups['spur_agents'] | map('extract', hostvars, 'ansible_hostname') | join(' ') }}; do
+      for h in {{ groups['spur_agents'] | map('extract', hostvars, 'spur_node_name') | join(' ') }}; do
         {{ spur_install_dir }}/spur show node "$h" >/dev/null 2>&1 || missing=$((missing+1))
       done
       [ "$missing" -eq 0 ] && exit 0
@@ -15,7 +17,16 @@
     exit 1
   args:
     executable: /bin/bash
+  register: spur_verify_wait
   changed_when: false
+  # Don't hard-fail: an intentionally-skipped (unreachable) agent will never
+  # register. Report and continue instead of failing the whole verify.
+  failed_when: false
+
+- name: Note if some agents never registered
+  ansible.builtin.debug:
+    msg: "{{ spur_verify_wait.stdout }}"
+  when: spur_verify_wait.rc != 0
 
 - name: Show spur nodes
   ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
