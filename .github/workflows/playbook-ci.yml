@@ -18,11 +18,6 @@ name: playbook-ci
 
 on:
   workflow_dispatch: {}
-  # TEMP: branch-scoped push so the workflow runs on the fork during iteration.
-  # Remove before merge.
-  push:
-    branches:
-      - ci/login-node-and-resilience
   pull_request:
     paths:
       - 'ansible/**'
