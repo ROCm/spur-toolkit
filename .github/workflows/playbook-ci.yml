@@ -185,12 +185,42 @@ jobs:
             -e spur_home=/opt/spur
 
       # --- Assert the cluster actually works -------------------------------
-      - name: Assert agents registered + a job completes
+      - name: Assert both agents registered
         run: |
+          set -euo pipefail
           echo "== spur nodes =="
           docker exec ctl-0 /usr/local/bin/spur nodes
-          count=$(docker exec ctl-0 /usr/local/bin/spur nodes | grep -c 'gpu-' || true)
-          test "$count" -ge 2 || { echo "expected >=2 agents, got $count"; exit 1; }
+          # `spur nodes` collapses the partition's members onto one NODELIST line
+          # (e.g. "gpu-1,gpu-2"), so count node names, not lines. Confirm each
+          # expected agent shows up individually via `spur show node`.
+          for a in gpu-1 gpu-2; do
+            docker exec ctl-0 /usr/local/bin/spur show node "$a" \
+              | grep -qx "NodeName=$a" || { echo "agent $a not registered"; exit 1; }
+          done
+          echo "both agents registered"
+
+      - name: Assert a job runs to completion
+        run: |
+          set -euo pipefail
+          docker exec ctl-0 bash -lc '
+            set -e
+            cat > /tmp/ci-job.sh <<EOF
+          #!/bin/bash
+          #SBATCH --job-name=ci-smoke
+          echo "ran on \$(hostname)"
+          EOF
+            jid=$(/usr/local/bin/spur submit /tmp/ci-job.sh | grep -oE "[0-9]+" | head -1)
+            echo "submitted job $jid"
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              case "$st" in
+                COMPLETED) echo "job $jid COMPLETED"; exit 0 ;;
+                FAILED|CANCELLED|TIMEOUT|NODE_FAIL) echo "job $jid ended $st"; exit 1 ;;
+              esac
+              sleep 2
+            done
+            echo "job $jid did not complete in time (last: ${st:-none})"; exit 1
+          '
 
       # TODO(next): rolling_upgrade.yml with a running job (assert survival +
       #             database_url still points at acct-0)
