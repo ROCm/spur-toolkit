@@ -85,8 +85,15 @@
   ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   max_fail_percentage: "{{ 100 if (spur_ignore_unreachable_agents | default(false) | bool) else 0 }}"
   pre_tasks:
-    # Only set for reachable hosts; an unreachable/skipped agent leaves this
-    # undefined, which gates the delegated drain/wait/resume tasks below off.
+    # Reachability marker: runs ON the agent, so an unreachable one (ignored via
+    # ignore_unreachable) never sets it. Can't reuse spur_node_name — the
+    # controller role sets that for every agent via delegate_facts, so it is
+    # defined even for a down host. The delegated drain/resume tasks below gate
+    # on this so they skip cleanly for a skipped agent.
+    - name: Mark this agent reachable
+      ansible.builtin.set_fact:
+        spur_agent_reachable: true
+
     - name: Resolve this node's registered name
       ansible.builtin.set_fact:
         spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
@@ -97,7 +104,7 @@
         --reason "ansible rolling upgrade"
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: true
-      when: inventory_hostname in ansible_play_hosts
+      when: spur_agent_reachable | default(false)
 
     # Draining stops new scheduling but lets running jobs finish on their own
     # (DRAINING -> DRAINED); only proceed once the node reports fully drained.
@@ -116,7 +123,7 @@
         executable: /bin/bash
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: false
-      when: inventory_hostname in ansible_play_hosts
+      when: spur_agent_reachable | default(false)
 
   roles:
     - role: spur_install
@@ -137,7 +144,7 @@
         executable: /bin/bash
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: false
-      when: inventory_hostname in ansible_play_hosts
+      when: spur_agent_reachable | default(false)
 
     # A drained node stays drained after spurd restarts — draining is server-side
     # state, not tied to the agent process. Without this, upgraded capacity sits
@@ -147,7 +154,7 @@
         {{ spur_install_dir }}/scontrol update NodeName={{ spur_node_name }} State=RESUME
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: true
-      when: inventory_hostname in ansible_play_hosts
+      when: spur_agent_reachable | default(false)
 
 - name: Verify the upgraded cluster still schedules work
   hosts: "{{ groups['spur_controllers'][0] }}"
