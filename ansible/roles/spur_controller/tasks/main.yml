@@ -37,21 +37,30 @@
   run_once: true
   when: hostvars[item].spur_node_name is not defined
 
-# Client env so the CLI (squeue/sinfo/scontrol and sacct/sacctmgr/...) works on
-# controllers without per-command flags. Controller-nodes only. Each controller
-# points SPUR_CONTROLLER_ADDR at its own local spurctld.
+# Client env so the CLI (squeue/sinfo/scontrol and sacct/sacctmgr/sreport/sshare —
+# accounting is served on the same port as the controller API, no separate flag/env
+# needed anymore) works on controllers without per-command flags. Controller-nodes
+# only. Lists every controller (comma-separated) so the CLI's built-in endpoint
+# rotation keeps working from this host even if this particular controller is down.
 - name: Set SPUR_CONTROLLER_ADDR in /etc/environment (controllers)
+  vars:
+    all_controller_endpoints: >-
+      {{ groups['spur_controllers']
+         | map('extract', hostvars, 'spur_controller_listen_ip')
+         | map('regex_replace', '^(.*)$', 'http://\1:' ~ spur_controller_port)
+         | join(',') }}
   ansible.builtin.lineinfile:
     path: /etc/environment
     regexp: '^SPUR_CONTROLLER_ADDR='
-    line: "SPUR_CONTROLLER_ADDR=http://{{ spur_controller_listen_ip }}:{{ spur_controller_port }}"
+    line: "SPUR_CONTROLLER_ADDR={{ all_controller_endpoints }}"
 
-- name: Set SPUR_ACCOUNTING_ADDR in /etc/environment (controllers)
+# Accounting no longer has its own address/port — it rides on SPUR_CONTROLLER_ADDR.
+# Strip any leftover SPUR_ACCOUNTING_ADDR from a pre-merge deployment of this host.
+- name: Remove stale SPUR_ACCOUNTING_ADDR from /etc/environment
   ansible.builtin.lineinfile:
     path: /etc/environment
     regexp: '^SPUR_ACCOUNTING_ADDR='
-    line: "SPUR_ACCOUNTING_ADDR=http://{{ hostvars[groups['spur_controllers'][0]]['spur_accounting_listen_ip'] }}:{{ spur_accounting_port }}"
-  when: spur_accounting_enabled | bool
+    state: absent
 
 - name: Write spur.conf
   ansible.builtin.template:
@@ -107,11 +116,16 @@
     - (raft_peers.stdout_lines | sort) != desired_peers
 
 # Stop BEFORE wiping state so spurctld does not rewrite the Raft log we are about to delete.
+# Only needed when we're actually wiping (and never when skip_restart is requested —
+# add_nodes.yml refreshes spur.conf without touching the running controller).
 - name: Stop spurctld before wiping state
   ansible.builtin.systemd:
     name: spurctld
     state: stopped
   failed_when: false
+  when:
+    - spur_wipe_state | bool
+    - not (spur_controller_skip_restart | default(false) | bool)
 
 - name: Wipe Raft state (when spur_wipe_state is true)
   ansible.builtin.file:
@@ -126,11 +140,17 @@
     mode: "0755"
   when: spur_wipe_state | bool
 
+# spur_controller_skip_restart: set by add_nodes.yml so spur.conf is regenerated
+# (to include a newly added agent) WITHOUT bouncing the running controller — a new
+# spurd registers itself at runtime, so no controller restart is needed to see it.
+# deploy.yml / rolling_upgrade.yml leave this false and restart as usual. When the
+# controller isn't restarted, ensure it's at least enabled + running (first-ever
+# run still needs it started; an already-running one is left untouched).
 - name: Enable and (re)start spurctld
   ansible.builtin.systemd:
     name: spurctld
     enabled: true
-    state: restarted
+    state: "{{ 'started' if (spur_controller_skip_restart | default(false) | bool) else 'restarted' }}"
 
 - name: Wait for spurctld to listen on {{ spur_controller_port }}
   ansible.builtin.wait_for:

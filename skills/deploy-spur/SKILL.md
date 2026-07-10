@@ -1,17 +1,18 @@
 ---
 name: deploy-spur
-description: Use when the user asks to deploy/install a Spur cluster on one or more bare-metal hosts over SSH. Covers every topology the Ansible playbook does — single-node, multi-node, HA (multi-controller Raft), and HA with separate compute nodes — plus optional PostgreSQL/spurdbd accounting and WireGuard mesh. Installs daemons as systemd services and Slurm-compatible CLI symlinks. Drives everything with plain SSH + bash; no Ansible required. ALWAYS asks the user up-front for mode + topology + controller count + accounting before touching anything.
+description: Use when the user asks to deploy/install a Spur cluster, or roll out a new build to an already-running one, on one or more bare-metal hosts over SSH. Covers every topology the Ansible playbook does — single-node, multi-node, HA (multi-controller Raft), and HA with separate compute nodes — plus optional PostgreSQL accounting (embedded in spurctld) and WireGuard mesh. Installs daemons as systemd services and Slurm-compatible CLI symlinks. Drives everything with plain SSH + bash; no Ansible required. ALWAYS asks the user up-front for mode + topology + controller count + accounting before touching anything.
 ---
 
 # Deploy Spur Cluster
 
 Spur is an AI-native job scheduler with these daemons:
 
-- **spurctld** — controller / scheduler / Raft consensus (1 instance, or ≥ 3 for HA)
+- **spurctld** — controller / scheduler / Raft consensus (1 instance, or ≥ 3 for HA). Also serves accounting (sacct/fairshare, backed by PostgreSQL) in-process on its own gRPC port whenever `[accounting].database_url` is set — there is no separate accounting daemon. Only Postgres itself is a distinct service, on `ACCT_HOST` (default: first controller; may be a dedicated node).
 - **spurd** — node agent, runs on every compute host
-- **spurdbd** — optional accounting daemon (sacct/fairshare), backed by PostgreSQL. One instance for the whole cluster, on `ACCT_HOST` (default: first controller; may be a dedicated node).
 
-This skill stands a cluster up with only SSH + bash on the targets. It is the standalone equivalent of `ansible/` and reaches the same end state: daemons run as **systemd services** (survive reboot), Slurm-compatible CLI names are symlinked, and accounting is optional (default on). One flow covers all four topologies — only the host list, Raft topology, and which hosts run an agent differ.
+> Pre-merge Spur builds additionally shipped a standalone `spurdbd` accounting daemon; upstream folded it into `spurctld`. If you're upgrading a cluster that still has `spurdbd.service` active, see **Step 5b: migrating off a standalone spurdbd** below — don't skip it, or you'll end up with two accounting paths fighting over the same Postgres.
+
+This skill stands a cluster up with only SSH + bash on the targets. It is the standalone equivalent of `ansible/` and reaches the same end state: daemons run as **systemd services** (survive reboot), Slurm-compatible CLI names are symlinked, and accounting is optional (default on). One flow covers all four topologies — only the host list, Raft topology, and which hosts run an agent differ. A rolling-upgrade flow (Step 12) upgrades an already-running cluster one host at a time instead of bouncing everything at once.
 
 Defaults (override only if the user asks):
 
@@ -20,23 +21,26 @@ Defaults (override only if the user asks):
 | `SPUR_HOME` | `/root/spur` |
 | `SPUR_INSTALL_DIR` | `/root/.local/bin` |
 | `SPUR_VERSION` | `latest` (passed to `install.sh`; or `nightly` / `vX.Y.Z`) |
-| `SPUR_BINARY_SRC` | *(empty)* — local dir with pre-built `spur/spurctld/spurd/spurdbd`; used when set, else `install.sh` |
+| `SPUR_BINARY_SRC` | *(empty)* — local dir with pre-built `spur/spurctld/spurd`; used when set, else `install.sh` |
 | `SPUR_CONTROLLER_PORT` | `6817` |
 | `SPUR_AGENT_PORT` | `6818` |
 | `SPUR_RAFT_PORT` | `6821` (hardcoded inside spurctld; cannot be changed via CLI) |
-| `SPUR_ACCT_PORT` | `6819` |
+| `ACCT_DB_PORT` | `5432` (PostgreSQL) |
 | `SPUR_CLUSTER_NAME` | `spur-cluster` |
 | `SPUR_LOG_LEVEL` | `info` |
 | `SPUR_WIPE_STATE` | `false` (preserve Raft state so re-runs/upgrades are non-destructive; set `true` for a fresh install or intentional Raft reinit) |
-| `ACCOUNTING` | `true` (deploy PostgreSQL + spurdbd; set `false` to skip) |
+| `ACCOUNTING` | `true` (deploy PostgreSQL; accounting is served by spurctld itself; set `false` to skip) |
 | `ACCT_DB_NAME` / `ACCT_DB_USER` / `ACCT_DB_PASSWORD` | `spur` / `spur` / `spur` |
 | `TRANSPORT` | `direct` (LAN) — or `wireguard` for an encrypted mesh |
+| `ROLLING_BATCH_SIZE` | `1` (agents upgraded per batch in Step 12; controllers are always one at a time) |
 | SSH user | `root` (unless the user specifies otherwise) |
 
 > Every command below is written to work whether the SSH user is `root` or a non-root user with (passwordless) `sudo` — confirm `sudo -n true` succeeds during Step 1's preflight. `SPUR_HOME`/`SPUR_INSTALL_DIR` default under `/root`, which is mode `0700`: a non-root user cannot even `cd`/execute/`test -x` into it, let alone write there, and **no `chown` of a subdirectory fixes this** (the block is on traversing `/root` itself). So:
 > - Every remote command that reads/writes under `/root`, `/etc/systemd/system`, or runs `spur`/`sbatch`/`sacct`/etc. must be `sudo`-prefixed — not just the file-writing steps. This applies uniformly (as root, `sudo` is a harmless no-op).
 > - `scp` and heredoc redirects (`cat > /path <<EOF`) run as the plain SSH user and cannot land a file directly under `/root` even with the SSH user later `sudo`-reading it. Copy to `/tmp` first, then `sudo install`/`sudo mv` it into place.
 > - Alternatively, set `SPUR_INSTALL_DIR`/`SPUR_HOME` to a world-traversable path (e.g. `/opt/spur`) up front to sidestep all of this — but then every install/`sudo` note below is still harmless, just unnecessary.
+>
+> **Password-based SSH works too** — every `ssh`/`scp` command in this skill is a plain invocation with no auth-method assumptions baked in, so if key-based auth isn't set up, prefix each one with `sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no ...` (and the `scp` equivalent). Do **not** add `-o BatchMode=yes` anywhere — it disables SSH's password prompt outright and silently breaks password auth even with `sshpass` supplying the answer.
 
 ## Step 0: gather inputs (MANDATORY — do not skip)
 
@@ -53,7 +57,7 @@ Before any SSH, **ask the user** (use `AskUserQuestion` for anything they didn't
    - `CONTROLLERS` — SSH targets running `spurctld`. Counts: single-node 1, multi-node 1, ha odd ≥ 3.
    - `AGENTS` — SSH targets running `spurd`. Any number ≥ 1. A host may appear in **both** lists (hyperconverged) or **only** in `AGENTS` (dedicated compute / "separate compute" HA).
 
-3. **Accounting** — deploy PostgreSQL + spurdbd for `sacct`/fairshare? Default **yes**. If no, set `ACCOUNTING=false`; job submission still works, only `sacct` is unavailable.
+3. **Accounting** — deploy PostgreSQL for `sacct`/fairshare (served by spurctld itself, no separate daemon)? Default **yes**. If no, set `ACCOUNTING=false`; job submission still works, only `sacct` is unavailable.
 
 4. **Transport** — `direct` (LAN, default) or `wireguard` (encrypted mesh). WireGuard adds Step 2b; everything else is identical (config advertises WG IPs instead of LAN IPs).
 
@@ -72,6 +76,7 @@ Once gathered, define the arrays the rest of the skill uses:
 ```bash
 CONTROLLERS=( user@host1 user@host2 user@host3 )   # ordered — index = Raft node_id - 1; ORDER MUST BE STABLE
 AGENTS=(     user@host4 )                            # may overlap CONTROLLERS (hyperconverged) or be disjoint
+LOGIN=(      )                                        # OPTIONAL dedicated submission/login nodes: CLI only, no daemon. Empty = none.
 SSH_USER=root
 TRANSPORT=direct                                     # or wireguard
 ACCOUNTING=true                                      # or false
@@ -81,11 +86,12 @@ SPUR_HOME=/root/spur
 SPUR_INSTALL_DIR=/root/.local/bin
 SPUR_VERSION=latest
 SPUR_BINARY_SRC=                                     # e.g. /tmp/spur-bin to push pre-built binaries
-SPUR_CONTROLLER_PORT=6817; SPUR_AGENT_PORT=6818; SPUR_RAFT_PORT=6821; SPUR_ACCT_PORT=6819
+SPUR_CONTROLLER_PORT=6817; SPUR_AGENT_PORT=6818; SPUR_RAFT_PORT=6821; ACCT_DB_PORT=5432
 SPUR_CLUSTER_NAME=spur-cluster; SPUR_LOG_LEVEL=info; SPUR_WIPE_STATE=false
 ACCT_DB_NAME=spur; ACCT_DB_USER=spur; ACCT_DB_PASSWORD=spur
+ROLLING_BATCH_SIZE=1                                  # Step 12 only — agents upgraded per batch
 
-HOSTS_ALL=( $(printf '%s\n' "${CONTROLLERS[@]}" "${AGENTS[@]}" | sort -u) )
+HOSTS_ALL=( $(printf '%s\n' "${CONTROLLERS[@]}" "${AGENTS[@]}" "${LOGIN[@]}" | sort -u) )
 ha_enabled=false; [ ${#CONTROLLERS[@]} -gt 1 ] && ha_enabled=true
 ```
 
@@ -96,12 +102,12 @@ Run on every unique host. Abort the whole deploy on any failure.
 ```bash
 for tgt in "${HOSTS_ALL[@]}"; do
   echo "############ $tgt ############"
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$tgt" '
+  ssh -o ConnectTimeout=10 "$tgt" '
     set +e
     echo "host=$(hostname -s) fqdn=$(hostname -f)"
     echo "kernel=$(uname -r) nproc=$(nproc)"
-    echo "--- spur ports (6817/6818/6819/6821) ---"
-    ss -tlnpH 2>/dev/null | grep -E ":(6817|6818|6819|6821)\b" || echo "spur ports free"
+    echo "--- spur ports (6817/6818/6821) ---"
+    ss -tlnpH 2>/dev/null | grep -E ":(6817|6818|6821)\b" || echo "spur ports free"
     echo "--- existing spur pids ---"
     pgrep -ax spurctld; pgrep -ax spurd; pgrep -ax spurdbd; echo "(end pids)"
     echo "--- tools ---"
@@ -125,7 +131,7 @@ Fail-fast rules:
 
 ## Step 2: install Spur binaries on all hosts (idempotent)
 
-Two sources, same as the playbook. `SPUR_BINARY_SRC` (a local dir holding pre-built `spur`, `spurctld`, `spurd`, `spurdbd`) takes precedence — use it when the upstream repo has no published release (`install.sh` returns 403) or for air-gapped installs. Otherwise curl `install.sh`.
+Two sources, same as the playbook. ROCm/spur publishes releases (https://github.com/ROCm/spur/releases) — `install.sh` (no `SPUR_BINARY_SRC` set) downloads one automatically (`SPUR_VERSION=latest` by default, or `nightly` for a mainline build, or a specific `vX.Y.Z`). Set `SPUR_BINARY_SRC` to a local dir holding pre-built `spur`, `spurctld`, `spurd` instead when you need mainline changes not yet released, an air-gapped install, or a custom build.
 
 ```bash
 for tgt in "${HOSTS_ALL[@]}"; do
@@ -136,7 +142,7 @@ for tgt in "${HOSTS_ALL[@]}"; do
   if [ -n "$SPUR_BINARY_SRC" ]; then
     # Push pre-built binaries from the operator box. scp can't land a file directly under
     # /root (it runs as the plain SSH user), so stage in /tmp and sudo-install from there.
-    for b in spur spurctld spurd spurdbd; do
+    for b in spur spurctld spurd; do
       scp -q "${SPUR_BINARY_SRC}/${b}" "${tgt}:/tmp/${b}.spur-push"
       ssh "$tgt" "sudo install -m 0755 /tmp/${b}.spur-push ${SPUR_INSTALL_DIR}/${b} && rm -f /tmp/${b}.spur-push"
     done
@@ -153,7 +159,7 @@ for tgt in "${HOSTS_ALL[@]}"; do
   ssh "$tgt" "
     set -euo pipefail
     sudo test -x ${SPUR_INSTALL_DIR}/spur || { echo 'spur binary missing after install' >&2; exit 1; }
-    for n in sbatch squeue sinfo scancel sacct scontrol salloc srun; do
+    for n in sbatch squeue sinfo scancel sacct sacctmgr scontrol salloc srun sattach scrontab sdiag smd sprio sreport sshare sstat strigger; do
       sudo ln -sf ${SPUR_INSTALL_DIR}/spur ${SPUR_INSTALL_DIR}/\$n
     done
     echo 'spur installed + symlinks created'
@@ -228,9 +234,31 @@ Default is **no wipe** so re-runs and upgrades preserve the job queue and node r
 
 ## Step 5: deploy accounting (only when `ACCOUNTING=true`) — on `ACCT_HOST`
 
-Accounting is a single service for the whole cluster; it lives on `ACCT_HOST` (default `CONTROLLERS[0]`, but may be any host — a controller, an agent, or a dedicated node). Deploy it **before** the controllers so the `[accounting]` block spurctld reads has a live spurdbd. Idempotent: existence-checked role/DB creation. If `ACCT_HOST` is a dedicated node, make sure Step 2 installed the `spurdbd` binary there too (add it to `HOSTS_ALL`).
+Accounting is served in-process by every controller's `spurctld` (no separate daemon); only Postgres is a distinct service, and it lives on `ACCT_HOST` (default `CONTROLLERS[0]`, but may be any host — a controller, an agent, or a dedicated node). Deploy it **before** the controllers so Postgres is reachable when spurctld's embedded accounting service connects. Idempotent: existence-checked role/DB creation.
+
+Because every controller — not just `ACCT_HOST` — connects to this Postgres directly over the network, it must accept remote TCP connections, not just localhost:
 
 ```bash
+# pg_hba lines granting each controller's IP access to the spur DB — built locally,
+# same pattern as the [[nodes]] blocks / CSVs in Step 6. Each is its own dedup-append
+# statement (grep -qxF before appending) so re-running Step 5 doesn't pile up duplicate
+# lines the way a bare `tee -a` would — mirrors Ansible's lineinfile exact-match semantics.
+#
+# pg_hba.conf's address field is a literal IP/CIDR, not a hostname, so this can't just
+# reuse IP[$h] — CONTROLLERS[] entries are SSH targets and may legitimately be DNS
+# names (host_addr() in Step 3 doesn't resolve them, it only strips user@). Appending
+# "somehost.example.com/32" produces an unparseable pg_hba line and takes Postgres
+# down on the next restart. Ask each controller for its own real IP instead — this is
+# also the more correct choice regardless of hostnames: it's the address Postgres will
+# actually see as the connection's source, which may differ from whatever address SSH
+# uses to reach the host (a management VLAN, a NAT'd address, etc.).
+pg_hba_appends=""
+for h in "${CONTROLLERS[@]}"; do
+  ctl_ip=$(ssh "$h" "hostname -I | awk '{print \$1}'")
+  line="host    ${ACCT_DB_NAME}    ${ACCT_DB_USER}    ${ctl_ip}/32    scram-sha-256"
+  pg_hba_appends+="sudo grep -qxF '${line}' \"\$pg_hba\" || echo '${line}' | sudo tee -a \"\$pg_hba\" >/dev/null"$'\n'
+done
+
 if [ "$ACCOUNTING" = true ]; then
   ssh "$ACCT_HOST" "
     set -euo pipefail
@@ -246,38 +274,42 @@ if [ "$ACCOUNTING" = true ]; then
       || sudo -u postgres psql -c \"CREATE ROLE ${ACCT_DB_USER} LOGIN PASSWORD '${ACCT_DB_PASSWORD}'\"
     sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${ACCT_DB_NAME}'\" | grep -q 1 \
       || sudo -u postgres psql -c \"CREATE DATABASE ${ACCT_DB_NAME} OWNER ${ACCT_DB_USER}\"
-    sudo test -x ${SPUR_INSTALL_DIR}/spurdbd || { echo 'spurdbd binary missing — install it or set ACCOUNTING=false' >&2; exit 1; }
-  "
 
-  # Install + start the spurdbd systemd unit. --migrate creates the accounting tables.
-  # Written to /tmp then sudo-installed: a plain heredoc redirect can't land a file
-  # under /etc/systemd/system when the SSH user isn't root.
-  ssh "$ACCT_HOST" "cat > /tmp/spurdbd.service.tmp <<'UNIT'
-[Unit]
-Description=Spur Accounting Daemon (spurdbd)
-After=network-online.target postgresql.service
-Wants=network-online.target
-Requires=postgresql.service
-
-[Service]
-Type=simple
-ExecStart=${SPUR_INSTALL_DIR}/spurdbd --database-url postgresql://${ACCT_DB_USER}:${ACCT_DB_PASSWORD}@localhost/${ACCT_DB_NAME} --listen [::]:${SPUR_ACCT_PORT} --migrate --log-level ${SPUR_LOG_LEVEL}
-Restart=on-failure
-RestartSec=3
-User=root
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-  sudo mv /tmp/spurdbd.service.tmp /etc/systemd/system/spurdbd.service
-  sudo systemctl daemon-reload
-  sudo systemctl enable spurdbd
-  sudo systemctl restart spurdbd
-  for i in \$(seq 1 30); do ss -tlnH | grep -q ':${SPUR_ACCT_PORT}\b' && { echo 'spurdbd up'; break; }; sleep 1; [ \$i -eq 30 ] && { echo 'spurdbd did not bind ${SPUR_ACCT_PORT}' >&2; exit 1; }; done
+    # Listen on all interfaces and allow every controller's IP to authenticate.
+    # /etc/postgresql/<version>/main/postgresql.conf is 3 levels below /etc/postgresql.
+    pg_conf=\$(sudo find /etc/postgresql -maxdepth 3 -name postgresql.conf | head -1)
+    pg_hba=\$(dirname \"\$pg_conf\")/pg_hba.conf
+    sudo sed -i \"s/^#\\?\\s*listen_addresses\\s*=.*/listen_addresses = '*'/\" \"\$pg_conf\"
+    grep -q listen_addresses \"\$pg_conf\" || echo \"listen_addresses = '*'\" | sudo tee -a \"\$pg_conf\" >/dev/null
+    ${pg_hba_appends}
+    sudo systemctl restart postgresql
+    for i in \$(seq 1 30); do ss -tlnH | grep -q ':${ACCT_DB_PORT}\b' && { echo 'postgres up'; break; }; sleep 1; [ \$i -eq 30 ] && { echo 'postgres did not bind ${ACCT_DB_PORT}' >&2; exit 1; }; done
   "
 fi
 ```
+
+## Step 5b: migrating off a standalone spurdbd (pre-merge upgrades only)
+
+Skip this if the cluster has never run the old, separate `spurdbd` daemon. If it has (check `systemctl is-active spurdbd` on `ACCT_HOST`, or an `[accounting] host = ...` line in `spur.conf`), clean it up on `ACCT_HOST` — otherwise the old daemon keeps running (harmlessly, but confusingly) alongside the new embedded accounting:
+
+```bash
+ssh "$ACCT_HOST" "
+  sudo systemctl disable --now spurdbd 2>/dev/null || true
+  sudo rm -f /etc/systemd/system/spurdbd.service
+  sudo systemctl daemon-reload
+  sudo rm -f ${SPUR_INSTALL_DIR}/spurdbd
+"
+```
+
+The old pre-merge `spur_binary_src` push (Step 2) copied `spurdbd` to every host in `HOSTS_ALL`, not just `ACCT_HOST` — it only ever *ran* as a service on `ACCT_HOST`, but a stray unused binary can be left on other controllers/agents too. Sweep it everywhere while you're at it:
+
+```bash
+for tgt in "${HOSTS_ALL[@]}"; do
+  ssh "$tgt" "sudo rm -f ${SPUR_INSTALL_DIR}/spurdbd"
+done
+```
+
+Run this before (or as part of) Step 5, then proceed to Step 6 — the regenerated `spur.conf` (below) already drops the old `host = ...` key.
 
 ## Step 6: render spur.conf + install spurctld systemd unit on every controller
 
@@ -303,13 +335,15 @@ for h in "${AGENTS[@]}"; do
 done
 part_csv=${part_csv%,}
 
-# Accounting block (only when enabled) points at ACCT_HOST's advertised IP.
+# Accounting block (only when enabled). No separate daemon anymore — spurctld
+# connects to Postgres directly, so database_url uses ACCT_HOST's network address
+# (not localhost) even for a controller that happens to be ACCT_HOST itself.
 # ${IP[$ACCT_HOST]} requires ACCT_HOST to be in HOSTS_ALL (Step 3); falls back to
 # stripping user@ from ACCT_HOST if it wasn't resolved into the IP map.
 acct_block=""
 if [ "$ACCOUNTING" = true ]; then
   acct_ip="${IP[$ACCT_HOST]:-${ACCT_HOST#*@}}"
-  acct_block=$'\n'"[accounting]"$'\n'"host = \"${acct_ip}:${SPUR_ACCT_PORT}\""$'\n'"database_url = \"postgresql://${ACCT_DB_USER}:${ACCT_DB_PASSWORD}@localhost/${ACCT_DB_NAME}\""$'\n'"fairshare_refresh_secs = 30"$'\n'
+  acct_block=$'\n'"[accounting]"$'\n'"database_url = \"postgresql://${ACCT_DB_USER}:${ACCT_DB_PASSWORD}@${acct_ip}:${ACCT_DB_PORT}/${ACCT_DB_NAME}\""$'\n'"fairshare_refresh_secs = 30"$'\n'
 fi
 
 wg_line="wg_enabled = false"
@@ -403,28 +437,29 @@ if $ha_enabled; then
 fi
 ```
 
-Set the client env on each **controller** so `squeue`/`sinfo`/`scontrol` (use `SPUR_CONTROLLER_ADDR`) and `sacct`/`sacctmgr`/`sreport`/`sshare` (use `SPUR_ACCOUNTING_ADDR`) work with no per-command flags — otherwise they default to `localhost` and fail on any controller that isn't the accounting host. Controllers only (agents don't run the CLI for users here):
+Set the client env on each **controller** so `squeue`/`sinfo`/`scontrol` and `sacct`/`sacctmgr`/`sreport`/`sshare` (all use `SPUR_CONTROLLER_ADDR` now — accounting rides the controller's own port, there's no separate accounting flag/env anymore) work with no per-command flags. List **every** controller, comma-separated — `spur-cli` rotates past a dead endpoint, so a controller can serve the CLI even when a different controller (or itself) is down. Controllers only (agents don't run the CLI for users here):
 
 ```bash
-ACCT_IP="${IP[$ACCT_HOST]:-${ACCT_HOST#*@}}"
+ctl_endpoints_csv=""
+for c in "${CONTROLLERS[@]}"; do ctl_endpoints_csv+="http://${IP[$c]}:${SPUR_CONTROLLER_PORT},"; done
+ctl_endpoints_csv=${ctl_endpoints_csv%,}
+
 for ctl in "${CONTROLLERS[@]}"; do
-  ctl_ip="${IP[$ctl]}"
   ssh "$ctl" "
     sudo sed -i '/^SPUR_CONTROLLER_ADDR=/d;/^SPUR_ACCOUNTING_ADDR=/d' /etc/environment
-    echo 'SPUR_CONTROLLER_ADDR=http://${ctl_ip}:${SPUR_CONTROLLER_PORT}' | sudo tee -a /etc/environment >/dev/null
-    $( [ \"$ACCOUNTING\" = true ] && echo "echo 'SPUR_ACCOUNTING_ADDR=http://${ACCT_IP}:${SPUR_ACCT_PORT}' | sudo tee -a /etc/environment >/dev/null" )
+    echo 'SPUR_CONTROLLER_ADDR=${ctl_endpoints_csv}' | sudo tee -a /etc/environment >/dev/null
   "
 done
 ```
 
-(`/etc/environment` is read at login, so a fresh shell / `bash -lc` picks it up; for `sudo` also running the CLI, use `sudo -E` to pass the vars through.)
+(`/etc/environment` is read at login, so a fresh shell / `bash -lc` picks it up; for `sudo` also running the CLI, use `sudo -E` to pass the vars through. The `sed` also strips any stale `SPUR_ACCOUNTING_ADDR` left over from a pre-merge deployment of this host.)
 
 ## Step 7: install spurd systemd unit on every agent
 
-`spurd --controller` takes a single URL — point every agent at `CONTROLLERS[0]` (followers forward writes via Raft). `WorkingDirectory=${SPUR_HOME}` in the unit sets the *fallback* stdout dir for `spur-<N>.out` (a job's own `WorkDir`/submit-CWD takes precedence). `--hostname`/`--address` are explicit (auto-detect picks `127.0.0.1`, breaking inter-node dispatch).
+`spurd --controller` accepts a comma-separated endpoint list and rotates past a dead one (spur-client endpoint rotation), so every agent is pointed at **every** controller, not just `CONTROLLERS[0]` — a single surviving controller is enough (followers forward writes via Raft either way). `WorkingDirectory=${SPUR_HOME}` in the unit sets the *fallback* stdout dir for `spur-<N>.out` (a job's own `WorkDir`/submit-CWD takes precedence). `--hostname`/`--address` are explicit (auto-detect picks `127.0.0.1`, breaking inter-node dispatch).
 
 ```bash
-CTL0="${IP[${CONTROLLERS[0]}]}"
+CTL_ENDPOINTS="$ctl_endpoints_csv"   # reuse the list built for the client env above
 for ag in "${AGENTS[@]}"; do
   # /tmp-then-sudo-mv: a plain heredoc redirect can't write to /etc/systemd/system as a
   # non-root SSH user.
@@ -438,7 +473,7 @@ Wants=network-online.target
 Type=simple
 Environment=HOME=${SPUR_HOME}
 WorkingDirectory=${SPUR_HOME}
-ExecStart=${SPUR_INSTALL_DIR}/spurd --controller http://${CTL0}:${SPUR_CONTROLLER_PORT} --hostname ${SHORT[$ag]} --address ${IP[$ag]} --listen 0.0.0.0:${SPUR_AGENT_PORT} --log-level ${SPUR_LOG_LEVEL}
+ExecStart=${SPUR_INSTALL_DIR}/spurd --controller ${CTL_ENDPOINTS} --hostname ${SHORT[$ag]} --address ${IP[$ag]} --listen 0.0.0.0:${SPUR_AGENT_PORT} --log-level ${SPUR_LOG_LEVEL}
 Restart=on-failure
 RestartSec=3
 User=root
@@ -456,6 +491,23 @@ UNIT
   "
 done
 ```
+
+## Step 7b: configure login (submission) nodes (only when `LOGIN` is non-empty)
+
+A login node is a pure client: the `spur` CLI (installed in Step 2) + the controller env, **no daemon**. Users SSH in and run `sbatch`/`squeue`/`sacct`/`srun`. Just set `SPUR_CONTROLLER_ADDR` (same comma-joined controller list the controllers get in Step 6) — accounting rides that address, no separate env. Nothing else to install or start.
+
+```bash
+if [ ${#LOGIN[@]} -gt 0 ]; then
+  for lg in "${LOGIN[@]}"; do
+    ssh "$lg" "
+      sudo sed -i '/^SPUR_CONTROLLER_ADDR=/d;/^SPUR_ACCOUNTING_ADDR=/d' /etc/environment
+      echo 'SPUR_CONTROLLER_ADDR=${ctl_endpoints_csv}' | sudo tee -a /etc/environment >/dev/null
+    "
+  done
+fi
+```
+
+> Networking: a login node needs outbound access to the controllers on `${SPUR_CONTROLLER_PORT}` (all CLI + accounting) and, for interactive `srun` live output, to the agents on `${SPUR_AGENT_PORT}` (`srun` streams output directly from the agent). Under `TRANSPORT=wireguard`, run Step 2b's join on each login node too (assign it a mesh IP and `spur net add-peer` it on the controller) so this works over the tunnel.
 
 ## Step 8: wait for every agent to register
 
@@ -550,7 +602,7 @@ done
 ### Accounting check (when `ACCOUNTING=true`)
 
 ```bash
-ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/sacct | head"   # sacct works from any controller (gRPC to spurdbd)
+ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/sacct | head"   # sacct works from any controller (accounting is served by spurctld itself)
 ssh "$ACCT_HOST" "sudo -u postgres psql -d ${ACCT_DB_NAME} -tAc 'SELECT count(*) FROM jobs;'"   # postgres lives on ACCT_HOST
 ```
 Expect a row per completed job. (With `ACCOUNTING=false`, `sacct` is expected to fail — that's fine; jobs still run.)
@@ -564,7 +616,7 @@ ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/spur queue"
 # Every daemon should be systemd-active.
 for ctl in "${CONTROLLERS[@]}"; do ssh "$ctl" "systemctl is-active spurctld"; done
 for ag  in "${AGENTS[@]}";      do ssh "$ag"  "systemctl is-active spurd"; done
-[ "$ACCOUNTING" = true ] && ssh "$ACCT_HOST" "systemctl is-active spurdbd postgresql"
+[ "$ACCOUNTING" = true ] && ssh "$ACCT_HOST" "systemctl is-active postgresql"
 
 # HA: identify the CURRENT leader. Every node that was ever leader has a
 # 'become leader' line, so grep -m1 (first match) is wrong after any
@@ -600,24 +652,107 @@ done
 
 To also remove accounting data (destructive): `ssh "$ACCT_HOST" "sudo -u postgres dropdb ${ACCT_DB_NAME}; sudo -u postgres dropuser ${ACCT_DB_USER}"`. Only do this if the user explicitly asks — it deletes all job history. Leave PostgreSQL itself installed unless asked to purge it.
 
+## Step 12: rolling upgrade (only when asked to upgrade a live cluster)
+
+Use this instead of re-running Steps 1–9 when jobs are currently running and a full-cluster daemon bounce (which Steps 1-9 do — no draining, no batching) is not acceptable. Assumes the cluster is already up and healthy; refuse to proceed otherwise. Requires `SPUR_BINARY_SRC` pointing at the new build (rebuild all three binaries together — same caveat as any upgrade). Only exercised so far with `TRANSPORT=direct`; the `IP[]` map this step reuses from Step 3 still needs to hold real addresses (`WG_IP[]` per Step 2b) for a wireguard cluster — re-derive it in this shell session first if it isn't already populated.
+
+**This step only pushes new binaries and restarts daemons — it does not touch `spur.conf` or Postgres.** If the cluster is still on the pre-merge standalone-`spurdbd` architecture, do the Step 5b migration first (a full-flow, bounce-based operation: Steps 2/4/5b/5/6/7/8/9/10) and confirm it's healthy on the merged-accounting build *before* using this step for further low-disruption upgrades. Running this step against a still-unmigrated cluster would push a spurctld binary that expects the new embedded-accounting config shape without updating `spur.conf`/`pg_hba.conf` to match — don't do that.
+
+```bash
+# Guard rail: refuse a rolling upgrade if state would be wiped, or the cluster
+# isn't already healthy.
+[ "$SPUR_WIPE_STATE" = true ] && { echo "rolling upgrade must not wipe Raft state" >&2; exit 1; }
+ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/spur nodes >/dev/null" \
+  || { echo "cluster is not healthy before starting — investigate first" >&2; exit 1; }
+
+# --- Controllers, ONE AT A TIME (never in parallel — that would drop Raft quorum) ---
+for ctl in "${CONTROLLERS[@]}"; do
+  echo "=== upgrading controller ${SHORT[$ctl]} ==="
+  for b in spur spurctld spurd; do
+    scp -q "${SPUR_BINARY_SRC}/${b}" "${ctl}:/tmp/${b}.spur-push"
+    ssh "$ctl" "sudo install -m 0755 /tmp/${b}.spur-push ${SPUR_INSTALL_DIR}/${b} && rm -f /tmp/${b}.spur-push"
+  done
+  ssh "$ctl" "sudo systemctl restart spurctld"
+  ssh "$ctl" "for i in \$(seq 1 30); do ss -tlnH | grep -q ':${SPUR_CONTROLLER_PORT}\b' && exit 0; sleep 1; done; exit 1" \
+    || { echo "${SHORT[$ctl]} did not come back up — aborting rolling upgrade" >&2; exit 1; }
+  # Health gate before moving to the next controller: leader must be elected again.
+  # Client-side failover means the OTHER controllers keep serving agents/CLI while
+  # this one is down, so this is the only wait needed between controllers.
+  if $ha_enabled; then
+    ssh "${CONTROLLERS[0]}" "
+      for i in \$(seq 1 60); do
+        out=\$(sudo ${SPUR_INSTALL_DIR}/spur nodes 2>&1); rc=\$?
+        [ \$rc -eq 0 ] && ! echo \"\$out\" | grep -qE 'no leader|not the Raft leader|cannot reach leader|transport error|Connection refused' && { echo OK; exit 0; }
+        sleep 1
+      done
+      echo 'timeout waiting for leader after controller restart' >&2; exit 1
+    " || exit 1
+  fi
+done
+
+# --- Agents, in batches of ROLLING_BATCH_SIZE (default 1) ---
+i=0
+while [ $i -lt ${#AGENTS[@]} ]; do
+  batch=("${AGENTS[@]:i:ROLLING_BATCH_SIZE}")
+  echo "=== draining batch: ${batch[*]} ==="
+  for ag in "${batch[@]}"; do
+    ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/spur node drain ${SHORT[$ag]} --reason 'rolling upgrade'"
+  done
+  for ag in "${batch[@]}"; do
+    for j in $(seq 1 120); do
+      st=$(ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/spur show node ${SHORT[$ag]} 2>/dev/null" \
+           | awk -v n="${SHORT[$ag]}" '/^NodeName=/{p=($0=="NodeName="n)} p' | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
+      [ "$st" = "DRAINED" ] && break
+      [ $j -eq 120 ] && { echo "${SHORT[$ag]} did not drain (still running jobs after 120s)" >&2; exit 1; }
+      sleep 1
+    done
+  done
+  for ag in "${batch[@]}"; do
+    for b in spur spurctld spurd; do
+      scp -q "${SPUR_BINARY_SRC}/${b}" "${ag}:/tmp/${b}.spur-push"
+      ssh "$ag" "sudo install -m 0755 /tmp/${b}.spur-push ${SPUR_INSTALL_DIR}/${b} && rm -f /tmp/${b}.spur-push"
+    done
+    ssh "$ag" "sudo systemctl restart spurd"
+  done
+  for ag in "${batch[@]}"; do
+    for j in $(seq 1 30); do
+      ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/spur show node ${SHORT[$ag]} >/dev/null 2>&1" && break
+      [ $j -eq 30 ] && { echo "${SHORT[$ag]} never re-registered after upgrade" >&2; exit 1; }
+      sleep 1
+    done
+    ssh "${CONTROLLERS[0]}" "sudo ${SPUR_INSTALL_DIR}/scontrol update NodeName=${SHORT[$ag]} State=RESUME"
+  done
+  i=$((i + ROLLING_BATCH_SIZE))
+done
+
+# Confirm the upgraded cluster actually schedules work (reuse Step 9's single-node test).
+```
+
+Notes:
+- **Drain, don't kill.** `spur node drain` stops new scheduling onto a node and lets its running jobs finish on their own (`DRAINING → DRAINED`); it does not evict them. Only touch the binary/restart `spurd` once a node reaches `DRAINED`.
+- **A drained node stays drained after `spurd` restarts** — draining is server-side state, not tied to the agent process. The `scontrol update ... State=RESUME` step is mandatory, or upgraded capacity sits idle indefinitely.
+- **Controllers never restart in parallel.** With < 3 controllers there's no other controller to fail over to during the restart, so a rolling upgrade of a single-controller (or 2-controller) cluster is still a short outage — this only buys zero-downtime with a real HA quorum (≥ 3).
+- If any step aborts partway, the cluster is left in a safe, valid state (some hosts upgraded, some not, nothing drained-and-forgotten except mid-batch — check `spur nodes` for any node still `DRAIN`/`DRAINING` and `RESUME` it manually before retrying).
+
 ## Gotchas (all hard-won — don't relearn them)
 
 ### Install / systemd
-- **This skill uses systemd**, not `nohup`. Units are `/etc/systemd/system/spur{ctld,d,dbd}.service`, `enabled` (survive reboot), `Restart=on-failure`. Always `systemctl daemon-reload` after writing a unit.
+- **This skill uses systemd**, not `nohup`. Units are `/etc/systemd/system/spur{ctld,d}.service` (`spurdbd.service` only exists as a leftover from a pre-merge deployment — see Step 5b), `enabled` (survive reboot), `Restart=on-failure`. Always `systemctl daemon-reload` after writing a unit.
 - **`spur --version` is NOT supported** — it errors. Check the binary with `test -x`, not by running `--version`.
-- **`install.sh` returns 403 when the repo has no published release.** Set `SPUR_BINARY_SRC` to a local dir of pre-built binaries and the skill scp's them instead.
-- **Slurm-compat symlinks** (`sbatch`/`squeue`/`sinfo`/`scancel`/`sacct`/`scontrol`/`salloc`/`srun` → `spur`) are created on every install path. The `spur` multi-call binary dispatches on argv[0].
+- **`install.sh` now works** (ROCm/spur publishes releases) — leaving `SPUR_BINARY_SRC` unset downloads one automatically. Set `SPUR_BINARY_SRC` to a local dir of pre-built binaries instead for mainline changes not yet released, air-gapped installs, or a custom build.
+- **Slurm-compat symlinks** — all 18 names the `spur` multi-call binary recognizes via argv[0] dispatch (`sbatch`, `squeue`, `sinfo`, `scancel`, `sacct`, `sacctmgr`, `scontrol`, `salloc`, `srun`, `sattach`, `scrontab`, `sdiag`, `smd`, `sprio`, `sreport`, `sshare`, `sstat`, `strigger`) → `spur` — are created on every install path.
 - **`pkill -f spurd` also kills `spurctld`** (substring match). Always `pkill -x` (exact name).
 
 ### Accounting
-- **Deploy accounting BEFORE the controller.** spurctld reads the `[accounting]` block at start and connects to spurdbd; if spurdbd isn't up yet, wire it first (Step 5 precedes Step 6).
-- **spurdbd needs `--migrate`** to create the accounting tables on first run.
-- **Accounting is one instance for the whole cluster**, on `CONTROLLERS[0]`. Don't run it per-node.
+- **No separate accounting daemon** — upstream folded `spurdbd` into `spurctld`. Deploy Postgres BEFORE the controllers (Step 5 precedes Step 6) so each controller's embedded accounting service can connect and migrate on startup.
+- **Every controller needs network access to Postgres, not just localhost** — each spurctld connects directly, so `listen_addresses`/`pg_hba.conf` must allow every controller's IP (Step 5), not just `ACCT_HOST`.
+- **Migrations run automatically inside spurctld** against `database_url`; a failed migration disables accounting for that controller (scheduling still works, `sacct` won't) rather than crashing it.
 - **Default DB creds are `spur/spur/spur`** — fine for a lab, change `ACCT_DB_PASSWORD` for anything real. Flag this to the user.
 - **`SPUR_WIPE_STATE` defaults to `false`** — re-runs and upgrades preserve the Raft job queue and node registrations. `SPUR_WIPE_STATE=true` resets the Raft job-id counter (job ids restart at 1, upserting onto the same accounting rows); use it only for a fresh install or intentional reinit.
-- **Rebuild all four binaries together for an upgrade.** The daemons share a Raft WAL schema and a spurdbd DB schema. Pushing a `spurctld` built from a different tree than its peers can crash it on start (`unknown variant …` / `LogIndex(N) violates`) when it reads a log entry it can't parse.
+- **Rebuild all three binaries together for an upgrade.** The daemons share a Raft WAL schema. Pushing a `spurctld` built from a different tree than its peers can crash it on start (`unknown variant …` / `LogIndex(N) violates`) when it reads a log entry it can't parse.
 - **Changing the controller set needs a wipe** (Spur 0.3.0 has no online membership change). Adding/removing/reordering a controller with state preserved leaves openraft with a mismatched on-disk membership. Agents are not Raft members — add/remove them freely.
 - **A stale dpkg lock** (`Could not get lock /var/lib/dpkg/lock-frontend`) means another apt/unattended-upgrade is running. Wait for it, or clear a genuinely hung `apt-get` before retrying — don't `--force`.
+- **Migrating a pre-merge cluster leaves a stale `spurdbd` behind if you skip Step 5b** — it keeps running (harmlessly) alongside the new embedded accounting until explicitly stopped/disabled/removed.
 
 ### Spur quirks
 - **Output file `spur-<N>.out` goes to the job's `WorkDir` = the CWD at submit time.** Submitting from `/tmp` writes `/tmp/spur-<N>.out`; submitting from the SSH user's home writes it there. Do NOT `cd` into a 0700 dir (e.g. `/root/spur`) when SSHing as a non-root user — the `cd` fails and WorkDir silently becomes the user's home. Pin the submit CWD to `/tmp` for predictability, and search `/tmp /home /root ${SPUR_HOME}` when hunting for output.
@@ -626,6 +761,8 @@ To also remove accounting data (destructive): `ssh "$ACCT_HOST" "sudo -u postgre
 - **`spur show job` uses `JobState=COMPLETED` (uppercase).** Parse `JobState=[A-Z]+`.
 - **Raft port 6821 is hardcoded** in spurctld (not a CLI flag). Preflight must include it.
 - **Harmless log spam `invalid transition from Completed to Completed`** on followers after multi-node jobs — the job actually succeeded.
+- **Harmless `ERROR`-level openraft log line on every spurctld restart** — `Can not initialize last_log_id=Some(...) vote=...:committed`. Despite the `ERROR` severity, this is normal on a restart with existing Raft state (single-node or HA); it doesn't indicate a problem — check `spur nodes`/job/accounting behavior, not this log line, to judge success.
+- **Harmless spurd startup warning `failed to load spur.conf ... path=/etc/spur/spur.conf`** — `spurd` is driven entirely by CLI flags and never actually reads a config file; this warning is always present and doesn't indicate misconfiguration.
 - **`$SPUR_NUM_NODES` is not set in the job environment** (as of Spur 0.3.0) even in multi-node jobs — only `$SPUR_TASK_OFFSET` and `$SPUR_PEER_NODES` are populated. A smoke-test script referencing it will print an empty value; don't treat that as a failure signal.
 - **A per-job scratch file (e.g. `.spur_job_<id>.sh`) can be left behind in an agent's WorkDir** and, on a shared/reused host, block a later job with a different id from writing its own script (`agent rejected job: failed to write job script`). The job then sits in `COMPLETING` forever and the node shows `mix` instead of `idle` — there's no automatic timeout/recovery. Fix by `spur cancel <jobid>` and removing the stale scratch file by hand; teardown (Step 11) does not clean these up since it only removes `${SPUR_HOME}` and `*.out` files, not arbitrary WorkDirs.
 
@@ -637,13 +774,13 @@ To also remove accounting data (destructive): `ssh "$ACCT_HOST" "sudo -u postgre
 - **HA `peers` list order must be stable across redeploys.** `node_id` is the 1-based position; reordering breaks openraft. To re-order, wipe state on every controller and redeploy.
 - **`-N` in a multi-node job must not exceed the agent count**, or it stays PENDING.
 - **Separate-compute HA:** controllers NOT in `AGENTS` must have no `spurd`. Verify with `systemctl is-active spurd` → `inactive`.
-- **Client-side failover is NOT implemented in Spur 0.3.0.** `spurd --controller` is a single URL; if `CONTROLLERS[0]` dies, agents are stranded even with a live Raft leader. Production HA needs an L4 VIP / DNS in front of `:6817`.
+- **Client-side failover is automatic.** `spurd --controller` and the CLI's `SPUR_CONTROLLER_ADDR` accept a comma-separated endpoint list and rotate past a dead one, so every agent and each controller's own env lists *every* controller, not just `CONTROLLERS[0]`. No VIP/DNS is required for basic failover.
 
 ## Report back
 
 End the run with:
 - Mode + counts (X controllers, Y agents), transport, accounting on/off
-- Per-host: install source (binary-src vs installer), `systemctl is-active` for each daemon, log source (`journalctl -u spurctld`/`spurd`/`spurdbd`)
+- Per-host: install source (binary-src vs installer), `systemctl is-active` for each daemon, log source (`journalctl -u spurctld`/`spurd`, or `spurdbd` if a legacy pre-merge unit is still present)
 - `spur nodes` output
 - HA only: which `node_id` became leader
 - Accounting only: `sacct` output + DB job count

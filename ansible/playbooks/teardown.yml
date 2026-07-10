@@ -5,8 +5,12 @@
 # Add -e wipe=true to also wipe ~/spur and /etc/wireguard/spur0.* (destructive).
 
 - name: Stop Spur daemons
-  # Include the accounting host too, in case it is a dedicated node not in either group.
-  hosts: "spur_controllers:spur_agents:{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  # Include the accounting host too, in case it is a dedicated node not in either
+  # group — this also cleans up a standalone spurdbd left over from a pre-merge
+  # deployment (accounting is embedded in spurctld now, no separate daemon).
+  # Login nodes are included so their WireGuard interface is torn down too (they
+  # run no daemon, so the systemd/pkill steps are harmless no-ops there).
+  hosts: "spur_controllers:spur_agents:spur_login:{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
   become: true
   gather_facts: no
   tasks:

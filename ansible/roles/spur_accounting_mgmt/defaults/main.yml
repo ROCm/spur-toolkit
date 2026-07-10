@@ -1,0 +1,41 @@
+---
+# Declarative accounting entities applied by manage_accounts.yml via `sacctmgr`.
+# All default empty, so running the playbook with none defined is a safe no-op.
+# `sacctmgr add` is a server-side upsert (ON CONFLICT ... DO UPDATE), so listing
+# an entity here is create-or-update; re-running is idempotent.
+#
+# Each item is a dict of sacctmgr key=value params. `name` is required; the rest
+# are optional and only passed when set. Accepted keys per entity type:
+#   qos:      name, priority, preemptmode, usagefactor, maxjobsperuser,
+#             maxsubmitjobsperuser, maxwall, maxtresperjob, maxtresperuser, description
+#   account:  name, description, organization, parent, fairshare, maxrunningjobs (maxjobs), grptres
+#   user:     name, account, adminlevel, defaultaccount
+#
+# Apply order is qos -> accounts -> users (a user references an account, and an
+# account may reference a parent). Removal order is the reverse (users first),
+# because associations.account has a foreign key onto accounts(name) with no
+# cascade — deleting an account with live user associations fails.
+
+spur_qos: []
+# - { name: high, priority: 100, maxwall: 1440 }
+
+spur_accounts: []
+# - { name: research, description: "Research group", fairshare: 100 }
+# - { name: ml, parent: research, fairshare: 50 }
+
+spur_users: []
+# - { name: alice, account: ml, defaultaccount: ml }
+# - { name: bob, account: research, adminlevel: Operator }
+
+# Optional removals. name (and for users, account) only.
+spur_qos_absent: []        # - { name: high }
+spur_users_absent: []      # - { name: bob, account: research }
+spur_accounts_absent: []   # - { name: ml }
+
+# Recognized sacctmgr param keys per entity, used to build key=value args from the
+# dicts above while ignoring any unrecognized keys. Keep in sync with upstream
+# spur-cli/src/sacctmgr.rs if it grows new params.
+spur_acctmgr_keys:
+  qos: [priority, preemptmode, usagefactor, maxjobsperuser, maxsubmitjobsperuser, maxwall, maxtresperjob, maxtresperuser, description]
+  account: [description, organization, parent, fairshare, maxrunningjobs, maxjobs, grptres]
+  user: [account, adminlevel, defaultaccount]

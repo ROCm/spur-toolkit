@@ -6,16 +6,19 @@
          else (ansible_host | default(ansible_default_ipv4.address)) }}
     spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
 
-- name: Resolve controller address agents will talk to
-  # NOTE: spurd --controller takes a single URL in Spur 0.3.0. In HA mode we still
-  # point at the first controller — non-leader controllers forward writes via the
-  # Raft cluster. Real failover when ctl[0] dies needs a VIP / DNS in front of 6817.
+- name: Resolve controller endpoint(s) agents will talk to
+  # spurd --controller accepts a comma-separated endpoint list and rotates past a
+  # dead one (spur-client endpoint rotation), so every controller is listed here —
+  # not just the first — for real client-side failover in HA mode. Non-leader
+  # controllers forward writes to the leader via Raft either way.
+  vars:
+    controller_ip: >-
+      {{ hostvars[item]['spur_wg_address'] if spur_transport == 'wireguard'
+         else (hostvars[item]['ansible_host'] | default(hostvars[item]['ansible_default_ipv4']['address'])) }}
   ansible.builtin.set_fact:
-    spur_controller_addr: >-
-      {{ hostvars[groups['spur_controllers'][0]]['spur_wg_address']
-         if spur_transport == 'wireguard'
-         else hostvars[groups['spur_controllers'][0]]['ansible_host']
-              | default(hostvars[groups['spur_controllers'][0]]['ansible_default_ipv4']['address']) }}
+    spur_controller_endpoints: >-
+      {{ (spur_controller_endpoints | default([])) + ["http://" ~ controller_ip ~ ":" ~ spur_controller_port] }}
+  loop: "{{ groups['spur_controllers'] }}"
 
 - name: Install spurd systemd unit
   # WorkingDirectory in the unit is {{ spur_home }} so job stdout (spur-<N>.out)

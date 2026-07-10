@@ -1,0 +1,156 @@
+---
+# Add compute agent(s) to a RUNNING Spur cluster with minimal disruption.
+#
+# Unlike a full deploy.yml run (which restarts every spurctld and every spurd),
+# this only starts spurd on the NEW nodes — existing daemons and running jobs are
+# left untouched. It works because a spurd registers itself at runtime: a new
+# agent appears in `spur nodes` the moment its spurd registers, with no controller
+# restart. spur.conf on the controllers is refreshed (so the config file stays
+# accurate for any future restart) but the running controller is NOT bounced.
+#
+# The node(s) MUST already be in the [spur_agents] inventory group (single source
+# of truth, same as deploy.yml). This playbook just brings the named new ones
+# online now, disruption-free. To ADD A CONTROLLER, use deploy.yml — that's a Raft
+# membership change and needs the guarded wipe/restart path.
+#
+# Run:
+#   ansible-playbook playbooks/add_nodes.yml -i inventory/hosts.ini -e new_nodes=gpu-3,gpu-4
+
+# --- Guard rails (on the first controller) ---
+- name: Validate request
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    add_list: "{{ new_nodes | default('') | split(',') | map('trim') | select | list }}"
+  tasks:
+    - name: Require new_nodes
+      ansible.builtin.assert:
+        that:
+          - add_list | length > 0
+        fail_msg: "Pass the node(s) to add, e.g. -e new_nodes=gpu-3,gpu-4"
+        quiet: true
+
+    - name: Every new node must be in the [spur_agents] inventory group
+      ansible.builtin.assert:
+        that:
+          - item in groups['spur_agents']
+        fail_msg: >-
+          '{{ item }}' is not in [spur_agents]. Add it to the inventory first —
+          that group is the source of truth for cluster membership.
+        quiet: true
+      loop: "{{ add_list }}"
+
+    - name: Refuse controllers (adding a controller is a deploy.yml / Raft operation)
+      ansible.builtin.assert:
+        that:
+          - item not in groups['spur_controllers']
+        fail_msg: >-
+          '{{ item }}' is a controller. add_nodes.yml only adds compute agents;
+          use deploy.yml to add/change controllers (Raft membership change).
+        quiet: true
+      loop: "{{ add_list }}"
+
+    - name: Cluster must be healthy before adding
+      ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
+      register: an_health
+      changed_when: false
+      failed_when: an_health.rc != 0
+
+# --- Gather facts on ALL cluster hosts (read-only, non-disruptive) ---
+# The spur.conf [[nodes]] loop reads ansible_processor_vcpus / memtotal / hostname
+# for EVERY agent, so facts for all of them must be present when we template the
+# config below — this is exactly what `--limit` breaks. Gathering facts touches no
+# daemon.
+- name: Gather facts across the cluster
+  hosts: spur_controllers:spur_agents
+  become: true
+  gather_facts: yes
+  tasks: []
+
+# --- Install + start spurd on the NEW nodes only ---
+# Skip any that are already registered (idempotent re-runs must not restart a
+# healthy new agent). spur_install + spur_agent only ever touch the node they run
+# on, so existing agents are never affected.
+- name: Bring new agents online
+  hosts: "{{ new_nodes | default('') | split(',') | map('trim') | select | join(':') }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Resolve this node's registered name
+      # set_fact (not a self-referential play var) so spur_node_name honors an
+      # inventory override but otherwise falls back to the gathered short hostname.
+      ansible.builtin.set_fact:
+        spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
+
+    - name: Is this node already registered with the controller?
+      # `spur show node <name>` does NOT filter server-side — it prints every node
+      # and returns rc=0 regardless of the name. So grep the exact `NodeName=<name>`
+      # line to tell whether THIS node is actually registered; rc alone is useless.
+      ansible.builtin.shell: |
+        {{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
+          | grep -qx "NodeName={{ spur_node_name }}"
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ groups['spur_controllers'][0] }}"
+      register: an_registered
+      changed_when: false
+      failed_when: false
+
+    - name: Note already-registered nodes (will be skipped)
+      ansible.builtin.debug:
+        msg: "{{ spur_node_name }} is already registered — skipping install/start (idempotent)."
+      when: an_registered.rc == 0
+  roles:
+    - role: spur_install
+      when: an_registered.rc != 0
+    - role: spur_agent
+      when: an_registered.rc != 0
+
+# --- Refresh spur.conf on the controllers WITHOUT restarting them ---
+- name: Refresh controller config (no restart)
+  hosts: spur_controllers
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  roles:
+    - role: spur_controller
+      vars:
+        spur_controller_skip_restart: true
+
+# --- Verify the new nodes registered ---
+- name: Verify new nodes are registered
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: true
+  gather_facts: no
+  vars:
+    add_list: "{{ new_nodes | default('') | split(',') | map('trim') | select | list }}"
+  tasks:
+    - name: Wait for each new node to appear in the cluster
+      # grep the exact NodeName= line — `spur show node` doesn't filter, so a bare
+      # rc check would pass even if the node never registered.
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          {{ spur_install_dir }}/spur show node {{ item }} 2>/dev/null \
+            | grep -qx "NodeName={{ item }}" && exit 0
+          sleep 1
+        done
+        echo "{{ item }} did not register within 30s"
+        exit 1
+      args:
+        executable: /bin/bash
+      loop: "{{ add_list }}"
+      changed_when: false
+
+    - name: Show cluster nodes
+      ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
+      register: an_final
+      changed_when: false
+
+    - name: Result
+      ansible.builtin.debug:
+        msg:
+          - "Added (no existing daemon restarted): {{ add_list | join(', ') }}"
+          - "{{ an_final.stdout_lines }}"

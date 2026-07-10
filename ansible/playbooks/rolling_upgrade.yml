@@ -1,0 +1,145 @@
+---
+# Rolling upgrade of an ALREADY-RUNNING Spur cluster — one host at a time (agents
+# drained first), so the cluster keeps scheduling and running jobs throughout.
+# Reuses the exact same spur_install/spur_controller/spur_agent/spur_verify roles
+# deploy.yml uses, just batched with `serial` and gated with drain/undrain, so
+# install/config/health-check logic has a single source of truth.
+#
+# Use deploy.yml instead when: doing a fresh install, changing topology (adding/
+# removing hosts, migrating off a pre-merge spurdbd deployment), or when a brief
+# full-cluster restart is acceptable.
+#
+# Run:
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new
+#
+# Batch agent upgrades (default one at a time):
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_rolling_batch_size=2
+
+- name: Guard rails — refuse to start against a wipe-flagged or unhealthy cluster
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  tasks:
+    - name: Fail if spur_wipe_state is set (a rolling upgrade must never wipe Raft state)
+      ansible.builtin.fail:
+        msg: >-
+          spur_wipe_state=true is not allowed with rolling_upgrade.yml — it would
+          destroy the running cluster's job queue/node registrations mid-upgrade.
+          Use deploy.yml for an intentional Raft reinit.
+      when: spur_wipe_state | bool
+
+    # spur_wg_address is only ever populated by the spur_wireguard role's own
+    # set_fact (deploy.yml invokes it explicitly); this playbook doesn't run that
+    # role, so spur_controller/spur_agent's `hostvars[item].spur_wg_address` lookup
+    # would hit an undefined variable partway through a host and abort mid-upgrade.
+    # Fail fast here instead, before any host is touched.
+    - name: Fail if spur_transport is wireguard (not yet supported by rolling_upgrade.yml)
+      ansible.builtin.fail:
+        msg: >-
+          rolling_upgrade.yml does not yet support spur_transport=wireguard (it
+          doesn't re-derive spur_wg_address the way deploy.yml does). Use deploy.yml
+          for a wireguard cluster — it accepts the same spur_binary_src and is
+          non-destructive by default (spur_wipe_state=false), just without
+          rolling/drained batching.
+      when: spur_transport == 'wireguard'
+
+    - name: Check the cluster is healthy before starting
+      ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
+      register: spur_pre_upgrade_health
+      changed_when: false
+      failed_when: spur_pre_upgrade_health.rc != 0
+
+# spur_controller re-renders spur.conf on every controller it touches, which
+# needs ansible_hostname for every agent (the [[nodes]] block) — gather facts
+# for the whole cluster up front rather than only as each play's hosts are
+# reached, the same as deploy.yml's first play does.
+- name: Gather facts across the whole cluster
+  hosts: spur_controllers:spur_agents
+  become: true
+  gather_facts: yes
+  tasks: []
+
+- name: Rolling upgrade — controllers, one at a time (preserves Raft quorum)
+  hosts: spur_controllers
+  become: true
+  gather_facts: yes
+  serial: 1
+  max_fail_percentage: 0
+  roles:
+    - role: spur_install
+      vars:
+        spur_force_reinstall: true
+    - role: spur_controller
+
+- name: Rolling upgrade — agents, drained and upgraded in batches
+  hosts: spur_agents
+  become: true
+  gather_facts: yes
+  serial: "{{ spur_rolling_batch_size | default(1) }}"
+  max_fail_percentage: 0
+  pre_tasks:
+    - name: Resolve this node's registered name
+      ansible.builtin.set_fact:
+        spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
+
+    - name: Drain this node before touching its binaries
+      ansible.builtin.command: >-
+        {{ spur_install_dir }}/spur node drain {{ spur_node_name }}
+        --reason "ansible rolling upgrade"
+      delegate_to: "{{ groups['spur_controllers'][0] }}"
+      changed_when: true
+
+    # Draining stops new scheduling but lets running jobs finish on their own
+    # (DRAINING -> DRAINED); only proceed once the node reports fully drained.
+    - name: Wait for the node to fully drain
+      ansible.builtin.shell: |
+        for i in $(seq 1 120); do
+          st=$({{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
+               | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
+               | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
+          [ "$st" = "DRAINED" ] && exit 0
+          sleep 1
+        done
+        echo "timed out waiting for {{ spur_node_name }} to drain (last state: $st)"
+        exit 1
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ groups['spur_controllers'][0] }}"
+      changed_when: false
+
+  roles:
+    - role: spur_install
+      vars:
+        spur_force_reinstall: true
+    - role: spur_agent
+
+  post_tasks:
+    - name: Wait for the node to re-register after the upgrade
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          {{ spur_install_dir }}/spur show node {{ spur_node_name }} >/dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        echo "{{ spur_node_name }} never re-registered after the upgrade"
+        exit 1
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ groups['spur_controllers'][0] }}"
+      changed_when: false
+
+    # A drained node stays drained after spurd restarts — draining is server-side
+    # state, not tied to the agent process. Without this, upgraded capacity sits
+    # idle indefinitely.
+    - name: Resume the node (undrain) now that it's back
+      ansible.builtin.command: >-
+        {{ spur_install_dir }}/scontrol update NodeName={{ spur_node_name }} State=RESUME
+      delegate_to: "{{ groups['spur_controllers'][0] }}"
+      changed_when: true
+
+- name: Verify the upgraded cluster still schedules work
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: true
+  gather_facts: no
+  roles:
+    - role: spur_verify

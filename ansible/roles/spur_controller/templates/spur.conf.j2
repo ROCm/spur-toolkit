@@ -14,10 +14,12 @@ peers = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['spur_controll
 plugin = "backfill"
 interval_secs = 1
 
-{% if spur_accounting_enabled | default(true) %}
+{% if spur_accounting_enabled | default(true) | bool %}
 [accounting]
-host = "{{ spur_accounting_listen_ip }}:{{ spur_accounting_port | default(6819) }}"
-database_url = "postgresql://{{ spur_accounting_db_user | default('spur') }}:{{ spur_accounting_db_password | default('spur') }}@localhost/{{ spur_accounting_db_name | default('spur') }}"
+# Accounting runs in-process inside spurctld (served on the same port as the
+# controller API) and reaches Postgres over the network — spur_accounting_listen_ip
+# is the Postgres host, which may or may not be this controller.
+database_url = "postgresql://{{ spur_accounting_db_user | default('spur') }}:{{ spur_accounting_db_password | default('spur') }}@{{ spur_accounting_listen_ip }}:{{ spur_accounting_db_port | default(5432) }}/{{ spur_accounting_db_name | default('spur') }}"
 fairshare_refresh_secs = 30
 {% endif %}
 

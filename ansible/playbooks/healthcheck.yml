@@ -1,0 +1,139 @@
+---
+# Read-only health check for a running Spur cluster. Safe to run anytime — it
+# only inspects state, never changes it. Every probe is failed_when:false so one
+# unhealthy host doesn't abort the report; problems are collected and summarized
+# at the end (and the play exits non-zero if any were found).
+#
+# Run:
+#   ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini
+
+- name: Controller health
+  hosts: spur_controllers
+  become: true
+  gather_facts: no
+  tasks:
+    - name: spurctld active?
+      ansible.builtin.command: systemctl is-active spurctld
+      register: hc_ctld
+      changed_when: false
+      failed_when: false
+
+    - name: Controller reachable + leader elected? (spur nodes)
+      ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
+      register: hc_nodes
+      changed_when: false
+      failed_when: false
+
+    - name: Job queue reachable? (spur queue)
+      ansible.builtin.command: "{{ spur_install_dir }}/spur queue"
+      register: hc_queue
+      changed_when: false
+      failed_when: false
+
+    - name: Accounting reachable? (sacct — only when enabled)
+      ansible.builtin.command: "{{ spur_install_dir }}/sacct --limit 1"
+      register: hc_sacct
+      changed_when: false
+      failed_when: false
+      when: spur_accounting_enabled | default(true) | bool
+
+    - name: Controller findings
+      ansible.builtin.set_fact:
+        hc_problems: >-
+          {{ (hc_ctld.stdout | default('') != 'active') | ternary(['spurctld not active'], [])
+             + (hc_nodes.rc != 0) | ternary(['`spur nodes` failed (controller/leader down?)'], [])
+             + (hc_nodes.rc == 0 and (hc_nodes.stdout | regex_search('no leader|not the Raft leader'))) | ternary(['no Raft leader elected'], [])
+             + (hc_queue.rc != 0) | ternary(['`spur queue` failed'], [])
+             + ((spur_accounting_enabled | default(true) | bool) and (hc_sacct.rc | default(0) != 0)) | ternary(['accounting/sacct unreachable'], []) }}
+
+- name: Agent health
+  hosts: spur_agents
+  become: true
+  gather_facts: no
+  tasks:
+    - name: spurd active?
+      ansible.builtin.command: systemctl is-active spurd
+      register: hc_spurd
+      changed_when: false
+      failed_when: false
+
+    - name: Agent port {{ spur_agent_port }} listening?
+      ansible.builtin.wait_for:
+        port: "{{ spur_agent_port }}"
+        host: "127.0.0.1"
+        timeout: 3
+      register: hc_port
+      failed_when: false
+
+    - name: Agent findings
+      ansible.builtin.set_fact:
+        hc_problems: >-
+          {{ (hc_spurd.stdout | default('') != 'active') | ternary(['spurd not active'], [])
+             + (hc_port.failed | default(false)) | ternary(['agent port ' ~ spur_agent_port ~ ' not listening'], []) }}
+
+- name: Accounting host (PostgreSQL) health
+  hosts: "{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  become: true
+  gather_facts: no
+  tasks:
+    - name: postgresql active + accepting connections?
+      ansible.builtin.shell: |
+        set +e
+        systemctl is-active postgresql >/dev/null 2>&1 || { echo "postgresql not active"; exit 0; }
+        command -v pg_isready >/dev/null 2>&1 && ! pg_isready -q && echo "postgresql not accepting connections (pg_isready)"
+        exit 0
+      args:
+        executable: /bin/bash
+      register: hc_pg
+      changed_when: false
+      failed_when: false
+      when: spur_accounting_enabled | default(true) | bool
+
+    - name: Accounting-host findings
+      ansible.builtin.set_fact:
+        hc_problems: >-
+          {{ hc_problems | default([]) + (hc_pg.stdout | default('') | trim | length > 0) | ternary([hc_pg.stdout | default('') | trim], []) }}
+      when: spur_accounting_enabled | default(true) | bool
+
+- name: Per-host resource check (all spur hosts)
+  hosts: "spur_controllers:spur_agents"
+  become: true
+  gather_facts: no
+  tasks:
+    - name: Raft/state dir size + free disk under spur_home
+      ansible.builtin.shell: |
+        set +e
+        avail_kb=$(df -Pk "{{ spur_home }}" 2>/dev/null | awk 'NR==2{print $4}')
+        state_sz=$(du -sh "{{ spur_home }}/state" 2>/dev/null | awk '{print $1}')
+        echo "state=${state_sz:-n/a} free=$(( ${avail_kb:-0} / 1024 ))MB"
+        # Warn if <1GB free where spur_home lives.
+        [ "${avail_kb:-0}" -lt 1048576 ] && echo "LOW_DISK"
+        exit 0
+      args:
+        executable: /bin/bash
+      register: hc_disk
+      changed_when: false
+      failed_when: false
+
+    - name: Resource findings
+      ansible.builtin.set_fact:
+        hc_problems: >-
+          {{ hc_problems | default([]) + (hc_disk.stdout is search('LOW_DISK')) | ternary(['low disk (<1GB free) under ' ~ spur_home], []) }}
+
+- name: Summary
+  hosts: "spur_controllers:spur_agents:{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  become: no
+  gather_facts: no
+  tasks:
+    - name: Per-host status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ (hc_problems | default([]) | length == 0) | ternary('OK', (hc_problems | default([]) | join('; '))) }}
+
+    - name: Fail if any host reported a problem
+      ansible.builtin.assert:
+        that:
+          - hc_problems | default([]) | length == 0
+        fail_msg: "{{ inventory_hostname }}: {{ hc_problems | default([]) | join('; ') }}"
+        quiet: true
