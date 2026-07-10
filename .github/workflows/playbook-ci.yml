@@ -199,16 +199,19 @@ jobs:
       - name: Assert both agents registered
         run: |
           set -euo pipefail
+          # Poll: agents may register a beat apart after their spurd starts.
+          for i in $(seq 1 30); do
+            missing=""
+            for a in gpu-1 gpu-2; do
+              docker exec ctl-0 /usr/local/bin/spur show node "$a" 2>/dev/null \
+                | grep -qx "NodeName=$a" || missing="$missing $a"
+            done
+            [ -z "$missing" ] && { echo "both agents registered"; break; }
+            sleep 2
+          done
           echo "== spur nodes =="
           docker exec ctl-0 /usr/local/bin/spur nodes
-          # `spur nodes` collapses the partition's members onto one NODELIST line
-          # (e.g. "gpu-1,gpu-2"), so count node names, not lines. Confirm each
-          # expected agent shows up individually via `spur show node`.
-          for a in gpu-1 gpu-2; do
-            docker exec ctl-0 /usr/local/bin/spur show node "$a" \
-              | grep -qx "NodeName=$a" || { echo "agent $a not registered"; exit 1; }
-          done
-          echo "both agents registered"
+          [ -z "$missing" ] || { echo "agents still missing:$missing"; exit 1; }
 
       - name: Assert a job runs to completion
         run: |
@@ -259,10 +262,16 @@ jobs:
           echo "== spur nodes after upgrade =="
           docker exec ctl-0 /usr/local/bin/spur nodes
           # Both agents must still be registered and resumed (not left DRAINED).
-          for a in gpu-1 gpu-2; do
-            docker exec ctl-0 /usr/local/bin/spur show node "$a" \
-              | grep -qx "NodeName=$a" || { echo "agent $a missing after upgrade"; exit 1; }
+          for i in $(seq 1 30); do
+            missing=""
+            for a in gpu-1 gpu-2; do
+              docker exec ctl-0 /usr/local/bin/spur show node "$a" 2>/dev/null \
+                | grep -qx "NodeName=$a" || missing="$missing $a"
+            done
+            [ -z "$missing" ] && break
+            sleep 2
           done
+          [ -z "$missing" ] || { echo "agents missing after upgrade:$missing"; exit 1; }
           # database_url must still point at acct-0 (preservation fix) — a
           # rolling upgrade must never silently repoint accounting.
           post_db=$(docker exec ctl-0 bash -lc "grep -oE 'postgresql://[^\"]+' /opt/spur/etc/spur.conf | head -1")
