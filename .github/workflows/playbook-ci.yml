@@ -6,20 +6,19 @@
 # against 3 controllers + 2 agents + 1 accounting node. Rolling upgrade and the
 # day-2 playbooks are stubbed as TODOs to add once deploy is green.
 #
-# Status: EXPERIMENTAL. workflow_dispatch-only for now (manual, non-gating) so
-# we can iterate on the systemd-in-Docker specifics (cgroup v2 on ubuntu-latest)
-# and the ROCm/spur build invocation before it gates PRs. Flip on `pull_request`
-# once it is green a few times in a row.
+# Status: EXPERIMENTAL. Temporarily runs on pull_request for fast iteration on
+# the systemd-in-Docker specifics (cgroup v2 on ubuntu-latest) and the ROCm/spur
+# build invocation. Once it is green a few times in a row, decide whether to keep
+# it gating PRs or narrow to workflow_dispatch / a schedule.
 # ============================================================================
 name: playbook-ci
 
 on:
   workflow_dispatch: {}
-  # TODO: enable once stable —
-  # pull_request:
-  #   paths:
-  #     - 'ansible/**'
-  #     - '.github/workflows/playbook-ci.yml'
+  pull_request:
+    paths:
+      - 'ansible/**'
+      - '.github/workflows/playbook-ci.yml'
 
 concurrency:
   group: playbook-ci-${{ github.ref }}
