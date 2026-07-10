@@ -18,6 +18,10 @@ name: playbook-ci
 
 on:
   workflow_dispatch: {}
+  # TEMP: branch-scoped push for fork iteration. Remove before merge.
+  push:
+    branches:
+      - ci/login-node-and-resilience
   pull_request:
     paths:
       - 'ansible/**'
@@ -319,6 +323,41 @@ jobs:
               sleep 2
             done
             echo "post-upgrade job did not complete"; exit 1
+          '
+
+      # --- Resilience: rolling upgrade with one agent unreachable ----------
+      - name: rolling_upgrade.yml with gpu-2 down (ignore-unreachable agents)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          set -euo pipefail
+          # Simulate an agent that's down for maintenance.
+          docker stop gpu-2
+          # Must proceed and upgrade the reachable agents; gpu-2 is skipped.
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_ignore_unreachable_agents=true
+
+      - name: Assert reachable agent upgraded, cluster still schedules
+        run: |
+          set -euo pipefail
+          docker exec ctl-0 /usr/local/bin/spur show node gpu-1 \
+            | grep -qx "NodeName=gpu-1" || { echo "gpu-1 missing after resilient upgrade"; exit 1; }
+          # A job still runs on the surviving agent.
+          docker exec ctl-0 bash -lc '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=resilient\necho ok on \$(hostname)\n" > /tmp/ci-res.sh
+            jid=$(/usr/local/bin/spur submit /tmp/ci-res.sh | grep -oE "[0-9]+" | head -1)
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = COMPLETED ] && { echo "resilient job $jid COMPLETED"; exit 0; }
+              case "$st" in FAILED|CANCELLED|TIMEOUT|NODE_FAIL) echo "job ended $st"; exit 1 ;; esac
+              sleep 2
+            done
+            echo "resilient job did not complete"; exit 1
           '
 
       # TODO(next): add_nodes.yml / remove_nodes.yml / manage_accounts.yml
