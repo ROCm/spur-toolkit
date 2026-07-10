@@ -85,14 +85,14 @@
   ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   max_fail_percentage: "{{ 100 if (spur_ignore_unreachable_agents | default(false) | bool) else 0 }}"
   pre_tasks:
-    # Reachability marker: runs ON the agent, so an unreachable one (ignored via
-    # ignore_unreachable) never sets it. Can't reuse spur_node_name — the
-    # controller role sets that for every agent via delegate_facts, so it is
-    # defined even for a down host. The delegated drain/resume tasks below gate
-    # on this so they skip cleanly for a skipped agent.
-    - name: Mark this agent reachable
-      ansible.builtin.set_fact:
-        spur_agent_reachable: true
+    # Reachability probe: ping actually connects, so an unreachable agent's
+    # result is registered unreachable (ignored via ignore_unreachable). A
+    # set_fact would NOT work here — it runs on the control node and "succeeds"
+    # even for a down host. The delegated drain/resume tasks gate on this so
+    # they skip cleanly for a skipped agent.
+    - name: Probe agent reachability
+      ansible.builtin.ping:
+      register: spur_agent_ping
 
     - name: Resolve this node's registered name
       ansible.builtin.set_fact:
@@ -104,7 +104,7 @@
         --reason "ansible rolling upgrade"
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: true
-      when: spur_agent_reachable | default(false)
+      when: not (spur_agent_ping.unreachable | default(false))
 
     # Draining stops new scheduling but lets running jobs finish on their own
     # (DRAINING -> DRAINED); only proceed once the node reports fully drained.
@@ -123,7 +123,7 @@
         executable: /bin/bash
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: false
-      when: spur_agent_reachable | default(false)
+      when: not (spur_agent_ping.unreachable | default(false))
 
   roles:
     - role: spur_install
@@ -144,7 +144,7 @@
         executable: /bin/bash
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: false
-      when: spur_agent_reachable | default(false)
+      when: not (spur_agent_ping.unreachable | default(false))
 
     # A drained node stays drained after spurd restarts — draining is server-side
     # state, not tied to the agent process. Without this, upgraded capacity sits
@@ -154,7 +154,7 @@
         {{ spur_install_dir }}/scontrol update NodeName={{ spur_node_name }} State=RESUME
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: true
-      when: spur_agent_reachable | default(false)
+      when: not (spur_agent_ping.unreachable | default(false))
 
 - name: Verify the upgraded cluster still schedules work
   hosts: "{{ groups['spur_controllers'][0] }}"
