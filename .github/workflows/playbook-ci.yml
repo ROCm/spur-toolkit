@@ -60,50 +60,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- Fetch pre-built Spur binaries from a ROCm/spur release ----------
-      # Faster and more representative than building from source: download the
-      # published linux-amd64 tarball, verify its sha256, and extract the three
-      # binaries into spur-bin/ for use as spur_binary_src. Override the version
-      # by running the workflow via workflow_dispatch after adding an input, or
-      # by editing SPUR_RELEASE below (default: newest non-nightly tag).
-      - name: Download + verify Spur release binaries
+      # --- Fetch pre-built Spur binaries from ROCm/spur --------------------
+      # Two sets, to exercise a real rolling upgrade between distinct builds:
+      #   spur-bin      = INITIAL deploy version  (latest published release)
+      #   spur-bin-new  = UPGRADE target version  (latest nightly build)
+      # Both are post spurdbd-merge, so both deploy cleanly with the current
+      # roles. (v0.3.0 and earlier are pre-merge and would fail on deploy, so
+      # "latest-1 release" is NOT a valid initial version today — we use the
+      # latest release for deploy and the nightly for the upgrade instead.)
+      # Each download verifies the tarball's sha256.
+      - name: Download + verify Spur binaries (deploy = release, upgrade = nightly)
         env:
           GH_TOKEN: ${{ github.token }}
-          # Pin a specific tag here, or leave empty to auto-pick the newest
-          # non-nightly release tag.
-          SPUR_RELEASE: ""
+          # Pin either explicitly, or leave empty for the documented defaults:
+          #   DEPLOY_TAG  empty -> newest non-nightly release
+          #   UPGRADE_TAG empty -> "nightly"
+          DEPLOY_TAG: ""
+          UPGRADE_TAG: ""
         run: |
           set -euo pipefail
-          tag="$SPUR_RELEASE"
-          if [ -z "$tag" ]; then
-            tag=$(gh api repos/ROCm/spur/releases --jq \
+
+          fetch() {  # <tag> <dest-dir>
+            local tag="$1" dest="$2" d
+            d="dl-$dest"
+            mkdir -p "$d"
+            ( cd "$d"
+              gh release download "$tag" --repo ROCm/spur \
+                --pattern '*-linux-amd64.tar.gz' \
+                --pattern '*-linux-amd64.tar.gz.sha256'
+              tarball=$(ls *-linux-amd64.tar.gz)
+              echo "Verifying checksum of $tarball ($tag)"
+              hash=$(awk '{print $1}' "${tarball}.sha256")
+              echo "${hash}  ${tarball}" | sha256sum -c -
+              tar xzf "$tarball"
+              bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
+              test -n "$bindir" || { echo "spurctld not found in $tarball"; exit 1; }
+              mkdir -p "$GITHUB_WORKSPACE/$dest"
+              for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/$dest/$b"; done
+              chmod +x "$GITHUB_WORKSPACE/$dest"/*
+            )
+          }
+
+          deploy_tag="${DEPLOY_TAG:-}"
+          if [ -z "$deploy_tag" ]; then
+            deploy_tag=$(gh api repos/ROCm/spur/releases --jq \
               'map(select(.tag_name != "nightly"))[0].tag_name')
           fi
-          echo "Using ROCm/spur release: $tag"
+          upgrade_tag="${UPGRADE_TAG:-nightly}"
 
-          mkdir -p dl && cd dl
-          gh release download "$tag" --repo ROCm/spur \
-            --pattern '*-linux-amd64.tar.gz' \
-            --pattern '*-linux-amd64.tar.gz.sha256'
+          echo "Deploy version : $deploy_tag  -> spur-bin"
+          echo "Upgrade version: $upgrade_tag -> spur-bin-new"
+          fetch "$deploy_tag"  spur-bin
+          fetch "$upgrade_tag" spur-bin-new
 
-          tarball=$(ls *-linux-amd64.tar.gz)
-          echo "Verifying checksum of $tarball"
-          # The .sha256 may contain just the hash or "hash  filename"; normalise.
-          hash=$(awk '{print $1}' "${tarball}.sha256")
-          echo "${hash}  ${tarball}" | sha256sum -c -
-
-          tar xzf "$tarball"
-          # Layout is spur-<ver>-linux-amd64/bin/{spur,spurctld,spurd,...}
-          bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
-          test -n "$bindir" || { echo "spurctld not found in tarball"; exit 1; }
-
-          mkdir -p "$GITHUB_WORKSPACE/spur-bin"
-          for b in spur spurctld spurd; do
-            cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"
-          done
-          chmod +x "$GITHUB_WORKSPACE"/spur-bin/*
-          echo "== staged binaries =="
-          ls -l "$GITHUB_WORKSPACE/spur-bin"
+          echo "== deploy binaries =="; ls -l "$GITHUB_WORKSPACE/spur-bin"
+          echo "== upgrade binaries =="; ls -l "$GITHUB_WORKSPACE/spur-bin-new"
 
       # --- Bring up the 6-node systemd-container cluster -------------------
       - name: Start 6 systemd containers on a docker network
@@ -222,8 +233,55 @@ jobs:
             echo "job $jid did not complete in time (last: ${st:-none})"; exit 1
           '
 
-      # TODO(next): rolling_upgrade.yml with a running job (assert survival +
-      #             database_url still points at acct-0)
+      # --- Rolling upgrade to the newer build ------------------------------
+      - name: Record pre-upgrade state (version + accounting target)
+        run: |
+          set -euo pipefail
+          echo "PRE_VERSION=$(docker exec ctl-0 /usr/local/bin/spur --version 2>/dev/null || true)"
+          # The accounting host in the live spur.conf must survive the upgrade.
+          pre_db=$(docker exec ctl-0 bash -lc "grep -oE 'postgresql://[^\"]+' /opt/spur/etc/spur.conf | head -1")
+          echo "pre-upgrade database_url: $pre_db"
+          echo "$pre_db" | grep -q '@acct-0:' || { echo "expected database_url to point at acct-0"; exit 1; }
+
+      - name: rolling_upgrade.yml (to nightly build)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur
+
+      - name: Assert cluster healthy + accounting preserved after upgrade
+        run: |
+          set -euo pipefail
+          echo "== spur nodes after upgrade =="
+          docker exec ctl-0 /usr/local/bin/spur nodes
+          # Both agents must still be registered and resumed (not left DRAINED).
+          for a in gpu-1 gpu-2; do
+            docker exec ctl-0 /usr/local/bin/spur show node "$a" \
+              | grep -qx "NodeName=$a" || { echo "agent $a missing after upgrade"; exit 1; }
+          done
+          # database_url must still point at acct-0 (preservation fix) — a
+          # rolling upgrade must never silently repoint accounting.
+          post_db=$(docker exec ctl-0 bash -lc "grep -oE 'postgresql://[^\"]+' /opt/spur/etc/spur.conf | head -1")
+          echo "post-upgrade database_url: $post_db"
+          echo "$post_db" | grep -q '@acct-0:' || { echo "database_url no longer points at acct-0!"; exit 1; }
+          # A job still runs after the upgrade.
+          docker exec ctl-0 bash -lc '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=post-upgrade\necho ok on \$(hostname)\n" > /tmp/ci-post.sh
+            jid=$(/usr/local/bin/spur submit /tmp/ci-post.sh | grep -oE "[0-9]+" | head -1)
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = COMPLETED ] && { echo "post-upgrade job $jid COMPLETED"; exit 0; }
+              case "$st" in FAILED|CANCELLED|TIMEOUT|NODE_FAIL) echo "job ended $st"; exit 1 ;; esac
+              sleep 2
+            done
+            echo "post-upgrade job did not complete"; exit 1
+          '
+
       # TODO(next): add_nodes.yml / remove_nodes.yml / manage_accounts.yml
       # TODO(next): healthcheck.yml (assert green) and teardown.yml
 
