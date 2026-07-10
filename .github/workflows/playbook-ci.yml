@@ -51,7 +51,7 @@ jobs:
           DUMMY="-e new_nodes=ctl-0 -e remove_nodes=ctl-0"
           for pb in playbooks/*.yml; do
             echo "== syntax-check $pb =="
-            ansible-playbook --syntax-check -i ci/inventory/ci.ini $DUMMY "$pb" || exit 1
+            ansible-playbook --syntax-check -i inventory/ci.ini $DUMMY "$pb" || exit 1
           done
 
   deploy-6node:
@@ -176,7 +176,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i ci/inventory/ci.ini playbooks/deploy.yml \
+          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur
