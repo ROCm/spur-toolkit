@@ -94,9 +94,13 @@
       ansible.builtin.ping:
       register: spur_agent_ping
 
+    # Default through inventory_hostname (always defined) so the delegated shell
+    # tasks below can template {{ spur_node_name }} even for an unreachable agent
+    # with no gathered facts — free-form shell args are finalized before `when`,
+    # so an undefined var would error despite the reachability gate.
     - name: Resolve this node's registered name
       ansible.builtin.set_fact:
-        spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
+        spur_node_name: "{{ spur_node_name | default(ansible_hostname | default(inventory_hostname)) }}"
 
     - name: Drain this node before touching its binaries
       ansible.builtin.command: >-
