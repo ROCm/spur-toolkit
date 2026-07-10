@@ -102,23 +102,35 @@
       ansible.builtin.set_fact:
         spur_node_name: "{{ spur_node_name | default(ansible_hostname | default(inventory_hostname)) }}"
 
+    # Always drain, even for an agent that's unreachable over SSH: this is a
+    # controller-side command (delegate_to, no connection to the agent itself
+    # needed) and it's what actually stops the scheduler from still treating a
+    # down node as schedulable. Skipping it here would leave an unreachable
+    # agent sitting Idle in the scheduler's view until its heartbeat times out
+    # (default 90s) — long enough for the verify job below to be dispatched to
+    # a node that will never run it.
     - name: Drain this node before touching its binaries
       ansible.builtin.command: >-
         {{ spur_install_dir }}/spur node drain {{ spur_node_name }}
         --reason "ansible rolling upgrade"
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: true
-      when: not (spur_agent_ping.unreachable | default(false))
 
     # Draining stops new scheduling but lets running jobs finish on their own
     # (DRAINING -> DRAINED); only proceed once the node reports fully drained.
+    # Also accept DOWN: an agent that's genuinely unreachable may independently
+    # cross its heartbeat timeout and flip to DOWN before (or instead of)
+    # settling on DRAINED, which is an equally valid "stopped scheduling here"
+    # outcome for our purposes.
     - name: Wait for the node to fully drain
       ansible.builtin.shell: |
         for i in $(seq 1 120); do
           st=$({{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
                | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
                | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
-          [ "$st" = "DRAINED" ] && exit 0
+          case "$st" in
+            DRAINED|DOWN) exit 0 ;;
+          esac
           sleep 1
         done
         echo "timed out waiting for {{ spur_node_name }} to drain (last state: $st)"
@@ -127,7 +139,10 @@
         executable: /bin/bash
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: false
-      when: not (spur_agent_ping.unreachable | default(false))
+      # Non-fatal: an unreachable agent's exact state transition timing isn't
+      # guaranteed within this window. The drain command above already told
+      # the scheduler to stop assigning new work here, which is what matters.
+      failed_when: false
 
   roles:
     - role: spur_install
