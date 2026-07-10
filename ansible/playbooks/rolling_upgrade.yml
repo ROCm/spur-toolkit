@@ -81,7 +81,9 @@
   become: true
   gather_facts: yes
   serial: "{{ spur_rolling_batch_size | default(1) }}"
-  max_fail_percentage: 0
+  # Skip unreachable agents when spur_ignore_unreachable_agents=true, else strict.
+  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
+  max_fail_percentage: "{{ 100 if (spur_ignore_unreachable_agents | default(false) | bool) else 0 }}"
   pre_tasks:
     - name: Resolve this node's registered name
       ansible.builtin.set_fact:

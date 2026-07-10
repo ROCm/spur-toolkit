@@ -1,13 +1,15 @@
 # ============================================================================
 # Playbook integration test.
 #
-# On a single GitHub-hosted runner, brings up a 6-node cluster of
+# On a single GitHub-hosted runner, brings up a 7-node cluster of
 # systemd-enabled Docker containers, downloads pre-built Spur binaries from
 # ROCm/spur, and exercises the playbooks end-to-end:
 #   - deploy.yml            : 3 controllers (HA/Raft) + 2 agents + 1 accounting
+#                             + 1 login node
 #   - rolling_upgrade.yml   : upgrade the whole cluster to the newer build
-# Assertions: agents register, jobs run to COMPLETED, and the accounting
-# database_url is preserved byte-for-byte across the rolling upgrade.
+# Assertions: agents register, jobs run to COMPLETED (submitted both from a
+# controller and from the login node), and the accounting database_url is
+# preserved byte-for-byte across the rolling upgrade.
 #
 # Day-2 playbooks (add_nodes/remove_nodes/manage_accounts/healthcheck/teardown)
 # are TODO — they build on the same running cluster.
@@ -16,6 +18,11 @@ name: playbook-ci
 
 on:
   workflow_dispatch: {}
+  # TEMP: branch-scoped push so the workflow runs on the fork during iteration.
+  # Remove before merge.
+  push:
+    branches:
+      - ci/login-node-and-resilience
   pull_request:
     paths:
       - 'ansible/**'
@@ -48,7 +55,7 @@ jobs:
             ansible-playbook --syntax-check -i inventory/ci.ini $DUMMY "$pb" || exit 1
           done
 
-  deploy-6node:
+  integration:
     runs-on: ubuntu-latest
     needs: lint
     steps:
@@ -110,10 +117,10 @@ jobs:
           echo "== deploy binaries =="; ls -l "$GITHUB_WORKSPACE/spur-bin"
           echo "== upgrade binaries =="; ls -l "$GITHUB_WORKSPACE/spur-bin-new"
 
-      # --- Bring up the 6-node systemd-container cluster -------------------
-      - name: Start 6 systemd containers on a docker network
+      # --- Bring up the systemd-container cluster --------------------------
+      - name: Start systemd containers on a docker network
         env:
-          NODES: "ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0"
+          NODES: "ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0 login-0"
           IMG: jrei/systemd-ubuntu:22.04
         run: |
           set -euo pipefail
@@ -138,7 +145,7 @@ jobs:
 
       - name: Wait for systemd to be ready in every container
         env:
-          NODES: "ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0"
+          NODES: "ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0 login-0"
         run: |
           set -uo pipefail
           for n in $NODES; do
@@ -162,7 +169,7 @@ jobs:
 
       - name: Install in-container preflight deps (curl/tar/iproute2/python3/sudo)
         env:
-          NODES: "ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0"
+          NODES: "ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0 login-0"
         run: |
           set -euo pipefail
           # sudo: Ansible become defaults to sudo; the accounting role uses
@@ -178,8 +185,8 @@ jobs:
           python3 -m pip install ansible-core
           ansible-galaxy collection install community.docker
 
-      # --- Run deploy.yml against the 6 nodes ------------------------------
-      - name: deploy.yml (3 ctl + 2 agent + 1 acct)
+      # --- Run deploy.yml against the cluster ------------------------------
+      - name: deploy.yml (3 ctl + 2 agent + 1 acct + 1 login)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
@@ -228,6 +235,31 @@ jobs:
               sleep 2
             done
             echo "job $jid did not complete in time (last: ${st:-none})"; exit 1
+          '
+
+      - name: Assert login node can submit + query a job
+        run: |
+          set -euo pipefail
+          # login-0 runs no daemon — only the CLI + SPUR_CONTROLLER_ADDR written
+          # to /etc/environment by the spur_login role. docker exec bypasses PAM,
+          # so source /etc/environment explicitly to mimic a real login session.
+          # This proves a user SSHing into the login node can drive the cluster.
+          docker exec login-0 bash -c '
+            set -e
+            set -a; . /etc/environment; set +a
+            test -n "$SPUR_CONTROLLER_ADDR" || { echo "SPUR_CONTROLLER_ADDR not set"; exit 1; }
+            echo "login SPUR_CONTROLLER_ADDR=$SPUR_CONTROLLER_ADDR"
+            squeue >/dev/null || { echo "squeue failed from login node"; exit 1; }
+            printf "#!/bin/bash\n#SBATCH --job-name=from-login\necho ok on \$(hostname)\n" > /tmp/ci-login.sh
+            jid=$(sbatch /tmp/ci-login.sh | grep -oE "[0-9]+" | head -1)
+            echo "login node submitted job $jid"
+            for i in $(seq 1 30); do
+              st=$(scontrol show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = COMPLETED ] && { echo "login-submitted job $jid COMPLETED"; exit 0; }
+              case "$st" in FAILED|CANCELLED|TIMEOUT|NODE_FAIL) echo "job ended $st"; exit 1 ;; esac
+              sleep 2
+            done
+            echo "login-submitted job did not complete"; exit 1
           '
 
       # --- Rolling upgrade to the newer build ------------------------------
@@ -300,7 +332,7 @@ jobs:
       - name: Dump logs on failure
         if: failure()
         run: |
-          for n in ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0; do
+          for n in ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0 login-0; do
             echo "===== $n journal (spur*) ====="
             docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -50' || true
           done
@@ -308,5 +340,5 @@ jobs:
       - name: Teardown containers
         if: always()
         run: |
-          for n in ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0; do docker rm -f "$n" || true; done
+          for n in ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0 login-0; do docker rm -f "$n" || true; done
           docker network rm spur-ci || true

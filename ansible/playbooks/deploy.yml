@@ -20,7 +20,10 @@
   hosts: "spur_controllers:spur_agents:spur_login"
   become: true
   gather_facts: yes
-  any_errors_fatal: true
+  # A down agent is skipped when spur_ignore_unreachable_agents=true; a down
+  # controller is still caught by the strict "Start controller" play below.
+  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
+  any_errors_fatal: "{{ not (spur_ignore_unreachable_agents | default(false) | bool) }}"
   roles:
     - role: spur_install
 
@@ -69,7 +72,9 @@
   hosts: spur_agents
   become: true
   gather_facts: no
-  any_errors_fatal: true
+  # Agents only: optionally skip unreachable ones (see spur_ignore_unreachable_agents).
+  any_errors_fatal: "{{ not (spur_ignore_unreachable_agents | default(false) | bool) }}"
+  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   serial: 0      # parallel
   roles:
     - role: spur_agent

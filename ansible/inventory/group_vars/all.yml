@@ -50,6 +50,16 @@ spur_accounting_db_port: 5432
 # this false so a fresh-install re-run doesn't needlessly reinstall.
 spur_force_reinstall: false
 
+# Tolerate unreachable AGENTS and proceed with the rest (per-run, via -e).
+# Default false = strict (an unreachable host aborts the run). When true, the
+# AGENT plays in deploy.yml / rolling_upgrade.yml skip hosts that can't be
+# reached and continue with the others — useful for a large fleet where a few
+# compute nodes may be down for maintenance.
+# IMPORTANT: this only ever loosens the agent plays. Controllers are Raft members
+# (skipping one silently breaks quorum) and the accounting host runs the shared
+# DB, so those plays stay strict regardless of this flag.
+spur_ignore_unreachable_agents: false
+
 # Logging
 spur_log_level: info
 
