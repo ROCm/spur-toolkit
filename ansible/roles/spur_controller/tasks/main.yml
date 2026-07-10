@@ -30,7 +30,9 @@
 
 - name: Resolve short node name for each agent (used by spur.conf and --hostname)
   ansible.builtin.set_fact:
-    spur_node_name: "{{ hostvars[item].ansible_hostname }}"
+    spur_node_name: >-
+      {{ hostvars[item].ansible_hostname
+         | default(hostvars[item].inventory_hostname) }}
   delegate_to: "{{ item }}"
   delegate_facts: true
   loop: "{{ groups['spur_agents'] }}"
