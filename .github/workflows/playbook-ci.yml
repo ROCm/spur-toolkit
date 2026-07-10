@@ -1,0 +1,182 @@
+# ============================================================================
+# FIRST DRAFT — playbook integration test for PRs.
+#
+# Brings up a 6-node cluster of systemd-enabled Docker containers on a single
+# GitHub-hosted runner, builds Spur from ROCm/spur@main, and runs deploy.yml
+# against 3 controllers + 2 agents + 1 accounting node. Rolling upgrade and the
+# day-2 playbooks are stubbed as TODOs to add once deploy is green.
+#
+# Status: EXPERIMENTAL. workflow_dispatch-only for now (manual, non-gating) so
+# we can iterate on the systemd-in-Docker specifics (cgroup v2 on ubuntu-latest)
+# and the ROCm/spur build invocation before it gates PRs. Flip on `pull_request`
+# once it is green a few times in a row.
+# ============================================================================
+name: playbook-ci
+
+on:
+  workflow_dispatch: {}
+  # TODO: enable once stable —
+  # pull_request:
+  #   paths:
+  #     - 'ansible/**'
+  #     - '.github/workflows/playbook-ci.yml'
+
+concurrency:
+  group: playbook-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ansible + lint
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ansible-core ansible-lint
+          ansible-galaxy collection install community.docker
+      - name: Syntax check all playbooks
+        working-directory: ansible
+        run: |
+          for pb in playbooks/*.yml; do
+            echo "== syntax-check $pb =="
+            ansible-playbook --syntax-check -i ci/inventory/ci.ini "$pb" || exit 1
+          done
+
+  deploy-6node:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Build Spur from upstream main -----------------------------------
+      - name: Checkout ROCm/spur@main
+        uses: actions/checkout@v4
+        with:
+          repository: ROCm/spur
+          ref: main
+          path: spur-src
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            spur-src/target
+          key: cargo-${{ hashFiles('spur-src/Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Build spur binaries
+        working-directory: spur-src
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler build-essential
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          cargo build --release -p spur-cli -p spurctld -p spurd
+          mkdir -p "$GITHUB_WORKSPACE/spur-bin"
+          cp target/release/spur target/release/spurctld target/release/spurd \
+             "$GITHUB_WORKSPACE/spur-bin/"
+
+      # --- Bring up the 6-node systemd-container cluster -------------------
+      - name: Start 6 systemd containers on a docker network
+        env:
+          NODES: "ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0"
+          IMG: jrei/systemd-ubuntu:22.04
+        run: |
+          set -euo pipefail
+          docker network create spur-ci
+          docker pull "$IMG"
+          # Flags per systemd-in-Docker on a cgroup v2 host (ubuntu-latest):
+          #   --privileged --cgroupns=host, /sys/fs/cgroup mounted :rw (NOT :ro,
+          #   which is a cgroup v1 convention), and tmpfs for /run and /tmp.
+          # The image sets CMD=/sbin/init itself, so no --entrypoint is needed.
+          # We use explicit `docker run` rather than the Actions `container:`
+          # option, which has a known bug initializing systemd entrypoints
+          # (github community discussion #153131).
+          for n in $NODES; do
+            docker run -d --name "$n" --hostname "$n" \
+              --network spur-ci \
+              --privileged \
+              --cgroupns=host \
+              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+              "$IMG"
+          done
+
+      - name: Wait for systemd to be ready in every container
+        env:
+          NODES: "ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0"
+        run: |
+          set -uo pipefail
+          for n in $NODES; do
+            ok=""
+            for i in $(seq 1 30); do
+              # "running" or "degraded" both mean systemd finished booting; only
+              # keep waiting while it is still "starting" / "initializing".
+              st=$(docker exec "$n" systemctl is-system-running 2>/dev/null || true)
+              case "$st" in
+                running|degraded) ok=1; break ;;
+              esac
+              sleep 2
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::systemd never became ready in $n (last: ${st:-none})"
+              docker exec "$n" systemctl status --no-pager || true
+              exit 1
+            fi
+            echo "$n: systemd ready ($st)"
+          done
+
+      - name: Install in-container preflight deps (curl/tar/iproute2/python3)
+        env:
+          NODES: "ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0"
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3'
+          done
+
+      - name: Install ansible + docker connection plugin
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ansible-core
+          ansible-galaxy collection install community.docker
+
+      # --- Run deploy.yml against the 6 nodes ------------------------------
+      - name: deploy.yml (3 ctl + 2 agent + 1 acct)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i ci/inventory/ci.ini playbooks/deploy.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur
+
+      # --- Assert the cluster actually works -------------------------------
+      - name: Assert agents registered + a job completes
+        run: |
+          echo "== spur nodes =="
+          docker exec ctl-0 /usr/local/bin/spur nodes
+          count=$(docker exec ctl-0 /usr/local/bin/spur nodes | grep -c 'gpu-' || true)
+          test "$count" -ge 2 || { echo "expected >=2 agents, got $count"; exit 1; }
+
+      # TODO(next): rolling_upgrade.yml with a running job (assert survival +
+      #             database_url still points at acct-0)
+      # TODO(next): add_nodes.yml / remove_nodes.yml / manage_accounts.yml
+      # TODO(next): healthcheck.yml (assert green) and teardown.yml
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          for n in ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0; do
+            echo "===== $n journal (spur*) ====="
+            docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -50' || true
+          done
+
+      - name: Teardown containers
+        if: always()
+        run: |
+          for n in ctl-0 ctl-1 ctl-2 gpu-1 gpu-2 acct-0; do docker rm -f "$n" || true; done
+          docker network rm spur-ci || true
