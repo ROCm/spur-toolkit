@@ -240,11 +240,19 @@ jobs:
       - name: Record pre-upgrade state (version + accounting target)
         run: |
           set -euo pipefail
-          echo "PRE_VERSION=$(docker exec ctl-0 /usr/local/bin/spur --version 2>/dev/null || true)"
-          # The accounting host in the live spur.conf must survive the upgrade.
-          pre_db=$(docker exec ctl-0 bash -lc "grep -oE 'postgresql://[^\"]+' /opt/spur/etc/spur.conf | head -1")
-          echo "pre-upgrade database_url: $pre_db"
-          echo "$pre_db" | grep -q '@acct-0:' || { echo "expected database_url to point at acct-0"; exit 1; }
+          docker exec ctl-0 /usr/local/bin/spur --version || true
+          # The accounting role advertises the host by its network IP, not name,
+          # so the spur.conf database_url contains acct-0's Docker IP. Capture
+          # that IP and the host@:port it resolves to, and persist for the
+          # post-upgrade comparison. (The password in the URL is masked by CI.)
+          acct_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' acct-0)
+          echo "acct-0 IP: $acct_ip"
+          pre_hostport=$(docker exec ctl-0 bash -lc "grep -oE '@[^/\"]+' /opt/spur/etc/spur.conf | head -1")
+          echo "pre-upgrade accounting endpoint: $pre_hostport"
+          echo "$pre_hostport" | grep -q "@${acct_ip}:" || { echo "database_url does not point at acct-0 ($acct_ip)"; exit 1; }
+          # Persist for the post-upgrade step.
+          echo "ACCT_IP=$acct_ip" >> "$GITHUB_ENV"
+          echo "PRE_HOSTPORT=$pre_hostport" >> "$GITHUB_ENV"
 
       - name: rolling_upgrade.yml (to nightly build)
         working-directory: ansible
@@ -272,11 +280,12 @@ jobs:
             sleep 2
           done
           [ -z "$missing" ] || { echo "agents missing after upgrade:$missing"; exit 1; }
-          # database_url must still point at acct-0 (preservation fix) — a
-          # rolling upgrade must never silently repoint accounting.
-          post_db=$(docker exec ctl-0 bash -lc "grep -oE 'postgresql://[^\"]+' /opt/spur/etc/spur.conf | head -1")
-          echo "post-upgrade database_url: $post_db"
-          echo "$post_db" | grep -q '@acct-0:' || { echo "database_url no longer points at acct-0!"; exit 1; }
+          # database_url must still point at acct-0's IP (preservation fix) — a
+          # rolling upgrade must never silently repoint accounting at a controller.
+          post_hostport=$(docker exec ctl-0 bash -lc "grep -oE '@[^/\"]+' /opt/spur/etc/spur.conf | head -1")
+          echo "post-upgrade accounting endpoint: $post_hostport (expected: $PRE_HOSTPORT)"
+          echo "$post_hostport" | grep -q "@${ACCT_IP}:" || { echo "database_url no longer points at acct-0 ($ACCT_IP)!"; exit 1; }
+          test "$post_hostport" = "$PRE_HOSTPORT" || { echo "accounting endpoint changed across upgrade!"; exit 1; }
           # A job still runs after the upgrade.
           docker exec ctl-0 bash -lc '
             set -e
