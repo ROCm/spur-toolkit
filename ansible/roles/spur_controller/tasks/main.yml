@@ -34,6 +34,9 @@
 # gather facts on all hosts up front, so this is a no-op there. add_nodes.yml only
 # gathers facts for the new nodes by the time the controller role runs, so any
 # pre-existing agents may be missing facts — this task fills the gap.
+# ignore_unreachable/ignore_errors: a temporarily down agent (e.g. during a rolling
+# upgrade) must not abort the controller upgrade. The template uses | default() so
+# spur.conf is still rendered with the last-known or 0-fallback values for that node.
 - name: Gather facts for any agent missing them (needed for spur.conf [[nodes]] block)
   ansible.builtin.setup:
   delegate_to: "{{ item }}"
@@ -41,6 +44,8 @@
   loop: "{{ groups['spur_agents'] }}"
   run_once: true
   when: hostvars[item].ansible_processor_vcpus is not defined
+  ignore_unreachable: true
+  ignore_errors: true
 
 - name: Resolve short node name for each agent (used by spur.conf and --hostname)
   ansible.builtin.set_fact:

@@ -33,8 +33,8 @@ agent_port = {{ spur_agent_port }}
 {% for h in groups['spur_agents'] %}
 [[nodes]]
 names = "{{ hostvars[h]['spur_node_name'] }}"
-cpus = {{ hostvars[h]['ansible_processor_vcpus'] }}
-memory_mb = {{ (hostvars[h]['ansible_memtotal_mb'] * 0.9) | int }}
+cpus = {{ hostvars[h]['ansible_processor_vcpus'] | default(0) }}
+memory_mb = {{ ((hostvars[h]['ansible_memtotal_mb'] | default(0)) * 0.9) | int }}
 
 {% endfor %}
 [[partitions]]

@@ -58,6 +58,10 @@
   hosts: spur_controllers:spur_agents
   become: true
   gather_facts: yes
+  # ignore_unreachable: a temporarily down agent must not abort the whole upgrade.
+  # The spur_controller role's setup task will re-attempt fact-gathering for any
+  # agent still missing facts when spur.conf is re-rendered.
+  ignore_unreachable: true
   tasks: []
 
 - name: Rolling upgrade — controllers, one at a time (preserves Raft quorum)
