@@ -15,6 +15,12 @@ name: playbook-ci
 
 on:
   workflow_dispatch: {}
+  # push trigger scoped to the CI branch so the workflow runs on the fork during
+  # iteration (pull_request runs in the BASE repo, which doesn't have this file
+  # on its default branch yet). Remove this push block before merging.
+  push:
+    branches:
+      - ci/playbook-integration-tests
   pull_request:
     paths:
       - 'ansible/**'
