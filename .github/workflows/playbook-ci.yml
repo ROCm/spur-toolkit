@@ -2,9 +2,10 @@
 # FIRST DRAFT — playbook integration test for PRs.
 #
 # Brings up a 6-node cluster of systemd-enabled Docker containers on a single
-# GitHub-hosted runner, builds Spur from ROCm/spur@main, and runs deploy.yml
-# against 3 controllers + 2 agents + 1 accounting node. Rolling upgrade and the
-# day-2 playbooks are stubbed as TODOs to add once deploy is green.
+# GitHub-hosted runner, downloads pre-built Spur binaries from a ROCm/spur
+# release, and runs deploy.yml against 3 controllers + 2 agents + 1 accounting
+# node. Rolling upgrade and the day-2 playbooks are stubbed as TODOs to add once
+# deploy is green.
 #
 # Status: EXPERIMENTAL. Temporarily runs on pull_request for fast iteration on
 # the systemd-in-Docker specifics (cgroup v2 on ubuntu-latest) and the ROCm/spur
@@ -59,34 +60,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- Build Spur from upstream main -----------------------------------
-      - name: Checkout ROCm/spur@main
-        uses: actions/checkout@v4
-        with:
-          repository: ROCm/spur
-          ref: main
-          path: spur-src
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            spur-src/target
-          key: cargo-${{ hashFiles('spur-src/Cargo.lock') }}
-          restore-keys: cargo-
-
-      - name: Build spur binaries
-        working-directory: spur-src
+      # --- Fetch pre-built Spur binaries from a ROCm/spur release ----------
+      # Faster and more representative than building from source: download the
+      # published linux-amd64 tarball, verify its sha256, and extract the three
+      # binaries into spur-bin/ for use as spur_binary_src. Override the version
+      # by running the workflow via workflow_dispatch after adding an input, or
+      # by editing SPUR_RELEASE below (default: newest non-nightly tag).
+      - name: Download + verify Spur release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Pin a specific tag here, or leave empty to auto-pick the newest
+          # non-nightly release tag.
+          SPUR_RELEASE: ""
         run: |
-          sudo apt-get update && sudo apt-get install -y protobuf-compiler build-essential
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source "$HOME/.cargo/env"
-          cargo build --release -p spur-cli -p spurctld -p spurd
+          set -euo pipefail
+          tag="$SPUR_RELEASE"
+          if [ -z "$tag" ]; then
+            tag=$(gh api repos/ROCm/spur/releases --jq \
+              'map(select(.tag_name != "nightly"))[0].tag_name')
+          fi
+          echo "Using ROCm/spur release: $tag"
+
+          mkdir -p dl && cd dl
+          gh release download "$tag" --repo ROCm/spur \
+            --pattern '*-linux-amd64.tar.gz' \
+            --pattern '*-linux-amd64.tar.gz.sha256'
+
+          tarball=$(ls *-linux-amd64.tar.gz)
+          echo "Verifying checksum of $tarball"
+          # The .sha256 may contain just the hash or "hash  filename"; normalise.
+          hash=$(awk '{print $1}' "${tarball}.sha256")
+          echo "${hash}  ${tarball}" | sha256sum -c -
+
+          tar xzf "$tarball"
+          # Layout is spur-<ver>-linux-amd64/bin/{spur,spurctld,spurd,...}
+          bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
+          test -n "$bindir" || { echo "spurctld not found in tarball"; exit 1; }
+
           mkdir -p "$GITHUB_WORKSPACE/spur-bin"
-          cp target/release/spur target/release/spurctld target/release/spurd \
-             "$GITHUB_WORKSPACE/spur-bin/"
+          for b in spur spurctld spurd; do
+            cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"
+          done
+          chmod +x "$GITHUB_WORKSPACE"/spur-bin/*
+          echo "== staged binaries =="
+          ls -l "$GITHUB_WORKSPACE/spur-bin"
 
       # --- Bring up the 6-node systemd-container cluster -------------------
       - name: Start 6 systemd containers on a docker network
