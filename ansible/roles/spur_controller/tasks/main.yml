@@ -116,11 +116,16 @@
     - (raft_peers.stdout_lines | sort) != desired_peers
 
 # Stop BEFORE wiping state so spurctld does not rewrite the Raft log we are about to delete.
+# Only needed when we're actually wiping (and never when skip_restart is requested —
+# add_nodes.yml refreshes spur.conf without touching the running controller).
 - name: Stop spurctld before wiping state
   ansible.builtin.systemd:
     name: spurctld
     state: stopped
   failed_when: false
+  when:
+    - spur_wipe_state | bool
+    - not (spur_controller_skip_restart | default(false) | bool)
 
 - name: Wipe Raft state (when spur_wipe_state is true)
   ansible.builtin.file:
@@ -135,11 +140,17 @@
     mode: "0755"
   when: spur_wipe_state | bool
 
+# spur_controller_skip_restart: set by add_nodes.yml so spur.conf is regenerated
+# (to include a newly added agent) WITHOUT bouncing the running controller — a new
+# spurd registers itself at runtime, so no controller restart is needed to see it.
+# deploy.yml / rolling_upgrade.yml leave this false and restart as usual. When the
+# controller isn't restarted, ensure it's at least enabled + running (first-ever
+# run still needs it started; an already-running one is left untouched).
 - name: Enable and (re)start spurctld
   ansible.builtin.systemd:
     name: spurctld
     enabled: true
-    state: restarted
+    state: "{{ 'started' if (spur_controller_skip_restart | default(false) | bool) else 'restarted' }}"
 
 - name: Wait for spurctld to listen on {{ spur_controller_port }}
   ansible.builtin.wait_for:

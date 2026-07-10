@@ -1,6 +1,6 @@
 # Spur — Ansible Deployment
 
-Lifecycle playbooks: `deploy.yml` stands up a Spur cluster in every supported shape from inventory; `rolling_upgrade.yml` upgrades an already-running cluster's binaries with no full-cluster outage; `teardown.yml` stops it. Plus day-2 [admin operations](#admin-operations) — `manage_accounts.yml`, `remove_nodes.yml`, `healthcheck.yml`. Daemons run as **systemd services**, Slurm-compatible CLI names are symlinked, and optional **PostgreSQL accounting** (embedded in `spurctld`) is on by default.
+Lifecycle playbooks: `deploy.yml` stands up a Spur cluster in every supported shape from inventory; `rolling_upgrade.yml` upgrades an already-running cluster's binaries with no full-cluster outage; `teardown.yml` stops it. Plus day-2 [admin operations](#admin-operations) — `manage_accounts.yml`, `add_nodes.yml`, `remove_nodes.yml`, `healthcheck.yml`. Daemons run as **systemd services**, Slurm-compatible CLI names are symlinked, and optional **PostgreSQL accounting** (embedded in `spurctld`) is on by default.
 
 ## Quick start
 
@@ -282,7 +282,7 @@ Override per-run with `-e key=value` (repeatable):
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release -e spur_wipe_state=true
 ```
 
-The day-2 admin playbooks take their own structured vars (`spur_accounts` / `spur_qos` / `spur_users` for `manage_accounts.yml`, `nodes_to_remove` for `remove_nodes.yml`) — documented under [Admin operations](#admin-operations) rather than in the table above, since they're per-playbook lists, not global cluster settings.
+The day-2 admin playbooks take their own vars (`spur_accounts` / `spur_qos` / `spur_users` for `manage_accounts.yml`, `new_nodes` for `add_nodes.yml`, `nodes_to_remove` for `remove_nodes.yml`) — documented under [Admin operations](#admin-operations) rather than in the table above, since they're per-playbook inputs, not global cluster settings.
 
 ---
 
@@ -371,6 +371,18 @@ ansible-playbook playbooks/manage_accounts.yml -i inventory/hosts.ini
 
 Removals go in `spur_qos_absent` / `spur_accounts_absent` / `spur_users_absent` (name-only; users also take `account`). The playbook applies in FK-safe order automatically — qos/accounts before users on add, users before accounts on remove (an account can't be deleted while a user association still references it). Requires accounting enabled.
 
+### Add compute nodes — `add_nodes.yml`
+
+Add agent(s) to a **running** cluster with **no disruption to existing daemons or jobs**. A full `deploy.yml` run also adds nodes, but it restarts *every* spurctld and spurd (see [Upgrading](#upgrading)); `add_nodes.yml` only starts `spurd` on the new hosts. It works because a new `spurd` registers itself at runtime — the node appears in `spur nodes` immediately, no controller restart needed.
+
+First add the host(s) to `[spur_agents]` in your inventory (the source of truth), then:
+
+```bash
+ansible-playbook playbooks/add_nodes.yml -i inventory/hosts.ini -e new_nodes=gpu-3,gpu-4
+```
+
+What it does: gathers facts across the cluster (so the regenerated `spur.conf` has cpu/memory for every node), installs + starts `spurd` on the new hosts only, refreshes `spur.conf` on the controllers **without restarting them**, and verifies each new node registered. Idempotent — a node already registered is skipped (re-runs never bounce a healthy agent). Adding a **controller** is out of scope (that's a Raft membership change) — use `deploy.yml` for that; `add_nodes.yml` refuses controller names.
+
 ### Decommission compute nodes — `remove_nodes.yml`
 
 Cleanly remove agents from a running cluster: drain → wait until `DRAINED` (running jobs finish first) → stop `spurd` on the node → `spur node remove`. No state wipe (agents aren't Raft members).
@@ -379,7 +391,7 @@ Cleanly remove agents from a running cluster: drain → wait until `DRAINED` (ru
 ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4
 ```
 
-Names are as they appear in `spur nodes`. After it runs, **delete those hosts from `[spur_agents]` in your inventory** or a later `deploy.yml` will re-add them (the playbook prints this reminder). Adding nodes is just `deploy.yml` with the new hosts in inventory — no separate playbook needed.
+Names are as they appear in `spur nodes`. After it runs, **delete those hosts from `[spur_agents]` in your inventory** or a later `deploy.yml` will re-add them (the playbook prints this reminder).
 
 ### Health check — `healthcheck.yml`
 
