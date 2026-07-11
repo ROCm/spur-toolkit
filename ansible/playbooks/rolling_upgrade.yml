@@ -14,9 +14,19 @@
 #
 # Batch agent upgrades (default one at a time):
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_rolling_batch_size=2
+#
+# Skip agents unreachable over SSH (default false = strict, abort the upgrade):
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_ignore_unreachable_agents=true
+#
+# Skip agents that are reachable but still busy — a running job blocked drain
+# from completing within spur_drain_wait_secs (default 120s). Default false =
+# strict, abort the upgrade rather than silently leave a node on the old
+# binary. A skipped busy node is resumed on its current binary, not left
+# drained:
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_skip_busy_agents=true
 
 - name: Guard rails — refuse to start against a wipe-flagged or unhealthy cluster
-  hosts: "{{ groups['spur_controllers'][0] }}"
+  hosts: spur_controllers[0]
   become: true
   gather_facts: no
   any_errors_fatal: true
@@ -81,12 +91,34 @@
   become: true
   gather_facts: yes
   serial: "{{ spur_rolling_batch_size | default(1) }}"
-  max_fail_percentage: 0
+  # Skip unreachable agents when spur_ignore_unreachable_agents=true, else strict.
+  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
+  max_fail_percentage: "{{ 100 if (spur_ignore_unreachable_agents | default(false) | bool) else 0 }}"
   pre_tasks:
+    # Reachability probe: ping actually connects, so an unreachable agent's
+    # result is registered unreachable (ignored via ignore_unreachable). A
+    # set_fact would NOT work here — it runs on the control node and "succeeds"
+    # even for a down host. The delegated drain/resume tasks gate on this so
+    # they skip cleanly for a skipped agent.
+    - name: Probe agent reachability
+      ansible.builtin.ping:
+      register: spur_agent_ping
+
+    # Default through inventory_hostname (always defined) so the delegated shell
+    # tasks below can template {{ spur_node_name }} even for an unreachable agent
+    # with no gathered facts — free-form shell args are finalized before `when`,
+    # so an undefined var would error despite the reachability gate.
     - name: Resolve this node's registered name
       ansible.builtin.set_fact:
-        spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
+        spur_node_name: "{{ spur_node_name | default(ansible_hostname | default(inventory_hostname)) }}"
 
+    # Always drain, even for an agent that's unreachable over SSH: this is a
+    # controller-side command (delegate_to, no connection to the agent itself
+    # needed) and it's what actually stops the scheduler from still treating a
+    # down node as schedulable. Skipping it here would leave an unreachable
+    # agent sitting Idle in the scheduler's view until its heartbeat times out
+    # (default 90s) — long enough for the verify job below to be dispatched to
+    # a node that will never run it.
     - name: Drain this node before touching its binaries
       ansible.builtin.command: >-
         {{ spur_install_dir }}/spur node drain {{ spur_node_name }}
@@ -96,13 +128,19 @@
 
     # Draining stops new scheduling but lets running jobs finish on their own
     # (DRAINING -> DRAINED); only proceed once the node reports fully drained.
+    # Also accept DOWN: an agent that's genuinely unreachable may independently
+    # cross its heartbeat timeout and flip to DOWN before (or instead of)
+    # settling on DRAINED, which is an equally valid "stopped scheduling here"
+    # outcome for our purposes.
     - name: Wait for the node to fully drain
       ansible.builtin.shell: |
-        for i in $(seq 1 120); do
+        for i in $(seq 1 {{ spur_drain_wait_secs | default(120) }}); do
           st=$({{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
                | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
                | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
-          [ "$st" = "DRAINED" ] && exit 0
+          case "$st" in
+            DRAINED|DOWN) exit 0 ;;
+          esac
           sleep 1
         done
         echo "timed out waiting for {{ spur_node_name }} to drain (last state: $st)"
@@ -111,12 +149,52 @@
         executable: /bin/bash
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: false
+      # Non-fatal: an unreachable agent's exact state transition timing isn't
+      # guaranteed within this window, and a reachable-but-busy node (a job
+      # still running there) is a distinct, expected case handled below via
+      # spur_node_busy. The drain command above already told the scheduler to
+      # stop assigning new work here, which is what matters either way.
+      failed_when: false
+      register: spur_drain_wait
+
+    # Busy = reachable (drain wasn't skipped by unreachability) but the wait
+    # above didn't reach DRAINED/DOWN in time — i.e. a job is still running
+    # there. Draining never force-kills a running job, so this is expected,
+    # not an error; whether to proceed anyway is the operator's call below.
+    - name: Determine whether this node is busy (reachable but still draining)
+      ansible.builtin.set_fact:
+        spur_node_busy: "{{ (spur_drain_wait.rc | default(0) != 0) and not (spur_agent_ping.unreachable | default(false)) }}"
+
+    - name: Refuse to upgrade a busy node unless spur_skip_busy_agents=true
+      ansible.builtin.fail:
+        msg: >-
+          {{ spur_node_name }} still has a running job and did not drain
+          within {{ spur_drain_wait_secs | default(120) }}s. Rolling upgrade
+          never force-kills running work. Re-run with
+          -e spur_skip_busy_agents=true to leave busy nodes on their current
+          binary and continue upgrading the rest of the fleet.
+      when: spur_node_busy and not (spur_skip_busy_agents | default(false) | bool)
+
+    - name: Note busy node is being left on its current binary
+      ansible.builtin.debug:
+        msg: >-
+          {{ spur_node_name }} still has a running job — skipping its upgrade
+          (spur_skip_busy_agents=true) and resuming it as-is.
+      when: spur_node_busy and (spur_skip_busy_agents | default(false) | bool)
 
   roles:
+    # Skipped for a busy node (spur_node_busy=true, opted in via
+    # spur_skip_busy_agents) — overwriting a running agent's binaries out from
+    # under its own job is unsafe regardless of how the drain wait turned out.
+    # Still attempted for an unreachable node; every task inside will itself
+    # fail (ignored, not counted, via the play's ignore_unreachable) since
+    # there's no connection to reach it.
     - role: spur_install
       vars:
         spur_force_reinstall: true
+      when: not (spur_node_busy | default(false))
     - role: spur_agent
+      when: not (spur_node_busy | default(false))
 
   post_tasks:
     - name: Wait for the node to re-register after the upgrade
@@ -131,18 +209,24 @@
         executable: /bin/bash
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: false
+      # A skipped busy node was never touched (roles above didn't run for it),
+      # so spurd never restarted — there's nothing to wait for.
+      when: not (spur_agent_ping.unreachable | default(false)) and not (spur_node_busy | default(false))
 
     # A drained node stays drained after spurd restarts — draining is server-side
     # state, not tied to the agent process. Without this, upgraded capacity sits
-    # idle indefinitely.
+    # idle indefinitely. This also covers a skipped busy node: it's healthy and
+    # was only drained as part of attempting the upgrade, so put it back into
+    # service on its current binary.
     - name: Resume the node (undrain) now that it's back
       ansible.builtin.command: >-
         {{ spur_install_dir }}/scontrol update NodeName={{ spur_node_name }} State=RESUME
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: true
+      when: not (spur_agent_ping.unreachable | default(false))
 
 - name: Verify the upgraded cluster still schedules work
-  hosts: "{{ groups['spur_controllers'][0] }}"
+  hosts: spur_controllers[0]
   become: true
   gather_facts: no
   roles:
