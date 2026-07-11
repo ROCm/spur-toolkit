@@ -238,7 +238,11 @@ jobs:
           # rolling_upgrade.yml must never force-kill running work.
           docker exec ctl-0 bash -lc '
             set -e
-            printf "#!/bin/bash\n#SBATCH --job-name=busy\nsleep 120\n" > /tmp/ci-busy.sh
+            # Long enough to outlast deploy + rolling upgrade + verify (the
+            # verify play alone can burn up to 60s on a multi-node job that
+            # can never satisfy N=3 with gpu-2 down) with real margin —
+            # observed ~145s elapsed between submitting this and checking it.
+            printf "#!/bin/bash\n#SBATCH --job-name=busy\nsleep 600\n" > /tmp/ci-busy.sh
             jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-busy.sh | grep -oE "[0-9]+" | head -1)
             echo "$jid" > /tmp/ci-busy.jid
             for i in $(seq 1 30); do
