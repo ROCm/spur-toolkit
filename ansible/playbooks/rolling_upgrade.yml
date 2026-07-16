@@ -25,6 +25,10 @@
 # drained:
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_skip_busy_agents=true
 #
+# Re-render spur.conf from the Ansible template (default: preserve existing config).
+# Only needed when inventory vars have changed (e.g. new cluster name, ports, nodes):
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_overwrite_conf=true
+#
 # Force-upgrade ALL nodes even if jobs are still running — running jobs WILL be
 # killed (marked NODE_FAIL by the controller the moment spurd restarts). Only
 # use when job disruption is acceptable (e.g. a maintenance window where you
@@ -91,6 +95,11 @@
       vars:
         spur_force_reinstall: true
     - role: spur_controller
+      vars:
+        # rolling_upgrade preserves the existing spur.conf by default — the cluster
+        # is live and its config is known-good. Pass -e spur_overwrite_conf=true to
+        # re-render it from the Ansible template (e.g. after changing inventory vars).
+        spur_controller_skip_conf: "{{ not (spur_overwrite_conf | default(false) | bool) }}"
 
 - name: Rolling upgrade — agents, drained and upgraded in batches
   hosts: spur_agents
