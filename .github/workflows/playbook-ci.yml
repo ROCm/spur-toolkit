@@ -364,7 +364,7 @@ jobs:
           set -euo pipefail
           # The running job must have been killed when spurd restarted.
           jid=$(docker exec ctl-0 cat /tmp/ci-force-busy.jid)
-          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
           echo "force-busy job $jid state after force upgrade: $st"
           [ "$st" = NODE_FAIL ] || { echo "expected NODE_FAIL, got $st"; exit 1; }
 
