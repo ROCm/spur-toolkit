@@ -135,6 +135,7 @@
     dest: "{{ spur_home }}/etc/spur.conf"
     mode: "0644"
   register: spur_conf
+  when: not (spur_controller_skip_conf | default(false) | bool)
 
 - name: Install spurctld systemd unit
   ansible.builtin.template:
