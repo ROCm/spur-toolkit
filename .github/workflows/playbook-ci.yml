@@ -1,23 +1,14 @@
 # ============================================================================
-# Playbook integration test.
+# Playbook integration tests — two parallel jobs, each with its own cluster.
 #
-# On a single GitHub-hosted runner, brings up a lean 4-node cluster of
-# systemd-enabled Docker containers, downloads pre-built Spur binaries from
-# ROCm/spur, and exercises deploy.yml + two rolling_upgrade.yml passes:
+# integration-resilience:
+#   deploy + rolling upgrade covering all three agent states + force upgrade
+#   with OS-level kill verification (bare process AND Docker container)
 #
-# Pass 1 — resilience (all three agent states in one run):
-#   - gpu-1 : normal            -> upgraded, still schedules work afterward
-#   - gpu-2 : unreachable (down)-> skipped via spur_ignore_unreachable_agents
-#   - gpu-3 : busy (job running)-> skipped via spur_skip_busy_agents, resumed
-#             on its current binary, running job left undisturbed
+# integration-conf:
+#   deploy + spur.conf preservation (default: preserve, opt-in: overwrite)
 #
-# Pass 2 — force upgrade (spur_force_upgrade_busy_agents=true):
-#   - gpu-3 : busy (new job)    -> upgraded immediately, job killed (NODE_FAIL)
-#
-# Full HA/accounting/login-node coverage lives in deploy.yml's own path — this
-# job is scoped to rolling-upgrade resilience, not general deploy coverage, to
-# keep the fast-iteration loop fast.
-#
+# Full HA/accounting/login-node coverage lives in deploy.yml's own path.
 # Day-2 playbooks (add_nodes/remove_nodes/manage_accounts/healthcheck/teardown)
 # are TODO — they build on the same running cluster.
 # ============================================================================
@@ -63,7 +54,10 @@ jobs:
             ansible-playbook --syntax-check -i inventory/ci.ini $DUMMY "$pb" || exit 1
           done
 
-  integration:
+  # ---------------------------------------------------------------------------
+  # Job 1: rolling upgrade resilience + force upgrade + container kill
+  # ---------------------------------------------------------------------------
+  integration-resilience:
     runs-on: ubuntu-latest
     needs: lint
     env:
@@ -71,12 +65,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- Fetch pre-built Spur binaries from ROCm/spur --------------------
-      # Two sets, to exercise a real rolling upgrade between distinct builds:
-      #   spur-bin      = INITIAL deploy version  (latest published release)
-      #   spur-bin-new  = UPGRADE target version  (latest nightly build)
-      # Both are post spurdbd-merge, so both deploy cleanly with the current
-      # roles. Each download verifies the tarball's sha256.
       - name: Download + verify Spur binaries (deploy = release, upgrade = nightly)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -85,7 +73,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          fetch() {  # <tag> <dest-dir>
+          fetch() {
             local tag="$1" dest="$2" d
             d="dl-$dest"
             mkdir -p "$d"
@@ -118,10 +106,6 @@ jobs:
           fetch "$deploy_tag"  spur-bin
           fetch "$upgrade_tag" spur-bin-new
 
-          echo "== deploy binaries =="; ls -l "$GITHUB_WORKSPACE/spur-bin"
-          echo "== upgrade binaries =="; ls -l "$GITHUB_WORKSPACE/spur-bin-new"
-
-      # --- Bring up the systemd-container cluster --------------------------
       - name: Start systemd containers on a docker network
         env:
           IMG: jrei/systemd-ubuntu:22.04
@@ -129,13 +113,6 @@ jobs:
           set -euo pipefail
           docker network create spur-ci
           docker pull "$IMG"
-          # Flags per systemd-in-Docker on a cgroup v2 host (ubuntu-latest):
-          #   --privileged --cgroupns=host, /sys/fs/cgroup mounted :rw (NOT :ro,
-          #   which is a cgroup v1 convention), and tmpfs for /run and /tmp.
-          # The image sets CMD=/sbin/init itself, so no --entrypoint is needed.
-          # We use explicit `docker run` rather than the Actions `container:`
-          # option, which has a known bug initializing systemd entrypoints
-          # (github community discussion #153131).
           for n in $NODES; do
             docker run -d --name "$n" --hostname "$n" \
               --network spur-ci \
@@ -152,12 +129,8 @@ jobs:
           for n in $NODES; do
             ok=""
             for i in $(seq 1 30); do
-              # "running" or "degraded" both mean systemd finished booting; only
-              # keep waiting while it is still "starting" / "initializing".
               st=$(docker exec "$n" systemctl is-system-running 2>/dev/null || true)
-              case "$st" in
-                running|degraded) ok=1; break ;;
-              esac
+              case "$st" in running|degraded) ok=1; break ;; esac
               sleep 2
             done
             if [ -z "$ok" ]; then
@@ -175,13 +148,39 @@ jobs:
             docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
           done
 
+      - name: Install Docker inside gpu-3 (for container kill test)
+        run: |
+          set -euo pipefail
+          # Install Docker CE inside the gpu-3 systemd container so we can
+          # submit a spur job that launches a Docker container, then assert
+          # the container is killed by the force-upgrade playbook.
+          docker exec gpu-3 bash -c '
+            apt-get install -y -qq ca-certificates curl gnupg lsb-release
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+              | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) \
+              signed-by=/etc/apt/keyrings/docker.gpg] \
+              https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" \
+              > /etc/apt/sources.list.d/docker.list
+            apt-get update -qq
+            apt-get install -y -qq docker-ce docker-ce-cli containerd.io
+            systemctl enable --now docker
+          '
+          # Wait for Docker daemon to be ready inside gpu-3
+          for i in $(seq 1 30); do
+            docker exec gpu-3 docker info &>/dev/null && break
+            sleep 2
+          done
+          docker exec gpu-3 docker info --format '{{.ServerVersion}}'
+
       - name: Install ansible + docker connection plugin
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install ansible-core
           ansible-galaxy collection install community.docker
 
-      # --- Run deploy.yml against the cluster ------------------------------
       - name: deploy.yml (1 ctl + 3 agents)
         working-directory: ansible
         env:
@@ -192,11 +191,9 @@ jobs:
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur
 
-      # --- Assert the cluster actually works -------------------------------
       - name: Assert all three agents registered
         run: |
           set -euo pipefail
-          # Poll: agents may register a beat apart after their spurd starts.
           for i in $(seq 1 30); do
             missing=""
             for a in gpu-1 gpu-2 gpu-3; do
@@ -233,21 +230,13 @@ jobs:
             echo "job $jid did not complete in time (last: ${st:-none})"; exit 1
           '
 
-      # --- Set up the three agent states, then upgrade in one pass ---------
+      # --- Pass 1: resilience (3 agent states in one run) ------------------
       - name: Simulate gpu-2 unreachable and gpu-3 busy
         run: |
           set -euo pipefail
-          # gpu-2: down for maintenance.
           docker stop gpu-2
-
-          # gpu-3: pin a long-running job there so drain can't complete —
-          # rolling_upgrade.yml must never force-kill running work.
           docker exec ctl-0 bash -lc '
             set -e
-            # Long enough to outlast deploy + rolling upgrade + verify (the
-            # verify play alone can burn up to 60s on a multi-node job that
-            # can never satisfy N=3 with gpu-2 down) with real margin —
-            # observed ~145s elapsed between submitting this and checking it.
             printf "#!/bin/bash\n#SBATCH --job-name=busy\nsleep 600\n" > /tmp/ci-busy.sh
             jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-busy.sh | grep -oE "[0-9]+" | head -1)
             echo "$jid" > /tmp/ci-busy.jid
@@ -276,10 +265,6 @@ jobs:
       - name: Assert gpu-1 upgraded and still schedules work
         run: |
           set -euo pipefail
-          # Poll: a same-command re-check moments apart has been observed to
-          # flip pass/fail on this specific query (see PR discussion) — retry
-          # instead of trusting a single call either way, and only fail after
-          # every attempt in the window comes back empty.
           found=""
           for i in $(seq 1 30); do
             docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null \
@@ -301,7 +286,7 @@ jobs:
             echo "post-upgrade job did not complete"; exit 1
           '
 
-      - name: Assert gpu-3's busy job was left undisturbed
+      - name: Assert gpu-3 busy job was left undisturbed
         run: |
           set -euo pipefail
           jid=$(docker exec ctl-0 cat /tmp/ci-busy.jid)
@@ -310,49 +295,67 @@ jobs:
           [ "$st" = RUNNING ] || { echo "busy job $jid was disturbed by the upgrade (state: $st)"; exit 1; }
           docker exec ctl-0 /usr/local/bin/spur show node gpu-3
 
-      # --- Force-upgrade pass: gpu-3 still on old binary, job still running --
-      # Pin a fresh busy job on gpu-3 (the scancel above hasn't run yet), then
-      # run rolling_upgrade with spur_force_upgrade_busy_agents=true targeting
-      # only gpu-3 and assert: (a) job was killed (NODE_FAIL), (b) node was
-      # upgraded to the new binary and re-registered.
-      - name: Submit a second busy job on gpu-3 for the force-upgrade test
+      # --- Pass 2: force upgrade — bare process + Docker container killed ---
+      - name: Submit force-upgrade test jobs on gpu-3 (bare sleep + Docker container)
         run: |
           set -euo pipefail
-          # Cancel the original busy job first so gpu-3 is Idle, then submit
-          # a fresh one. This ensures the force-upgrade test has a clean job ID.
+          # Cancel the original busy job and wait for gpu-3 to go IDLE.
           jid=$(docker exec ctl-0 cat /tmp/ci-busy.jid)
           docker exec ctl-0 /usr/local/bin/spur scancel "$jid" || true
-          # Wait for gpu-3 to go Idle before submitting the new busy job.
           for i in $(seq 1 30); do
             st=$(docker exec ctl-0 /usr/local/bin/spur show node gpu-3 2>/dev/null | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
             [ "$st" = IDLE ] && break
             sleep 2
           done
+
+          # Job A: bare sleep (existing test path).
           docker exec ctl-0 bash -lc '
             set -e
-            printf "#!/bin/bash\n#SBATCH --job-name=force-busy\nsleep 600\n" > /tmp/ci-force-busy.sh
-            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-busy.sh | grep -oE "[0-9]+" | head -1)
-            echo "$jid" > /tmp/ci-force-busy.jid
+            printf "#!/bin/bash\n#SBATCH --job-name=force-bare\nsleep 600\n" > /tmp/ci-force-bare.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-bare.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-force-bare.jid
             for i in $(seq 1 30); do
               st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
-              [ "$st" = RUNNING ] && { echo "force-busy job $jid RUNNING on gpu-3"; exit 0; }
+              [ "$st" = RUNNING ] && { echo "bare job $jid RUNNING on gpu-3"; exit 0; }
               sleep 1
             done
-            echo "force-busy job $jid never reached RUNNING (last: ${st:-none})"; exit 1
+            echo "bare job $jid never reached RUNNING"; exit 1
           '
 
-      - name: rolling_upgrade.yml --force (full fleet, gpu-3 will be force-upgraded)
+          # Job B: Docker container (tests the container-kill code path).
+          # The job script launches a detached Docker container inside gpu-3
+          # then sleeps in the foreground so the spur job stays RUNNING.
+          docker exec ctl-0 bash -lc '
+            set -e
+            cat > /tmp/ci-force-docker.sh <<EOF
+          #!/bin/bash
+          #SBATCH --job-name=force-docker
+          docker run -d --name ci-force-container ubuntu:22.04 sleep 600
+          sleep 600
+          EOF
+            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-docker.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-force-docker.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "docker job $jid RUNNING on gpu-3"; exit 0; }
+              sleep 1
+            done
+            echo "docker job $jid never reached RUNNING"; exit 1
+          '
+
+          # Confirm the Docker container is actually running inside gpu-3.
+          for i in $(seq 1 20); do
+            docker exec gpu-3 docker ps --filter name=ci-force-container --format '{{.Names}}' \
+              | grep -q ci-force-container && { echo "ci-force-container running"; break; }
+            sleep 2
+          done
+          docker exec gpu-3 docker ps --filter name=ci-force-container
+
+      - name: rolling_upgrade.yml --force (gpu-3 force-upgraded, jobs+container killed)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          # Run against the full fleet — the playbook handles each node's state:
-          #   gpu-1: already on new binary, spur_install is idempotent (no-op)
-          #   gpu-2: still down, skipped via spur_ignore_unreachable_agents=true
-          #   gpu-3: busy with a new job, force-upgraded (job will be NODE_FAIL)
-          # We cannot use -l gpu-3 here because the fact-gather play must reach
-          # ctl-0 to populate hostvars for the spur_agent role's controller-IP
-          # resolution (hostvars['ctl-0']['ansible_default_ipv4']).
           ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
             -e spur_install_dir=/usr/local/bin \
@@ -361,30 +364,45 @@ jobs:
             -e spur_force_upgrade_busy_agents=true \
             -e spur_drain_wait_secs=10
 
-      - name: Assert gpu-3 was upgraded and the forced-killed job is no longer running
+      - name: Assert bare job processes were killed (scheduler + OS cgroup check)
         run: |
           set -euo pipefail
-
-          # 1. Scheduler state: job must not still be RUNNING.
-          jid=$(docker exec ctl-0 cat /tmp/ci-force-busy.jid)
+          jid=$(docker exec ctl-0 cat /tmp/ci-force-bare.jid)
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
-          echo "force-busy job $jid scheduler state after force upgrade: $st"
-          [ "$st" = RUNNING ] && { echo "job $jid is still RUNNING in scheduler — processes were not killed"; exit 1; }
-          echo "scheduler: job $jid ended with $st (expected NODE_FAIL or CANCELLED)"
+          echo "bare job $jid scheduler state: $st"
+          [ "$st" = RUNNING ] && { echo "FAIL: bare job still RUNNING"; exit 1; }
+          echo "scheduler: bare job ended with $st"
 
-          # 2. OS-level check: verify the job processes are actually dead on gpu-3.
-          # The playbook kills all PIDs in /sys/fs/cgroup/spur/*/cgroup.procs, so
-          # the cgroup should be empty (or gone) and the sleep process must not exist.
           orphan_pids=$(docker exec gpu-3 bash -c \
             "find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null | xargs cat 2>/dev/null | sort -u" || true)
           if [ -n "$orphan_pids" ]; then
-            echo "FAIL: orphan PIDs still alive in spur cgroups on gpu-3: $orphan_pids"
+            echo "FAIL: orphan PIDs still in spur cgroups on gpu-3: $orphan_pids"
             docker exec gpu-3 ps -p "$orphan_pids" || true
             exit 1
           fi
-          echo "OS check: no orphan job processes remain in spur cgroups on gpu-3"
+          echo "OS check: spur cgroups empty on gpu-3"
 
-          # 3. gpu-3 must have re-registered after the spurd restart.
+      - name: Assert Docker container was killed by force upgrade
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-force-docker.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
+          echo "docker job $jid scheduler state: $st"
+          [ "$st" = RUNNING ] && { echo "FAIL: docker job still RUNNING in scheduler"; exit 1; }
+          echo "scheduler: docker job ended with $st"
+
+          # The Docker container must be gone — not running, not even stopped/exited.
+          running=$(docker exec gpu-3 docker ps --filter name=ci-force-container --format '{{.Names}}' || true)
+          if [ -n "$running" ]; then
+            echo "FAIL: Docker container ci-force-container is still RUNNING on gpu-3"
+            docker exec gpu-3 docker ps
+            exit 1
+          fi
+          echo "Docker container ci-force-container is gone from gpu-3"
+
+      - name: Assert gpu-3 re-registered after force upgrade
+        run: |
+          set -euo pipefail
           found=""
           for i in $(seq 1 30); do
             docker exec ctl-0 /usr/local/bin/spur show node gpu-3 2>/dev/null \
@@ -394,6 +412,190 @@ jobs:
           [ -n "$found" ] || { echo "gpu-3 did not re-register after force upgrade"; exit 1; }
           echo "gpu-3 re-registered after force upgrade"
           docker exec ctl-0 /usr/local/bin/spur show node gpu-3
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          for n in $NODES; do
+            echo "===== $n journal (spur*) ====="
+            docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -50' || true
+            echo "===== $n docker ps ====="
+            docker exec "$n" docker ps -a 2>/dev/null || true
+          done
+
+      - name: Teardown containers
+        if: always()
+        run: |
+          for n in $NODES; do docker rm -f "$n" || true; done
+          docker network rm spur-ci || true
+
+  # ---------------------------------------------------------------------------
+  # Job 2: spur.conf preservation
+  # ---------------------------------------------------------------------------
+  integration-conf:
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      NODES: "ctl-0 gpu-1 gpu-2 gpu-3"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download + verify Spur binaries (deploy = release, upgrade = nightly)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_TAG: ""
+          UPGRADE_TAG: ""
+        run: |
+          set -euo pipefail
+
+          fetch() {
+            local tag="$1" dest="$2" d
+            d="dl-$dest"
+            mkdir -p "$d"
+            ( cd "$d"
+              gh release download "$tag" --repo ROCm/spur \
+                --pattern '*-linux-amd64.tar.gz' \
+                --pattern '*-linux-amd64.tar.gz.sha256'
+              tarball=$(ls *-linux-amd64.tar.gz)
+              echo "Verifying checksum of $tarball ($tag)"
+              hash=$(awk '{print $1}' "${tarball}.sha256")
+              echo "${hash}  ${tarball}" | sha256sum -c -
+              tar xzf "$tarball"
+              bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
+              test -n "$bindir" || { echo "spurctld not found in $tarball"; exit 1; }
+              mkdir -p "$GITHUB_WORKSPACE/$dest"
+              for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/$dest/$b"; done
+              chmod +x "$GITHUB_WORKSPACE/$dest"/*
+            )
+          }
+
+          deploy_tag="${DEPLOY_TAG:-}"
+          if [ -z "$deploy_tag" ]; then
+            deploy_tag=$(gh api repos/ROCm/spur/releases --jq \
+              'map(select(.tag_name != "nightly"))[0].tag_name')
+          fi
+          upgrade_tag="${UPGRADE_TAG:-nightly}"
+
+          fetch "$deploy_tag"  spur-bin
+          fetch "$upgrade_tag" spur-bin-new
+
+      - name: Start systemd containers on a docker network
+        env:
+          IMG: jrei/systemd-ubuntu:22.04
+        run: |
+          set -euo pipefail
+          docker network create spur-ci
+          docker pull "$IMG"
+          for n in $NODES; do
+            docker run -d --name "$n" --hostname "$n" \
+              --network spur-ci \
+              --privileged \
+              --cgroupns=host \
+              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+              "$IMG"
+          done
+
+      - name: Wait for systemd to be ready in every container
+        run: |
+          set -uo pipefail
+          for n in $NODES; do
+            ok=""
+            for i in $(seq 1 30); do
+              st=$(docker exec "$n" systemctl is-system-running 2>/dev/null || true)
+              case "$st" in running|degraded) ok=1; break ;; esac
+              sleep 2
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::systemd never became ready in $n (last: ${st:-none})"
+              exit 1
+            fi
+            echo "$n: systemd ready ($st)"
+          done
+
+      - name: Install in-container preflight deps (curl/tar/iproute2/python3/sudo)
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
+          done
+
+      - name: Install ansible + docker connection plugin
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ansible-core
+          ansible-galaxy collection install community.docker
+
+      - name: deploy.yml (1 ctl + 3 agents)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur
+
+      - name: Assert all three agents registered
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            missing=""
+            for a in gpu-1 gpu-2 gpu-3; do
+              docker exec ctl-0 /usr/local/bin/spur show node "$a" 2>/dev/null \
+                | grep -qx "NodeName=$a" || missing="$missing $a"
+            done
+            [ -z "$missing" ] && { echo "all three agents registered"; break; }
+            sleep 2
+          done
+          [ -z "$missing" ] || { echo "agents still missing:$missing"; exit 1; }
+
+      # --- spur.conf preservation test ------------------------------------
+      - name: Stamp a sentinel line into spur.conf to detect overwrites
+        run: |
+          docker exec ctl-0 bash -c 'echo "# CI-SENTINEL" >> /opt/spur/etc/spur.conf'
+          docker exec ctl-0 grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
+            || { echo "sentinel not written"; exit 1; }
+          echo "sentinel written to spur.conf"
+
+      - name: rolling_upgrade.yml (default — spur.conf must be preserved)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_ignore_unreachable_agents=true \
+            -e spur_skip_busy_agents=true \
+            -e spur_drain_wait_secs=10
+
+      - name: Assert spur.conf was NOT overwritten (sentinel must still be present)
+        run: |
+          docker exec ctl-0 grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
+            && echo "PASS: spur.conf preserved (sentinel intact)" \
+            || { echo "FAIL: spur.conf was overwritten — sentinel gone"; exit 1; }
+
+      - name: rolling_upgrade.yml --overwrite-conf (spur.conf must be re-rendered)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_ignore_unreachable_agents=true \
+            -e spur_skip_busy_agents=true \
+            -e spur_drain_wait_secs=10 \
+            -e spur_overwrite_conf=true
+
+      - name: Assert spur.conf WAS overwritten (sentinel must be gone)
+        run: |
+          docker exec ctl-0 grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
+            && { echo "FAIL: spur.conf was not overwritten — sentinel still present"; exit 1; } \
+            || echo "PASS: spur.conf re-rendered (sentinel gone)"
 
       # TODO(next): add_nodes.yml / remove_nodes.yml / manage_accounts.yml
       # TODO(next): healthcheck.yml (assert green) and teardown.yml

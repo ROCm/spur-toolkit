@@ -25,6 +25,10 @@
 # drained:
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_skip_busy_agents=true
 #
+# Re-render spur.conf from the Ansible template (default: preserve existing config).
+# Only needed when inventory vars have changed (e.g. new cluster name, ports, nodes):
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_overwrite_conf=true
+#
 # Force-upgrade ALL nodes even if jobs are still running — running jobs WILL be
 # killed (marked NODE_FAIL by the controller the moment spurd restarts). Only
 # use when job disruption is acceptable (e.g. a maintenance window where you
@@ -91,6 +95,11 @@
       vars:
         spur_force_reinstall: true
     - role: spur_controller
+      vars:
+        # rolling_upgrade preserves the existing spur.conf by default — the cluster
+        # is live and its config is known-good. Pass -e spur_overwrite_conf=true to
+        # re-render it from the Ansible template (e.g. after changing inventory vars).
+        spur_controller_skip_conf: "{{ not (spur_overwrite_conf | default(false) | bool) }}"
 
 - name: Rolling upgrade — agents, drained and upgraded in batches
   hosts: spur_agents
@@ -201,22 +210,97 @@
           then proceeding with upgrade.
       when: spur_node_busy and (spur_force_upgrade_busy_agents | default(false) | bool)
 
-    # Kill actual job processes before spurd restarts so they don't linger as
-    # orphans. SIGTERM first (gives the job a chance to flush/checkpoint), then
-    # SIGKILL after 2s for anything that didn't exit. Both are best-effort
-    # (|| true) — if the cgroup is already empty or the job finished naturally
-    # during the drain wait, that is fine.
-    - name: Kill job processes in spur cgroups before upgrade
+    # Kill all workloads started by spur jobs before spurd restarts, so nothing
+    # lingers as an orphan consuming CPU/GPU/memory.
+    #
+    # Three layers, in order:
+    #
+    # 1. Container runtimes — if a job launched containers (Docker, containerd/nerdctl,
+    #    Podman, or any OCI runtime) those containers live under their own cgroup
+    #    subtree and are invisible to a plain cgroup.procs kill. Detect containers
+    #    whose cgroup ancestry includes a spur job cgroup and stop them via the
+    #    runtime's own CLI first, which cleanly tears down the network namespace,
+    #    volume mounts, and GPU device contexts before the kernel sees SIGKILL.
+    #
+    # 2. SIGTERM to surviving bare PIDs — catches any non-containerised processes
+    #    still in spur cgroups (MPI ranks, Python scripts, bare GPU processes, etc.)
+    #    and gives them 5s to flush/checkpoint.
+    #
+    # 3. SIGKILL to anything still alive after the grace period.
+    #
+    # All steps are best-effort (|| true / 2>/dev/null) — an already-empty cgroup
+    # (job finished during the drain wait) is silently skipped.
+    - name: Kill job processes and containers in spur cgroups before upgrade
       ansible.builtin.shell: |
-        pids=$(find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null \
-               | xargs cat 2>/dev/null | sort -u)
-        [ -z "$pids" ] && exit 0
-        echo "$pids" | xargs kill -TERM 2>/dev/null || true
-        sleep 2
-        pids=$(find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null \
-               | xargs cat 2>/dev/null | sort -u)
-        [ -z "$pids" ] && exit 0
-        echo "$pids" | xargs kill -KILL 2>/dev/null || true
+        set -uo pipefail
+
+        # ── helper: collect all PIDs currently in spur job cgroups ──────────
+        spur_pids() {
+          find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null \
+            | xargs cat 2>/dev/null | sort -u
+        }
+
+        pids=$(spur_pids)
+        [ -z "$pids" ] && { echo "no spur job processes found, nothing to kill"; exit 0; }
+        echo "spur job PIDs before kill: $pids"
+
+        # ── 1. container runtime kills ───────────────────────────────────────
+        # For each spur job PID, walk /proc/<pid>/cgroup to find any container
+        # scope (docker-<id>.scope, cri-containerd-<id>.scope, libpod-<id>.scope).
+        # Then stop the container via whichever CLI is available.
+        container_ids=""
+        for pid in $pids; do
+          [ -f /proc/$pid/cgroup ] || continue
+          # Extract container IDs from cgroup paths for all known runtimes:
+          #   Docker/nerdctl : docker-<64hex>.scope
+          #   containerd CRI : cri-containerd-<64hex>.scope
+          #   Podman         : libpod-<64hex>.scope  or  machine.slice/.../libpod-...
+          #   generic OCI    : anything ending in -<64hex>.scope under a known scope dir
+          ids=$(grep -oE '(docker|cri-containerd|libpod)-([a-f0-9]{64})\.scope' \
+                  /proc/$pid/cgroup 2>/dev/null \
+                | grep -oE '[a-f0-9]{64}' || true)
+          container_ids="${container_ids} ${ids}"
+        done
+        container_ids=$(echo "$container_ids" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+
+        if [ -n "$container_ids" ]; then
+          echo "found containers to kill: $container_ids"
+          for cid in $container_ids; do
+            short="${cid:0:12}"
+            # Try each runtime CLI in turn; skip silently if not installed.
+            if command -v docker &>/dev/null; then
+              docker kill "$short" 2>/dev/null && echo "docker kill $short: ok" || true
+            fi
+            if command -v nerdctl &>/dev/null; then
+              nerdctl kill "$short" 2>/dev/null && echo "nerdctl kill $short: ok" || true
+            fi
+            if command -v podman &>/dev/null; then
+              podman kill "$short" 2>/dev/null && echo "podman kill $short: ok" || true
+            fi
+            # containerd (crictl) — used by Kubernetes/containerd shim
+            if command -v crictl &>/dev/null; then
+              crictl stop "$short" 2>/dev/null && echo "crictl stop $short: ok" || true
+            fi
+          done
+          sleep 2
+        fi
+
+        # ── 2. SIGTERM to surviving bare PIDs ────────────────────────────────
+        pids=$(spur_pids)
+        if [ -n "$pids" ]; then
+          echo "sending SIGTERM to bare PIDs: $pids"
+          echo "$pids" | xargs kill -TERM 2>/dev/null || true
+          sleep 5
+        fi
+
+        # ── 3. SIGKILL to anything still alive ───────────────────────────────
+        pids=$(spur_pids)
+        if [ -n "$pids" ]; then
+          echo "sending SIGKILL to surviving PIDs: $pids"
+          echo "$pids" | xargs kill -KILL 2>/dev/null || true
+        fi
+
+        echo "kill sequence complete"
       args:
         executable: /bin/bash
       when: spur_node_busy and (spur_force_upgrade_busy_agents | default(false) | bool)
