@@ -395,6 +395,57 @@ jobs:
           echo "gpu-3 re-registered after force upgrade"
           docker exec ctl-0 /usr/local/bin/spur show node gpu-3
 
+      # --- spur.conf preservation test -----------------------------------
+      # Verify that rolling_upgrade.yml does NOT overwrite spur.conf by default,
+      # and DOES overwrite it when -e spur_overwrite_conf=true is passed.
+      - name: Stamp a sentinel line into spur.conf to detect overwrites
+        run: |
+          # Append a comment that the template would never produce.
+          docker exec ctl-0 bash -c \
+            'echo "# CI-SENTINEL" >> /opt/spur/etc/spur.conf'
+          docker exec ctl-0 grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
+            || { echo "sentinel not written"; exit 1; }
+          echo "sentinel written to spur.conf"
+
+      - name: rolling_upgrade.yml (default — spur.conf must be preserved)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_ignore_unreachable_agents=true \
+            -e spur_skip_busy_agents=true \
+            -e spur_drain_wait_secs=10
+
+      - name: Assert spur.conf was NOT overwritten (sentinel must still be present)
+        run: |
+          docker exec ctl-0 grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
+            && echo "PASS: spur.conf preserved (sentinel intact)" \
+            || { echo "FAIL: spur.conf was overwritten — sentinel gone"; exit 1; }
+
+      - name: rolling_upgrade.yml --overwrite-conf (spur.conf must be re-rendered)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_ignore_unreachable_agents=true \
+            -e spur_skip_busy_agents=true \
+            -e spur_drain_wait_secs=10 \
+            -e spur_overwrite_conf=true
+
+      - name: Assert spur.conf WAS overwritten (sentinel must be gone)
+        run: |
+          docker exec ctl-0 grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
+            && { echo "FAIL: spur.conf was not overwritten — sentinel still present"; exit 1; } \
+            || echo "PASS: spur.conf re-rendered (sentinel gone)"
+
       # TODO(next): add_nodes.yml / remove_nodes.yml / manage_accounts.yml
       # TODO(next): healthcheck.yml (assert green) and teardown.yml
 
