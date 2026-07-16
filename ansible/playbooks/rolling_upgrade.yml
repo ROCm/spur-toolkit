@@ -197,8 +197,28 @@
       ansible.builtin.debug:
         msg: >-
           WARNING: {{ spur_node_name }} still has a running job.
-          spur_force_upgrade_busy_agents=true — proceeding with upgrade.
-          The running job will be marked NODE_FAIL when spurd restarts.
+          spur_force_upgrade_busy_agents=true — killing job processes now,
+          then proceeding with upgrade.
+      when: spur_node_busy and (spur_force_upgrade_busy_agents | default(false) | bool)
+
+    # Kill actual job processes before spurd restarts so they don't linger as
+    # orphans. SIGTERM first (gives the job a chance to flush/checkpoint), then
+    # SIGKILL after 2s for anything that didn't exit. Both are best-effort
+    # (|| true) — if the cgroup is already empty or the job finished naturally
+    # during the drain wait, that is fine.
+    - name: Kill job processes in spur cgroups before upgrade
+      ansible.builtin.shell: |
+        pids=$(find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null \
+               | xargs cat 2>/dev/null | sort -u)
+        [ -z "$pids" ] && exit 0
+        echo "$pids" | xargs kill -TERM 2>/dev/null || true
+        sleep 2
+        pids=$(find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null \
+               | xargs cat 2>/dev/null | sort -u)
+        [ -z "$pids" ] && exit 0
+        echo "$pids" | xargs kill -KILL 2>/dev/null || true
+      args:
+        executable: /bin/bash
       when: spur_node_busy and (spur_force_upgrade_busy_agents | default(false) | bool)
 
   roles:

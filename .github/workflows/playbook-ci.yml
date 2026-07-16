@@ -361,16 +361,30 @@ jobs:
             -e spur_force_upgrade_busy_agents=true \
             -e spur_drain_wait_secs=10
 
-      - name: Assert gpu-3 was upgraded and the forced-killed job is NODE_FAIL
+      - name: Assert gpu-3 was upgraded and the forced-killed job is no longer running
         run: |
           set -euo pipefail
-          # The running job must have been killed when spurd restarted.
+
+          # 1. Scheduler state: job must not still be RUNNING.
           jid=$(docker exec ctl-0 cat /tmp/ci-force-busy.jid)
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
-          echo "force-busy job $jid state after force upgrade: $st"
-          [ "$st" = NODE_FAIL ] || { echo "expected NODE_FAIL, got $st"; exit 1; }
+          echo "force-busy job $jid scheduler state after force upgrade: $st"
+          [ "$st" = RUNNING ] && { echo "job $jid is still RUNNING in scheduler — processes were not killed"; exit 1; }
+          echo "scheduler: job $jid ended with $st (expected NODE_FAIL or CANCELLED)"
 
-          # gpu-3 must have re-registered after the spurd restart.
+          # 2. OS-level check: verify the job processes are actually dead on gpu-3.
+          # The playbook kills all PIDs in /sys/fs/cgroup/spur/*/cgroup.procs, so
+          # the cgroup should be empty (or gone) and the sleep process must not exist.
+          orphan_pids=$(docker exec gpu-3 bash -c \
+            "find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null | xargs cat 2>/dev/null | sort -u" || true)
+          if [ -n "$orphan_pids" ]; then
+            echo "FAIL: orphan PIDs still alive in spur cgroups on gpu-3: $orphan_pids"
+            docker exec gpu-3 ps -p "$orphan_pids" || true
+            exit 1
+          fi
+          echo "OS check: no orphan job processes remain in spur cgroups on gpu-3"
+
+          # 3. gpu-3 must have re-registered after the spurd restart.
           found=""
           for i in $(seq 1 30); do
             docker exec ctl-0 /usr/local/bin/spur show node gpu-3 2>/dev/null \
