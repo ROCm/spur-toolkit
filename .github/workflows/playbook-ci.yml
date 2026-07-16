@@ -339,18 +339,23 @@ jobs:
             echo "force-busy job $jid never reached RUNNING (last: ${st:-none})"; exit 1
           '
 
-      - name: rolling_upgrade.yml --force (gpu-3 only, job will be killed)
+      - name: rolling_upgrade.yml --force (full fleet, gpu-3 will be force-upgraded)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          # Limit to gpu-3 only — gpu-1 is already on the new binary and
-          # gpu-2 is still down; touching them again is noise for this test.
+          # Run against the full fleet — the playbook handles each node's state:
+          #   gpu-1: already on new binary, spur_install is idempotent (no-op)
+          #   gpu-2: still down, skipped via spur_ignore_unreachable_agents=true
+          #   gpu-3: busy with a new job, force-upgraded (job will be NODE_FAIL)
+          # We cannot use -l gpu-3 here because the fact-gather play must reach
+          # ctl-0 to populate hostvars for the spur_agent role's controller-IP
+          # resolution (hostvars['ctl-0']['ansible_default_ipv4']).
           ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
-            -l gpu-3 \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
+            -e spur_ignore_unreachable_agents=true \
             -e spur_force_upgrade_busy_agents=true \
             -e spur_drain_wait_secs=10
 
