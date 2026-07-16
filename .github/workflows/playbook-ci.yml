@@ -26,6 +26,8 @@ name: playbook-ci
 on:
   workflow_dispatch: {}
   push:
+    branches:
+      - main
     paths:
       - 'ansible/**'
       - '.github/workflows/playbook-ci.yml'
