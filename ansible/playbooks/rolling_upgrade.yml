@@ -24,6 +24,12 @@
 # binary. A skipped busy node is resumed on its current binary, not left
 # drained:
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_skip_busy_agents=true
+#
+# Force-upgrade ALL nodes even if jobs are still running — running jobs WILL be
+# killed (marked NODE_FAIL by the controller the moment spurd restarts). Only
+# use when job disruption is acceptable (e.g. a maintenance window where you
+# know no production work is running, or when jobs are short/re-runnable):
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_force_upgrade_busy_agents=true
 
 - name: Guard rails — refuse to start against a wipe-flagged or unhealthy cluster
   hosts: spur_controllers[0]
@@ -165,15 +171,20 @@
       ansible.builtin.set_fact:
         spur_node_busy: "{{ (spur_drain_wait.rc | default(0) != 0) and not (spur_agent_ping.unreachable | default(false)) }}"
 
-    - name: Refuse to upgrade a busy node unless spur_skip_busy_agents=true
+    - name: Refuse to upgrade a busy node unless spur_skip_busy_agents=true or spur_force_upgrade_busy_agents=true
       ansible.builtin.fail:
         msg: >-
           {{ spur_node_name }} still has a running job and did not drain
           within {{ spur_drain_wait_secs | default(120) }}s. Rolling upgrade
-          never force-kills running work. Re-run with
+          never force-kills running work by default. Re-run with
           -e spur_skip_busy_agents=true to leave busy nodes on their current
-          binary and continue upgrading the rest of the fleet.
-      when: spur_node_busy and not (spur_skip_busy_agents | default(false) | bool)
+          binary and continue upgrading the rest of the fleet, or with
+          -e spur_force_upgrade_busy_agents=true to upgrade immediately and
+          accept that running jobs will be marked NODE_FAIL.
+      when: >-
+        spur_node_busy and
+        not (spur_skip_busy_agents | default(false) | bool) and
+        not (spur_force_upgrade_busy_agents | default(false) | bool)
 
     - name: Note busy node is being left on its current binary
       ansible.builtin.debug:
@@ -182,19 +193,33 @@
           (spur_skip_busy_agents=true) and resuming it as-is.
       when: spur_node_busy and (spur_skip_busy_agents | default(false) | bool)
 
+    - name: Warn that running jobs WILL be killed (spur_force_upgrade_busy_agents=true)
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ spur_node_name }} still has a running job.
+          spur_force_upgrade_busy_agents=true — proceeding with upgrade.
+          The running job will be marked NODE_FAIL when spurd restarts.
+      when: spur_node_busy and (spur_force_upgrade_busy_agents | default(false) | bool)
+
   roles:
     # Skipped for a busy node (spur_node_busy=true, opted in via
     # spur_skip_busy_agents) — overwriting a running agent's binaries out from
     # under its own job is unsafe regardless of how the drain wait turned out.
+    # When spur_force_upgrade_busy_agents=true the operator has explicitly
+    # accepted that running jobs will be killed, so we proceed regardless.
     # Still attempted for an unreachable node; every task inside will itself
     # fail (ignored, not counted, via the play's ignore_unreachable) since
     # there's no connection to reach it.
     - role: spur_install
       vars:
         spur_force_reinstall: true
-      when: not (spur_node_busy | default(false))
+      when: >-
+        not (spur_node_busy | default(false)) or
+        (spur_force_upgrade_busy_agents | default(false) | bool)
     - role: spur_agent
-      when: not (spur_node_busy | default(false))
+      when: >-
+        not (spur_node_busy | default(false)) or
+        (spur_force_upgrade_busy_agents | default(false) | bool)
 
   post_tasks:
     - name: Wait for the node to re-register after the upgrade
@@ -210,8 +235,12 @@
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       changed_when: false
       # A skipped busy node was never touched (roles above didn't run for it),
-      # so spurd never restarted — there's nothing to wait for.
-      when: not (spur_agent_ping.unreachable | default(false)) and not (spur_node_busy | default(false))
+      # so spurd never restarted — there's nothing to wait for. A force-upgraded
+      # busy node DID have spurd restarted, so we do wait for re-registration.
+      when: >-
+        not (spur_agent_ping.unreachable | default(false)) and
+        (not (spur_node_busy | default(false)) or
+         (spur_force_upgrade_busy_agents | default(false) | bool))
 
     # A drained node stays drained after spurd restarts — draining is server-side
     # state, not tied to the agent process. Without this, upgraded capacity sits

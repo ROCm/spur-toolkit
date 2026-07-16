@@ -3,12 +3,16 @@
 #
 # On a single GitHub-hosted runner, brings up a lean 4-node cluster of
 # systemd-enabled Docker containers, downloads pre-built Spur binaries from
-# ROCm/spur, and exercises deploy.yml + a single rolling_upgrade.yml pass that
-# covers all three agent states an operator can hit in one run:
+# ROCm/spur, and exercises deploy.yml + two rolling_upgrade.yml passes:
+#
+# Pass 1 — resilience (all three agent states in one run):
 #   - gpu-1 : normal            -> upgraded, still schedules work afterward
 #   - gpu-2 : unreachable (down)-> skipped via spur_ignore_unreachable_agents
 #   - gpu-3 : busy (job running)-> skipped via spur_skip_busy_agents, resumed
 #             on its current binary, running job left undisturbed
+#
+# Pass 2 — force upgrade (spur_force_upgrade_busy_agents=true):
+#   - gpu-3 : busy (new job)    -> upgraded immediately, job killed (NODE_FAIL)
 #
 # Full HA/accounting/login-node coverage lives in deploy.yml's own path — this
 # job is scoped to rolling-upgrade resilience, not general deploy coverage, to
@@ -21,10 +25,10 @@ name: playbook-ci
 
 on:
   workflow_dispatch: {}
-  # TEMP: branch-scoped push for fork iteration. Remove before merge.
   push:
-    branches:
-      - ci/login-node-and-resilience
+    paths:
+      - 'ansible/**'
+      - '.github/workflows/playbook-ci.yml'
   pull_request:
     paths:
       - 'ansible/**'
@@ -303,7 +307,72 @@ jobs:
           echo "busy job $jid state after rolling upgrade: $st"
           [ "$st" = RUNNING ] || { echo "busy job $jid was disturbed by the upgrade (state: $st)"; exit 1; }
           docker exec ctl-0 /usr/local/bin/spur show node gpu-3
+
+      # --- Force-upgrade pass: gpu-3 still on old binary, job still running --
+      # Pin a fresh busy job on gpu-3 (the scancel above hasn't run yet), then
+      # run rolling_upgrade with spur_force_upgrade_busy_agents=true targeting
+      # only gpu-3 and assert: (a) job was killed (NODE_FAIL), (b) node was
+      # upgraded to the new binary and re-registered.
+      - name: Submit a second busy job on gpu-3 for the force-upgrade test
+        run: |
+          set -euo pipefail
+          # Cancel the original busy job first so gpu-3 is Idle, then submit
+          # a fresh one. This ensures the force-upgrade test has a clean job ID.
+          jid=$(docker exec ctl-0 cat /tmp/ci-busy.jid)
           docker exec ctl-0 /usr/local/bin/spur scancel "$jid" || true
+          # Wait for gpu-3 to go Idle before submitting the new busy job.
+          for i in $(seq 1 30); do
+            st=$(docker exec ctl-0 /usr/local/bin/spur show node gpu-3 2>/dev/null | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
+            [ "$st" = IDLE ] && break
+            sleep 2
+          done
+          docker exec ctl-0 bash -lc '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=force-busy\nsleep 600\n" > /tmp/ci-force-busy.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-busy.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-force-busy.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "force-busy job $jid RUNNING on gpu-3"; exit 0; }
+              sleep 1
+            done
+            echo "force-busy job $jid never reached RUNNING (last: ${st:-none})"; exit 1
+          '
+
+      - name: rolling_upgrade.yml --force (gpu-3 only, job will be killed)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          # Limit to gpu-3 only — gpu-1 is already on the new binary and
+          # gpu-2 is still down; touching them again is noise for this test.
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -l gpu-3 \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_force_upgrade_busy_agents=true \
+            -e spur_drain_wait_secs=10
+
+      - name: Assert gpu-3 was upgraded and the forced-killed job is NODE_FAIL
+        run: |
+          set -euo pipefail
+          # The running job must have been killed when spurd restarted.
+          jid=$(docker exec ctl-0 cat /tmp/ci-force-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
+          echo "force-busy job $jid state after force upgrade: $st"
+          [ "$st" = NODE_FAIL ] || { echo "expected NODE_FAIL, got $st"; exit 1; }
+
+          # gpu-3 must have re-registered after the spurd restart.
+          found=""
+          for i in $(seq 1 30); do
+            docker exec ctl-0 /usr/local/bin/spur show node gpu-3 2>/dev/null \
+              | grep -qx "NodeName=gpu-3" && { found=1; break; }
+            sleep 2
+          done
+          [ -n "$found" ] || { echo "gpu-3 did not re-register after force upgrade"; exit 1; }
+          echo "gpu-3 re-registered after force upgrade"
+          docker exec ctl-0 /usr/local/bin/spur show node gpu-3
 
       # TODO(next): add_nodes.yml / remove_nodes.yml / manage_accounts.yml
       # TODO(next): healthcheck.yml (assert green) and teardown.yml
