@@ -184,6 +184,8 @@
       - "CREATE ROLE {{ spur_accounting_db_user }} LOGIN PASSWORD '{{ spur_accounting_db_password | replace(\"'\", \"''\") }}'"
   become: true
   become_user: postgres
+  # The password is in the argv, which Ansible echoes on -v runs and on failure.
+  no_log: true
   when:
     - spur_accounting_enabled | bool
     - spur_db_role_check.stdout | trim != "1"
