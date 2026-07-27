@@ -109,7 +109,7 @@
     spur_controller_pg_addrs: >-
       {{ (spur_controller_pg_addrs | default([])) +
          [ hostvars[item].spur_wg_address if spur_transport == 'wireguard'
-           else (hostvars[item].ansible_host | default(hostvars[item].ansible_default_ipv4.address)) ] }}
+           else (hostvars[item].ansible_default_ipv4.address | default(hostvars[item].ansible_host)) ] }}
   loop: "{{ groups['spur_controllers'] }}"
   when: spur_accounting_enabled | bool
 
