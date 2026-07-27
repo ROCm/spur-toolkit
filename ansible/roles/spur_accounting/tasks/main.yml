@@ -11,6 +11,11 @@
 # co-located daemon, every controller — not just spur_accounting_host — needs a
 # network path to this database, so Postgres is configured to accept remote
 # TCP connections from every controller (scoped by IP, not opened globally).
+#
+# Ordering matters: the server is fully configured (port, listen address, pg_hba)
+# and restarted onto its final port BEFORE any role/database is created, because
+# the psql tasks connect on spur_accounting_db_port and would otherwise race the
+# still-default cluster.
 
 # --- Migration cleanup: this host is where a pre-merge deployment would have
 # --- run the standalone spurdbd daemon. Unconditional (not gated on
@@ -55,64 +60,10 @@
     state: started
   when: spur_accounting_enabled | bool
 
-# The community.postgresql collection is not guaranteed to be installed on the
-# control node, so create the role/database with psql via `become_user: postgres`.
-# Both operations are made idempotent by checking for existence first.
-- name: Check whether the spur DB role exists
-  ansible.builtin.command: >-
-    psql -tAc "SELECT 1 FROM pg_roles WHERE rolname = '{{ spur_accounting_db_user }}'"
-  become: true
-  become_user: postgres
-  register: spur_db_role_check
-  changed_when: false
-  when: spur_accounting_enabled | bool
-
-- name: Create the spur DB role
-  ansible.builtin.command: >-
-    psql -c "CREATE ROLE {{ spur_accounting_db_user }} LOGIN PASSWORD '{{ spur_accounting_db_password }}'"
-  become: true
-  become_user: postgres
-  when:
-    - spur_accounting_enabled | bool
-    - spur_db_role_check.stdout | trim != "1"
-
-- name: Check whether the spur database exists
-  ansible.builtin.command: >-
-    psql -tAc "SELECT 1 FROM pg_database WHERE datname = '{{ spur_accounting_db_name }}'"
-  become: true
-  become_user: postgres
-  register: spur_db_check
-  changed_when: false
-  when: spur_accounting_enabled | bool
-
-- name: Create the spur database owned by the spur role
-  ansible.builtin.command: >-
-    psql -c "CREATE DATABASE {{ spur_accounting_db_name }} OWNER {{ spur_accounting_db_user }}"
-  become: true
-  become_user: postgres
-  when:
-    - spur_accounting_enabled | bool
-    - spur_db_check.stdout | trim != "1"
-
-# --- Remote access: every controller's embedded accounting service connects
-# --- directly to this Postgres, so it must accept TCP from each of them.
-# pg_hba.conf's address field is a literal IP/CIDR, not a hostname — using
-# ansible_host here would break if it's ever set to a DNS name (a normal thing
-# to do in Ansible) rather than an IP, producing an unparseable pg_hba line and
-# taking Postgres down on the next restart/reload. ansible_default_ipv4.address
-# is also the more *correct* choice regardless: it's the host's actual
-# network-facing IP, which is what Postgres will see as the connection's source
-# address — ansible_host is merely how the control node reaches it for SSH and
-# may differ (a management VLAN, a NAT'd address, etc.).
-- name: Compute each controller's advertised address (for pg_hba, may include this host)
-  ansible.builtin.set_fact:
-    spur_controller_pg_addrs: >-
-      {{ (spur_controller_pg_addrs | default([])) +
-         [ hostvars[item].spur_wg_address if spur_transport == 'wireguard'
-           else (hostvars[item].ansible_default_ipv4.address | default(hostvars[item].ansible_host)) ] }}
-  loop: "{{ groups['spur_controllers'] }}"
-  when: spur_accounting_enabled | bool
-
+# --- Server configuration. This must run BEFORE the role/database creation
+# --- below: those tasks connect with `psql -p spur_accounting_db_port`, so the
+# --- cluster has to be listening on that port first. Locate the config, pin the
+# --- port + listen address, open pg_hba for every controller, then restart once.
 - name: Locate the PostgreSQL config file
   # /etc/postgresql/<version>/main/postgresql.conf is 3 levels below /etc/postgresql.
   ansible.builtin.shell: "find /etc/postgresql -maxdepth 3 -name postgresql.conf | head -1"
@@ -145,6 +96,37 @@
   register: spur_pg_listen
   when: spur_accounting_enabled | bool
 
+# Without this Postgres keeps listening on its packaged default (5432), so a
+# non-default spur_accounting_db_port would leave wait_for, the psql tasks below,
+# and spur.conf's database_url all pointing at a port nothing is bound to. Pin
+# the cluster's port to the configured value so every consumer agrees.
+- name: Set the PostgreSQL listen port to spur_accounting_db_port
+  ansible.builtin.lineinfile:
+    path: "{{ spur_pg_conf_file }}"
+    regexp: "^#?\\s*port\\s*="
+    line: "port = {{ spur_accounting_db_port }}"
+  register: spur_pg_port
+  when: spur_accounting_enabled | bool
+
+# --- Remote access: every controller's embedded accounting service connects
+# --- directly to this Postgres, so it must accept TCP from each of them.
+# pg_hba.conf's address field is a literal IP/CIDR, not a hostname — using
+# ansible_host here would break if it's ever set to a DNS name (a normal thing
+# to do in Ansible) rather than an IP, producing an unparseable pg_hba line and
+# taking Postgres down on the next restart/reload. ansible_default_ipv4.address
+# is also the more *correct* choice regardless: it's the host's actual
+# network-facing IP, which is what Postgres will see as the connection's source
+# address — ansible_host is merely how the control node reaches it for SSH and
+# may differ (a management VLAN, a NAT'd address, etc.).
+- name: Compute each controller's advertised address (for pg_hba, may include this host)
+  ansible.builtin.set_fact:
+    spur_controller_pg_addrs: >-
+      {{ (spur_controller_pg_addrs | default([])) +
+         [ hostvars[item].spur_wg_address if spur_transport == 'wireguard'
+           else (hostvars[item].ansible_default_ipv4.address | default(hostvars[item].ansible_host)) ] }}
+  loop: "{{ groups['spur_controllers'] }}"
+  when: spur_accounting_enabled | bool
+
 - name: Allow each controller to authenticate to the spur database over the network
   ansible.builtin.lineinfile:
     path: "{{ spur_pg_hba_file }}"
@@ -154,13 +136,15 @@
   register: spur_pg_hba
   when: spur_accounting_enabled | bool
 
-- name: Restart PostgreSQL to apply listen/auth changes
+- name: Restart PostgreSQL to apply port/listen/auth changes
   ansible.builtin.systemd:
     name: postgresql
     state: restarted
   when:
     - spur_accounting_enabled | bool
-    - (spur_pg_listen.changed | default(false)) or (spur_pg_hba.results | default([]) | selectattr('changed') | list | length > 0)
+    - (spur_pg_listen.changed | default(false)) or
+      (spur_pg_port.changed | default(false)) or
+      (spur_pg_hba.results | default([]) | selectattr('changed') | list | length > 0)
 
 - name: Wait for PostgreSQL to accept TCP connections on {{ spur_accounting_db_port }}
   ansible.builtin.wait_for:
@@ -168,3 +152,66 @@
     host: "127.0.0.1"
     timeout: 30
   when: spur_accounting_enabled | bool
+
+# The community.postgresql collection is not guaranteed to be installed on the
+# control node, so create the role/database with psql via `become_user: postgres`.
+# -p spur_accounting_db_port targets the cluster we just configured (the local
+# socket for a non-default port lives at .s.PGSQL.<port>, so a bare psql would
+# miss it). The password is embedded via the argv form (no shell/shlex re-parsing)
+# with SQL single-quotes doubled, so a password containing quotes is safe. Both
+# operations are made idempotent by checking for existence first.
+- name: Check whether the spur DB role exists
+  ansible.builtin.command:
+    argv:
+      - psql
+      - "-p"
+      - "{{ spur_accounting_db_port }}"
+      - "-tAc"
+      - "SELECT 1 FROM pg_roles WHERE rolname = '{{ spur_accounting_db_user }}'"
+  become: true
+  become_user: postgres
+  register: spur_db_role_check
+  changed_when: false
+  when: spur_accounting_enabled | bool
+
+- name: Create the spur DB role
+  ansible.builtin.command:
+    argv:
+      - psql
+      - "-p"
+      - "{{ spur_accounting_db_port }}"
+      - "-c"
+      - "CREATE ROLE {{ spur_accounting_db_user }} LOGIN PASSWORD '{{ spur_accounting_db_password | replace(\"'\", \"''\") }}'"
+  become: true
+  become_user: postgres
+  when:
+    - spur_accounting_enabled | bool
+    - spur_db_role_check.stdout | trim != "1"
+
+- name: Check whether the spur database exists
+  ansible.builtin.command:
+    argv:
+      - psql
+      - "-p"
+      - "{{ spur_accounting_db_port }}"
+      - "-tAc"
+      - "SELECT 1 FROM pg_database WHERE datname = '{{ spur_accounting_db_name }}'"
+  become: true
+  become_user: postgres
+  register: spur_db_check
+  changed_when: false
+  when: spur_accounting_enabled | bool
+
+- name: Create the spur database owned by the spur role
+  ansible.builtin.command:
+    argv:
+      - psql
+      - "-p"
+      - "{{ spur_accounting_db_port }}"
+      - "-c"
+      - "CREATE DATABASE {{ spur_accounting_db_name }} OWNER {{ spur_accounting_db_user }}"
+  become: true
+  become_user: postgres
+  when:
+    - spur_accounting_enabled | bool
+    - spur_db_check.stdout | trim != "1"
