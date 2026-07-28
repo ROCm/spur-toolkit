@@ -1,15 +1,24 @@
 # Spur — Ansible Deployment
 
-Lifecycle playbooks: `deploy.yml` stands up a Spur cluster in every supported shape from inventory; `rolling_upgrade.yml` upgrades an already-running cluster's binaries with no full-cluster outage; `teardown.yml` stops it. Plus day-2 [admin operations](#admin-operations) — `manage_accounts.yml`, `add_nodes.yml`, `remove_nodes.yml`, `healthcheck.yml`. Daemons run as **systemd services**, Slurm-compatible CLI names are symlinked, and optional **PostgreSQL accounting** (embedded in `spurctld`) is on by default.
+Playbooks for the whole cluster lifecycle:
+
+- **`deploy.yml`** — stands up a Spur cluster in any supported shape from your inventory.
+- **`rolling_upgrade.yml`** — upgrades a running cluster's binaries with no full-cluster outage.
+- **`teardown.yml`** — stops the cluster.
+- Day-2 [admin operations](#admin-operations) — `manage_accounts.yml`, `add_nodes.yml`, `remove_nodes.yml`, `healthcheck.yml`.
+
+Daemons run as **systemd services**, Slurm-compatible CLI names are symlinked, and optional **PostgreSQL accounting** (embedded in `spurctld`) is on by default.
 
 ## Quick start
 
-Run from this repo's `ansible/` directory. `spur` (the upstream source) is a separate repo — clone and build it wherever's convenient, then point `spur_binary_src` straight at the build output (no need to copy it anywhere; the role only ever reads the three named files `spur`/`spurctld`/`spurd` out of that directory).
+Run everything from this repo's `ansible/` directory.
+
+`spur` (the upstream source) is a separate repo. Clone and build it wherever's convenient, then point `spur_binary_src` straight at the build output — no need to copy it anywhere.
+
+> The role only ever reads the three named files `spur`/`spurctld`/`spurd` out of that directory.
 
 ```bash
-# 1. Build spur (see Build prerequisites for why — TL;DR: picks up mainline
-#    changes not yet in a tagged release; skip this and see Build prerequisites
-#    if a published release already covers what you need)
+# 1. Build spur (picks up mainline changes not yet in a tagged release; see Build prerequisites)
 git clone https://github.com/ROCm/spur.git && cd spur
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
 sudo apt install -y protobuf-compiler build-essential
@@ -28,16 +37,17 @@ ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=
 # Without PostgreSQL accounting (jobs still run, sacct/fairshare unavailable):
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD" -e spur_accounting_enabled=false
 
-# PostgreSQL on a DEDICATED accounting node (not a controller/agent): put that
-# host in its own [spur_accounting_node] group in the inventory, and name it with
-# -e (a play's hosts: field doesn't reliably read inventory [all:vars]). It runs
-# only Postgres — no spur daemons — and every controller connects to it remotely.
+# PostgreSQL on a DEDICATED accounting node — see note below:
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD" -e spur_accounting_host=acct-0
 ```
 
-By default (no `spur_accounting_host` set) PostgreSQL runs on the **first controller** — fine for most clusters. See [Accounting](#accounting-postgresql-embedded-in-spurctld) for the dedicated-node inventory layout and details.
+> **Dedicated accounting node:** put that host in its own `[spur_accounting_node]` group in the inventory, and name it with `-e` — a play's `hosts:` field doesn't reliably read inventory `[all:vars]`. It runs only Postgres (no spur daemons), and every controller connects to it remotely.
 
-The run ends by submitting a test job — check the `spur nodes` output and job stdout near the end. Real inventories are git-ignored (see `.gitignore`); only `inventory/*.example.ini` templates are tracked.
+A few things to know:
+
+- **Where Postgres runs:** by default (no `spur_accounting_host` set) it runs on the **first controller**, which is fine for most clusters. See [Accounting](#accounting-postgresql-embedded-in-spurctld) for the dedicated-node inventory layout and details.
+- **The run ends with a test job.** Check the `spur nodes` output and job stdout near the end.
+- **Your real inventory is git-ignored** (see `.gitignore`) — only `inventory/*.example.ini` templates are tracked.
 
 | Shape | Inventory pattern | Transport |
 |---|---|---|
@@ -55,13 +65,15 @@ The run ends by submitting a test job — check the `spur nodes` output and job 
 
 ## Build prerequisites
 
-ROCm/spur now publishes releases — check **https://github.com/ROCm/spur/releases** for the latest tag. If one already covers what you need, you can skip building entirely: omit `spur_binary_src` and the playbook falls back to upstream `install.sh`, which downloads it for you (`spur_version: latest` by default; set `nightly` for a build off the mainline branch, or a specific `vX.Y.Z`).
+You have two options: use a published release, or build the binaries yourself.
 
-Building locally (the Quick start path above) is still worth it when you need mainline changes not yet in a tagged release, an air-gapped install, or a custom patch — build on a machine matching your targets' architecture/libc (the lab targets are Ubuntu 22.04 x86-64). rustup auto-selects the toolchain version pinned in `rust-toolchain.toml` the first time you run `cargo` in the repo, so there's no manual version matching.
+**Option A — use a published release (no build needed).** ROCm/spur now publishes releases. Check **https://github.com/ROCm/spur/releases** for the latest tag. If a release covers what you need, just omit `spur_binary_src` and the playbook runs upstream `install.sh` to download the binaries for you. By default it installs `spur_version: latest`; set `nightly` for a build off the mainline branch, or pin a specific `vX.Y.Z`.
 
-> Already have Rust from somewhere other than rustup (distro package, asdf, …)? Compare `rustc --version` against `rust-toolchain.toml`'s `channel` — a mismatch can fail the build in ways that don't look version-related.
+**Option B — build locally** (the Quick start path above). Worth it when you need mainline changes not yet in a tagged release, an air-gapped install, or a custom patch. Build on a machine matching your targets' architecture/libc — the lab targets are Ubuntu 22.04 x86-64. You don't need to match the Rust version by hand: the first time you run `cargo` in the repo, rustup auto-selects the toolchain pinned in `rust-toolchain.toml`.
 
-This produces, under `target/release/`:
+> Already have Rust from somewhere other than rustup (distro package, asdf, …)? Compare `rustc --version` against `rust-toolchain.toml`'s `channel`. A mismatch can fail the build in ways that don't look version-related.
+
+A local build produces three binaries under `target/release/`:
 
 | Binary | Role |
 |---|---|
@@ -69,29 +81,35 @@ This produces, under `target/release/`:
 | `spurctld` | controller / scheduler / Raft — also serves accounting in-process on the same gRPC port when `[accounting].database_url` is set |
 | `spurd` | node agent |
 
-> A pre-merge build (before upstream folded `spurdbd` into `spurctld`) also produces a `spurdbd` binary. Harmless if it's sitting in the same directory as the other three — the role only ever reads `spur`/`spurctld`/`spurd` by exact name.
+> A pre-merge build (before upstream folded `spurdbd` into `spurctld`) also produces a `spurdbd` binary. It's harmless sitting alongside the other three — the role only ever reads `spur`/`spurctld`/`spurd` by exact name.
 
 Omit `spur_binary_src` and the playbook falls back to downloading a published release via upstream `install.sh` instead (see [Build prerequisites](#build-prerequisites)).
 
 ## Ansible control node
 
-The control node is wherever you run `ansible-playbook` — your workstation is fine, it doesn't need to join the cluster. WireGuard transport additionally needs the `ansible.utils` collection and `netaddr`:
+The control node is wherever you run `ansible-playbook` — your workstation is fine, and it doesn't need to join the cluster.
+
+WireGuard transport needs two extra dependencies on the control node — the `ansible.utils` collection and `netaddr`:
 
 ```bash
 ansible-galaxy collection install -r requirements.yml
 python3 -m pip install --user netaddr
 ```
 
-Target hosts need: SSH reachable, sudo or root, `systemd`, and (only for the `install.sh` fallback) `curl` + `tar`.
+Target hosts need: SSH reachable, sudo or root, `systemd`, and — only for the `install.sh` fallback — `curl` + `tar`.
 
-- Every play runs with `become: true`, so a non-root `ansible_user` with passwordless sudo (or `ansible_become_password` supplied) works the same as `ansible_user=root`. This is required — `spur_home`/`spur_install_dir` default under `/root`, unwritable by a non-root user without becoming root.
-- Password-based SSH works too: set `ansible_user`/`ansible_password` (via `sshpass`) in `[all:vars]` or per-host. `ansible.cfg` deliberately omits `-o BatchMode=yes` — that flag suppresses SSH's password prompt outright and silently breaks password auth even with `sshpass` supplying the answer.
+- Every play runs with `become: true`, so a non-root `ansible_user` with passwordless sudo (or `ansible_become_password` supplied) works the same as `ansible_user=root`. This is required: `spur_home`/`spur_install_dir` default under `/root`, which a non-root user can't write to without becoming root.
+- Password-based SSH works too — set `ansible_user`/`ansible_password` (via `sshpass`) in `[all:vars]` or per-host. `ansible.cfg` deliberately omits `-o BatchMode=yes`. That flag suppresses SSH's password prompt outright and silently breaks password auth even when `sshpass` is supplying the answer.
 
 ---
 
 ## Example commands per scenario
 
-Base pattern: `ansible-playbook playbooks/deploy.yml -i <inventory> -e spur_binary_src=<path> [extra flags]`.
+Every deploy uses the same base command; pick the inventory that matches your setup and add any extra flags from the table below.
+
+```
+ansible-playbook playbooks/deploy.yml -i <inventory> -e spur_binary_src=<path> [extra flags]
+```
 
 | Scenario | Inventory | Extra flags |
 |---|---|---|
@@ -108,6 +126,8 @@ Base pattern: `ansible-playbook playbooks/deploy.yml -i <inventory> -e spur_bina
 ---
 
 ## Inventory examples
+
+Pick the example that matches your cluster shape and copy it into your inventory file.
 
 ### Single-node
 
@@ -150,7 +170,7 @@ spur_wg_cidr=10.44.0.0/16
 spur_wg_port=51820
 ```
 
-> WireGuard is **single-controller only** — `spur net init` auto-assigns the controller `.1` and there's no multi-controller mesh command, so HA needs `direct` instead. Agents auto-assign `.2`, `.3`, … by inventory position; override any host with `spur_wg_address=…`. Requires the `ansible.utils` collection on the control node.
+> WireGuard is **single-controller only**, so use `direct` for HA. `spur net init` auto-assigns the controller `.1`, and there's no multi-controller mesh command. Agents auto-assign `.2`, `.3`, … by inventory position; override any host with `spur_wg_address=…`. This needs the `ansible.utils` collection on the control node.
 
 ### HA — multi-controller Raft (hyperconverged)
 
@@ -180,14 +200,14 @@ gpu-2 ansible_host=10.0.0.22 ansible_user=root
 ```
 
 **In HA mode, the playbook:**
-- Writes the same `peers = [...]` list to every controller's `spur.conf` (order matters — don't reorder controllers between deploys without wiping state).
+- Writes the same `peers = [...]` list to every controller's `spur.conf`. Order matters — don't reorder controllers between deploys without wiping state.
 - Assigns `node_id` = the controller's 1-based position in `groups['spur_controllers']`.
 - Waits for a leader to be elected before proceeding to agent registration.
 - Lets non-leader controllers forward client RPCs to the leader internally, so clients can talk to any controller.
 
-**Always use an odd `N` ≥ 3 in production** — even `N` gives the same fault tolerance as `N-1` and is strictly worse; `N=2` has zero fault tolerance (code-path testing only).
+**Always use an odd `N` ≥ 3 in production.** An even `N` gives the same fault tolerance as `N-1` and is strictly worse, and `N=2` has zero fault tolerance (code-path testing only).
 
-**Client-side failover is automatic.** `spurd --controller` and the CLI's `SPUR_CONTROLLER_ADDR` both accept a comma-separated endpoint list and rotate past a dead one, so the playbook points every agent — and each controller's own `/etc/environment` — at *every* controller, not just the first. A single surviving controller is enough; server-side leader forwarding handles writes from any endpoint in the list. No VIP/DNS round-robin needed for basic failover.
+**Client-side failover is automatic.** Both `spurd --controller` and the CLI's `SPUR_CONTROLLER_ADDR` accept a comma-separated endpoint list and rotate past a dead one. The playbook therefore points every agent — and each controller's own `/etc/environment` — at *every* controller, not just the first. A single surviving controller is enough, since server-side leader forwarding handles writes from any endpoint in the list. No VIP/DNS round-robin is needed for basic failover.
 
 A full HA inventory template lives at `inventory/hosts.ha.example.ini`.
 
@@ -195,7 +215,7 @@ A full HA inventory template lives at `inventory/hosts.ha.example.ini`.
 
 ## Login (submission) nodes
 
-**Optional, off by default.** A login node is a host users SSH into to submit and query jobs — it runs the `spur` CLI but **no daemon** (no `spurctld`, no `spurd`). Enable it purely by adding a `[spur_login]` group to your inventory; omit the group and nothing happens.
+**Optional, off by default.** A login node is a host your users SSH into to submit and query jobs. It runs the `spur` CLI but **no daemon** — no `spurctld`, no `spurd`. To set one up, just add a `[spur_login]` group to your inventory. Leave the group out and nothing happens.
 
 ```ini
 [spur_controllers]
@@ -209,22 +229,31 @@ gpu-2 ansible_host=10.0.0.12 ansible_user=root
 login1 ansible_host=10.0.0.20 ansible_user=root   ; users SSH here to run sbatch/squeue/sacct/srun
 ```
 
-On each login node the playbook installs the `spur` CLI + all 18 Slurm symlinks and writes `SPUR_CONTROLLER_ADDR` (every controller, comma-joined) to `/etc/environment` — nothing else. Users can then SSH in and run `sbatch`/`squeue`/`sacct`/`srun`/etc. with no per-command flags. A host already in `[spur_controllers]` or `[spur_agents]` doesn't need to be listed here (it's already a client); `[spur_login]` is for **dedicated** submission hosts.
+On each login node the playbook does three things: installs the `spur` CLI, adds all 18 Slurm symlinks, and writes `SPUR_CONTROLLER_ADDR` (every controller, comma-joined) to `/etc/environment`. Nothing else. Users can then SSH in and run `sbatch`/`squeue`/`sacct`/`srun`/etc. with no per-command flags.
 
-**Networking:** a login node needs outbound access to the controllers on `6817` (all CLI + accounting) and, for interactive `srun` live output, to the agents on `6818` (`srun` streams job output directly from the agent). Batch `sbatch` needs only the controller. Under `spur_transport=wireguard`, login nodes are automatically joined to the mesh so this works over the tunnel.
+You only need `[spur_login]` for **dedicated** submission hosts. A host already in `[spur_controllers]` or `[spur_agents]` is already a client, so there's no need to list it here.
+
+**Networking.** A login node needs outbound access to:
+
+- the controllers on `6817` — used for all CLI commands and accounting.
+- the agents on `6818` — used for interactive `srun` live output, which streams job output directly from the agent.
+
+Batch `sbatch` needs only the controller. Under `spur_transport=wireguard`, login nodes are automatically joined to the mesh, so all of this works over the tunnel.
 
 ---
 
 ## Accounting (PostgreSQL, embedded in spurctld)
 
-Enabled by default (`spur_accounting_enabled: true`). There's no separate accounting daemon — upstream folded the standalone `spurdbd` into `spurctld`, which serves the `SlurmAccounting` gRPC service in-process on its own controller port (6817) whenever `[accounting].database_url` is set. Only Postgres itself is a distinct service, running on **`spur_accounting_host`** (default: the first controller). Before the controllers start, the `spur_accounting` role:
+Accounting is on by default (`spur_accounting_enabled: true`), and there's no separate accounting daemon to manage. Upstream folded the old standalone `spurdbd` into `spurctld`, which now serves the `SlurmAccounting` gRPC service in-process on its own controller port (6817) whenever `[accounting].database_url` is set. The only distinct service is Postgres itself, which runs on **`spur_accounting_host`** (default: the first controller).
+
+Before the controllers start, the `spur_accounting` role:
 
 1. Installs `postgresql` + `postgresql-contrib`.
 2. Creates the `spur` role and `spur` database idempotently.
-3. Configures Postgres to accept remote TCP connections (`listen_addresses`, `pg_hba.conf`) from every controller's IP — each controller's embedded accounting service connects to Postgres directly over the network, not just the one that happens to be co-located with it.
-4. Writes every controller's `spur.conf` with an `[accounting]` block pointing `database_url` at that host.
+3. Configures Postgres to accept remote TCP connections from every controller's IP (via `listen_addresses` and `pg_hba.conf`). Each controller's embedded accounting service connects to Postgres over the network — not just the one that happens to be co-located with it.
+4. Writes an `[accounting]` block into every controller's `spur.conf`, pointing `database_url` at that host.
 
-**Dedicated accounting node:** set `spur_accounting_host` to any managed host — controller, agent, or a standalone host in its own group. Put that host in an `[spur_accounting_node]` group (it needs no spur binaries — only Postgres runs there):
+**Dedicated accounting node.** You can set `spur_accounting_host` to any managed host — a controller, an agent, or a standalone host in its own group. For a standalone host, put it in an `[spur_accounting_node]` group. It needs no spur binaries, since only Postgres runs there.
 
 ```ini
 [spur_controllers]
@@ -237,21 +266,27 @@ gpu-1 ansible_host=10.0.0.11 ansible_user=root
 acct-0 ansible_host=10.0.0.20 ansible_user=root   ; Postgres only, no spur daemons
 ```
 
-Then name it via `-e` (a play's `hosts:` field doesn't reliably read inventory `[all:vars]`):
+Then name it via `-e`.
+
+> Pass the host with `-e` rather than inventory `[all:vars]` — a play's `hosts:` field doesn't reliably read `[all:vars]`.
 
 ```bash
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_accounting_host=acct-0
 ```
 
-Every controller connects to it over the network (the role opens `listen_addresses`/`pg_hba.conf` for each controller's IP). If the host's PostgreSQL isn't on the default port, pass `-e spur_accounting_db_port=<port>`.
+Every controller connects to it over the network; the role opens `listen_addresses`/`pg_hba.conf` for each controller's IP. If the host's PostgreSQL isn't on the default port, pass `-e spur_accounting_db_port=<port>`.
 
-The playbook writes `SPUR_CONTROLLER_ADDR` (listing every controller) to `/etc/environment` on **controller nodes**, so the whole CLI — `squeue`/`sinfo`/`scontrol` and `sacct`/`sacctmgr`/`sreport`/`sshare` alike — works there with no per-command flags; accounting rides the same address, there's no separate env for it anymore. On non-controller nodes, or to override: `export SPUR_CONTROLLER_ADDR=http://<a-controller>:6817[,http://<another>:6817,...]`.
+On **controller nodes**, the playbook writes `SPUR_CONTROLLER_ADDR` (listing every controller) to `/etc/environment`. This means the whole CLI works there with no per-command flags — `squeue`/`sinfo`/`scontrol` and `sacct`/`sacctmgr`/`sreport`/`sshare` alike. Accounting rides the same address; there's no separate env var for it anymore. On non-controller nodes, or to override, set it yourself:
 
-Job submission still works without accounting (`-e spur_accounting_enabled=false`, shown in [Quick start](#quick-start)) — only `sacct`/fairshare are unavailable.
+```bash
+export SPUR_CONTROLLER_ADDR=http://<a-controller>:6817[,http://<another>:6817,...]
+```
 
-> Default DB credentials are `spur`/`spur`/`spur` — fine for a lab, **change `spur_accounting_db_password` for anything real.**
+Job submission still works without accounting — pass `-e spur_accounting_enabled=false` (shown in [Quick start](#quick-start)). You'll only lose `sacct` and fairshare.
 
-**Upgrading a pre-merge deployment:** if a cluster is still running the old, separate `spurdbd` (`systemctl is-active spurdbd`, or an `[accounting] host = ...` line in `spur.conf`), just re-run `deploy.yml` pointed at a merged-architecture build. `spur_accounting` stops/disables/removes any leftover `spurdbd` unit and binary, reconfigures Postgres for remote access, and the regenerated `spur.conf` drops the old `host` key — no manual cleanup needed. This is a full-cluster convergence, not a rolling upgrade (see [Upgrading](#upgrading)) — expect a brief restart of every daemon.
+> Default DB credentials are `spur`/`spur`/`spur` — fine for a lab, but **change `spur_accounting_db_password` for anything real.**
+
+**Upgrading a pre-merge deployment.** If a cluster is still running the old, separate `spurdbd` (check with `systemctl is-active spurdbd`, or look for an `[accounting] host = ...` line in `spur.conf`), just re-run `deploy.yml` pointed at a merged-architecture build. `spur_accounting` stops, disables, and removes any leftover `spurdbd` unit and binary, reconfigures Postgres for remote access, and the regenerated `spur.conf` drops the old `host` key — no manual cleanup needed. Note that this is a full-cluster convergence, not a rolling upgrade (see [Upgrading](#upgrading)), so expect a brief restart of every daemon.
 
 ---
 
@@ -259,74 +294,87 @@ Job submission still works without accounting (`-e spur_accounting_enabled=false
 
 | Variable | Default | What it does |
 |---|---|---|
-| `spur_cluster_name` | `spur-cluster` | `cluster_name` in `spur.conf` |
-| `spur_binary_src` | *(unset)* | Local dir of pre-built binaries to push. Unset → use upstream `install.sh`. |
-| `spur_version` | `latest` | Install channel for `install.sh`: `latest` / `nightly` / `vX.Y.Z` |
-| `spur_install_dir` | `/root/.local/bin` | Where binaries + Slurm symlinks land (added to `/etc/environment`) |
-| `spur_home` | `/root/spur` | Per-host state/log/etc root |
-| `spur_transport` | `direct` | `direct` or `wireguard` |
-| `spur_accounting_enabled` | `true` | Deploy PostgreSQL accounting (embedded in spurctld). `false` to skip. |
+| `spur_cluster_name` | `spur-cluster` | Sets `cluster_name` in `spur.conf`. |
+| `spur_binary_src` | *(unset)* | Local dir of pre-built binaries to push. Leave unset to fetch via upstream `install.sh`. |
+| `spur_version` | `latest` | Which `install.sh` channel to pull: `latest` / `nightly` / `vX.Y.Z`. |
+| `spur_install_dir` | `/root/.local/bin` | Where binaries and Slurm symlinks land (added to `/etc/environment`). |
+| `spur_home` | `/root/spur` | Per-host root for state, logs, and config. |
+| `spur_transport` | `direct` | Network transport: `direct` or `wireguard`. |
+| `spur_accounting_enabled` | `true` | Deploy PostgreSQL accounting (embedded in spurctld). Set `false` to skip. |
 | `spur_accounting_host` | first controller | Host that runs Postgres (any managed host). Pass via `-e`. |
-| `spur_accounting_db_name` / `_user` / `_password` | `spur` / `spur` / `spur` | Accounting DB credentials |
-| `spur_accounting_db_port` | `5432` | Postgres listen port |
-| `spur_wg_cidr` / `spur_wg_port` / `spur_wg_interface` | `10.44.0.0/16` / `51820` / `spur0` | WireGuard mesh settings |
-| `spur_controller_port` / `spur_agent_port` / `spur_raft_port` | `6817` / `6818` / `6821` | Listen ports |
-| `spur_log_level` | `info` | Daemon log verbosity |
-| `spur_wipe_state` | `false` | Wipe `~/spur/state` (Raft job queue/registrations) on (re)deploy. Non-destructive default for re-runs/upgrades; `true` for a fresh install or intentional Raft reinit. |
-| `spur_force_reinstall` | `false` | Force `spur_install` to re-pull/re-copy binaries even if already present. Used by `rolling_upgrade.yml`. |
+| `spur_accounting_db_name` / `_user` / `_password` | `spur` / `spur` / `spur` | Accounting DB credentials. |
+| `spur_accounting_db_port` | `5432` | Postgres listen port. |
+| `spur_wg_cidr` / `spur_wg_port` / `spur_wg_interface` | `10.44.0.0/16` / `51820` / `spur0` | WireGuard mesh settings. |
+| `spur_controller_port` / `spur_agent_port` / `spur_raft_port` | `6817` / `6818` / `6821` | Daemon listen ports. |
+| `spur_log_level` | `info` | Daemon log verbosity. |
+| `spur_wipe_state` | `false` | Wipe `~/spur/state` (Raft job queue/registrations) on (re)deploy. Safe default for re-runs and upgrades; set `true` for a fresh install or intentional Raft reinit. |
+| `spur_force_reinstall` | `false` | Re-pull/re-copy binaries via `spur_install` even if already present. Used by `rolling_upgrade.yml`. |
 | `spur_rolling_batch_size` | `1` | Agents upgraded per batch in `rolling_upgrade.yml` (`serial`). Controllers always upgrade one at a time regardless. |
 
-Override per-run with `-e key=value` (repeatable):
+Override any of these per run with `-e key=value` (repeatable):
 
 ```bash
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release -e spur_wipe_state=true
 ```
 
-The day-2 admin playbooks take their own vars (`spur_accounts` / `spur_qos` / `spur_users` for `manage_accounts.yml`, `new_nodes` for `add_nodes.yml`, `nodes_to_remove` for `remove_nodes.yml`) — documented under [Admin operations](#admin-operations) rather than in the table above, since they're per-playbook inputs, not global cluster settings.
+The day-2 admin playbooks take their own inputs — `spur_accounts` / `spur_qos` / `spur_users` for `manage_accounts.yml`, `new_nodes` for `add_nodes.yml`, `nodes_to_remove` for `remove_nodes.yml`. Those are per-playbook inputs rather than global cluster settings, so they live under [Admin operations](#admin-operations) instead of the table above.
 
 ---
 
 ## Upgrading
 
-Two ways to roll out newer binaries, depending on whether the cluster can tolerate a full-daemon bounce.
+Two ways to roll out newer binaries. Pick based on whether the cluster can take a full-daemon bounce or needs to keep running jobs throughout.
+
+| Path | Use when | Downtime |
+|---|---|---|
+| Full convergence (`deploy.yml`) | You're changing the topology, or a short cluster-wide blip is fine | Every daemon restarts at once |
+| Rolling upgrade (`rolling_upgrade.yml`) | The cluster is live with running jobs and must stay up | One host at a time |
 
 ### Full convergence (`deploy.yml`) — simplest, brief outage
 
-Non-destructive by default (`spur_wipe_state=false` preserves job state/registrations), but it restarts **every** daemon on **every** host in the same play — no batching. In-flight jobs are disrupted, and in HA all controllers bounce together (briefly losing a Raft leader). Use this for a topology change (e.g. migrating off `spurdbd`, adding/removing hosts) or when a short full-cluster blip is fine:
+This is the simplest path. It's non-destructive by default: `spur_wipe_state=false` preserves job state and registrations. The catch is that it restarts **every** daemon on **every** host in the same play, with no batching. In-flight jobs are disrupted, and in HA all controllers bounce together and briefly lose the Raft leader.
+
+Reach for it when you're making a topology change — migrating off `spurdbd`, adding or removing hosts — or when a short full-cluster blip is acceptable.
 
 ```bash
 cargo build --release -p spur-cli -p spurctld -p spurd   # rebuild all three together, see caveat below
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release
 ```
 
-- **Binaries roll out by content, not version string** — Ansible compares checksums, so an unchanged re-run is a near no-op.
-- **Rebuild all three together.** They share a Raft WAL schema; mixing binaries from different builds (e.g. only rebuilding `spurctld`) can leave a controller unable to parse a log a differently-versioned peer wrote.
-- **HA topology changes are guarded.** Spur 0.3.0 has no online Raft membership change, so adding/removing/reordering a **controller** needs a reinit — the role fails early with an actionable message if you change the controller set without `-e spur_wipe_state=true`. **Compute agents aren't Raft members** — add/remove freely, no wipe needed.
-- **Demoting a controller to agent-only leaves a stale `spurctld`.** Moving a host out of `[spur_controllers]`? `systemctl disable --now spurctld` on it first, or the leftover daemon keeps the old membership and can block quorum.
+A few things worth knowing:
+
+- **Binaries roll out by content, not version string.** Ansible compares checksums, so an unchanged re-run is a near no-op.
+- **Rebuild all three together.** They share a Raft WAL schema. Mixing binaries from different builds — say, rebuilding only `spurctld` — can leave a controller unable to parse a log a differently-versioned peer wrote.
+- **HA topology changes are guarded.** Adding, removing, or reordering a **controller** needs a reinit. Spur 0.3.0 has no online Raft membership change, so the role fails early with an actionable message if you change the controller set without `-e spur_wipe_state=true`. **Compute agents aren't Raft members** — add or remove them freely, no wipe needed.
+- **Demoting a controller to agent-only leaves a stale `spurctld`.** Moving a host out of `[spur_controllers]`? Run `systemctl disable --now spurctld` on it first. Otherwise the leftover daemon keeps the old membership and can block quorum.
 
 ### Rolling upgrade (`rolling_upgrade.yml`) — for a live cluster with running jobs
 
-Upgrades one host at a time so the cluster keeps scheduling and running jobs throughout:
+This path upgrades one host at a time, so the cluster keeps scheduling and running jobs throughout.
 
 ```bash
 cargo build --release -p spur-cli -p spurctld -p spurd
 ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release
 ```
 
-Reuses the same `spur_install`/`spur_controller`/`spur_agent`/`spur_verify` roles `deploy.yml` uses — no duplicated install/config/health-check logic:
+It reuses the same `spur_install`/`spur_controller`/`spur_agent`/`spur_verify` roles that `deploy.yml` uses, so there's no duplicated install, config, or health-check logic. Here's what it does, in order:
 
-1. **Guard rail** — refuses to start if `spur_wipe_state=true`, if `spur_transport=wireguard` (not yet supported by this playbook), or if the cluster isn't already healthy (leader elected, `spur nodes` reachable).
-2. **Controllers, one at a time** (`serial: 1`, aborts the whole run on first failure) — force-reinstall, restart `spurctld`, reuse the existing HA-aware "wait for Raft leader" task as the health gate before the next controller. Client-side failover (every agent/CLI is pointed at *every* controller) keeps the rest serving while one is down.
-3. **Agents, in configurable batches** (`spur_rolling_batch_size`, default `1`) — `spur node drain <node>`, poll until `DRAINED` (no running jobs left), force-reinstall, restart `spurd`, wait for re-registration, `scontrol update NodeName=<node> State=RESUME`.
-4. **Verify** — submits a real test job at the end to confirm the upgraded cluster actually schedules work.
+1. **Guard rail.** Refuses to start if `spur_wipe_state=true`, if `spur_transport=wireguard` (this playbook doesn't support it yet), or if the cluster isn't already healthy (leader elected, `spur nodes` reachable).
+2. **Controllers, one at a time** (`serial: 1`; the whole run aborts on the first failure). For each: force-reinstall, restart `spurctld`, then wait on the existing HA-aware "wait for Raft leader" task as the health gate before moving to the next controller. Client-side failover keeps the rest serving while one is down, since every agent and CLI is pointed at *every* controller.
+3. **Agents, in configurable batches** (`spur_rolling_batch_size`, default `1`). For each node: `spur node drain <node>`, poll until `DRAINED` (once no running jobs are left), force-reinstall, restart `spurd`, wait for re-registration, then `scontrol update NodeName=<node> State=RESUME`.
+4. **Verify.** Submits a real test job at the end to confirm the upgraded cluster actually schedules work.
 
-Same rebuild-all-three caveat applies. `spur_rolling_batch_size` trades speed for blast radius: `1` (default) disrupts at most one agent's capacity at a time; higher upgrades faster but drains more capacity concurrently. A single-controller cluster has no other controller to fail over to during its own restart, so a rolling upgrade of it is still a short outage — real zero-downtime needs HA (≥ 3 controllers).
+The same rebuild-all-three caveat from full convergence applies here too.
+
+`spur_rolling_batch_size` trades speed for blast radius. The default `1` disrupts at most one agent's capacity at a time; a higher value upgrades faster but drains more capacity concurrently.
+
+> A single-controller cluster has no other controller to fail over to during its own restart, so rolling it is still a short outage. Real zero-downtime needs HA — three or more controllers.
 
 ---
 
 ## Managing the cluster after deploy
 
-Daemons are systemd services — use the normal tools on any host:
+The daemons are ordinary systemd services, so manage them with the usual tools on any host:
 
 ```bash
 systemctl status spurctld          # on a controller (also serves accounting when enabled)
@@ -335,7 +383,7 @@ systemctl status postgresql        # on the accounting host
 journalctl -u spurctld -f          # follow logs
 ```
 
-Basic cluster commands (binaries are on `PATH` via `/etc/environment`):
+The binaries are on your `PATH` (via `/etc/environment`), so the everyday cluster commands just work:
 
 ```bash
 spur nodes        # partition/node summary
@@ -348,11 +396,11 @@ sacct             # accounting (when enabled) — Slurm-compatible symlink to sp
 
 ## Admin operations
 
-Day-2 playbooks for routine cluster administration. All are safe to run against a live cluster.
+These are the day-2 playbooks for routine cluster administration. All of them are safe to run against a live cluster.
 
 ### Manage accounts / users / QoS — `manage_accounts.yml`
 
-Declaratively apply accounting entities. Runtime-only (talks to the controller's embedded accounting via `sacctmgr`) — **no restart, no disruption**, and idempotent (`sacctmgr add` upserts). Define the desired state in a group_vars file or pass with `-e`:
+Declaratively apply accounting entities — QoS, accounts, and users. This is a runtime-only operation: it talks to the controller's embedded accounting through `sacctmgr`, so there's **no restart and no disruption**. It's also idempotent, since `sacctmgr add` upserts. Define the desired state in a group_vars file, or pass it with `-e`:
 
 ```yaml
 # e.g. inventory/group_vars/all.yml (or a dedicated accounts.yml)
@@ -369,56 +417,63 @@ spur_users:
 ansible-playbook playbooks/manage_accounts.yml -i inventory/hosts.ini
 ```
 
-Removals go in `spur_qos_absent` / `spur_accounts_absent` / `spur_users_absent` (name-only; users also take `account`). The playbook applies in FK-safe order automatically — qos/accounts before users on add, users before accounts on remove (an account can't be deleted while a user association still references it). Requires accounting enabled.
+To remove entities, list them under `spur_qos_absent` / `spur_accounts_absent` / `spur_users_absent` (name-only; users also take `account`). The playbook applies everything in FK-safe order automatically: qos/accounts before users when adding, and users before accounts when removing. That ordering matters because an account can't be deleted while a user association still references it. Requires accounting enabled.
 
 ### Add compute nodes — `add_nodes.yml`
 
-Add agent(s) to a **running** cluster with **no disruption to existing daemons or jobs**. A full `deploy.yml` run also adds nodes, but it restarts *every* spurctld and spurd (see [Upgrading](#upgrading)); `add_nodes.yml` only starts `spurd` on the new hosts. It works because a new `spurd` registers itself at runtime — the node appears in `spur nodes` immediately, no controller restart needed.
+Add agent(s) to a **running** cluster with **no disruption to existing daemons or jobs**. A full `deploy.yml` run also adds nodes, but it restarts every spurctld and spurd (see [Upgrading](#upgrading)); `add_nodes.yml` only starts `spurd` on the new hosts. This works because a new `spurd` registers itself at runtime — the node shows up in `spur nodes` immediately, with no controller restart.
 
-First add the host(s) to `[spur_agents]` in your inventory (the source of truth), then:
+First add the host(s) to `[spur_agents]` in your inventory (the source of truth), then run:
 
 ```bash
 ansible-playbook playbooks/add_nodes.yml -i inventory/hosts.ini -e new_nodes=gpu-3,gpu-4
 ```
 
-What it does: gathers facts across the cluster (so the regenerated `spur.conf` has cpu/memory for every node), installs + starts `spurd` on the new hosts only, refreshes `spur.conf` on the controllers **without restarting them**, and verifies each new node registered. Idempotent — a node already registered is skipped (re-runs never bounce a healthy agent). Adding a **controller** is out of scope (that's a Raft membership change) — use `deploy.yml` for that; `add_nodes.yml` refuses controller names.
+What it does: gathers facts across the cluster so the regenerated `spur.conf` has cpu/memory for every node, installs and starts `spurd` on the new hosts only, refreshes `spur.conf` on the controllers **without restarting them**, and verifies that each new node registered. It's idempotent — a node that's already registered is skipped, so re-runs never bounce a healthy agent. Adding a **controller** is out of scope, because that's a Raft membership change; use `deploy.yml` for that. `add_nodes.yml` refuses controller names.
 
 ### Decommission compute nodes — `remove_nodes.yml`
 
-Cleanly remove agents from a running cluster: drain → wait until `DRAINED` (running jobs finish first) → stop `spurd` on the node → `spur node remove`. No state wipe (agents aren't Raft members).
+Cleanly remove agents from a running cluster. The playbook drains each node, waits until it reaches `DRAINED` so running jobs finish first, stops `spurd` on the node, then runs `spur node remove`. There's no state wipe, since agents aren't Raft members.
 
 ```bash
 ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4
 ```
 
-Names are as they appear in `spur nodes`. After it runs, **delete those hosts from `[spur_agents]` in your inventory** or a later `deploy.yml` will re-add them (the playbook prints this reminder).
+Use the names as they appear in `spur nodes`. Afterward, **delete those hosts from `[spur_agents]` in your inventory** — otherwise a later `deploy.yml` will re-add them. The playbook prints this reminder when it finishes.
 
 ### Health check — `healthcheck.yml`
 
-Read-only cluster diagnostics — daemons active, controller reachable + leader elected, accounting/Postgres up, agent ports listening, disk/Raft-state size. Never changes anything; exits non-zero (with a per-host problem list) if anything's wrong, so it's usable as a cron/monitoring probe.
+Read-only cluster diagnostics. It checks that daemons are active, the controller is reachable with a leader elected, accounting/Postgres is up, agent ports are listening, and disk/Raft-state size is healthy. It never changes anything. If something's wrong it exits non-zero with a per-host problem list, which makes it usable as a cron or monitoring probe.
 
 ```bash
 ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini
 ```
 
-> **Partitions** are not yet manageable this way — Spur has no runtime partition CLI (unlike Slurm's `scontrol create/update/delete partition`), so partition changes still mean editing the `[[partitions]]` blocks in the controller role's `spur.conf` template and re-running `deploy.yml` (a brief controller restart). Tracked upstream as a Spur feature request.
+> **Partitions** aren't manageable this way yet. Spur has no runtime partition CLI (unlike Slurm's `scontrol create/update/delete partition`), so partition changes still mean editing the `[[partitions]]` blocks in the controller role's `spur.conf` template and re-running `deploy.yml`, which involves a brief controller restart. This is tracked upstream as a Spur feature request.
 
 ---
 
 ## Tear down
+
+Two flavors — the plain one stops the cluster, the `wipe=true` one also erases per-host state:
 
 ```bash
 ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini              # stop + disable daemons, remove units
 ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e wipe=true  # also rm -rf ~/spur
 ```
 
-Stops/disables the systemd services and reaps stray daemons. Leaves PostgreSQL installed and the accounting database intact — drop it manually on the accounting host if needed: `sudo -u postgres dropdb spur; sudo -u postgres dropuser spur`.
+Either way it stops and disables the systemd services and reaps any stray daemons. It deliberately leaves PostgreSQL installed and your accounting database intact — so if you want those gone too, drop them by hand on the accounting host:
+
+```bash
+sudo -u postgres dropdb spur
+sudo -u postgres dropuser spur
+```
 
 ---
 
 ## Troubleshooting
 
-Things you might see while running or operating a cluster, and what they mean.
+A field guide to things you might see while running or operating a cluster — most of the scary-looking ones are harmless.
 
 | Symptom | What's going on |
 |---|---|
@@ -431,6 +486,6 @@ Things you might see while running or operating a cluster, and what they mean.
 | `spur --version` errors | Not a supported flag — use `spur nodes` / `spur show ...` to confirm the CLI works. |
 | Job IDs restarted at 1 and old `sacct` history looks overwritten | You deployed with `spur_wipe_state=true`, which resets the Raft job-id counter. Use `spur_wipe_state=false` (the default) to preserve history. |
 
-**Ports** the cluster listens on (open these between hosts): `6817` controller API + accounting, `6818` agents, `6821` Raft. `6821` is fixed in Spur 0.3.0.
+**Ports** the cluster listens on — open these between hosts: `6817` controller API + accounting, `6818` agents, `6821` Raft. `6821` is fixed in Spur 0.3.0.
 
-For **why the roles are written the way they are** (implementation rationale, hard-won Ansible/Spur quirks encoded into the tasks), see [`CONTRIBUTING.md`](CONTRIBUTING.md) — that's maintainer reference, not needed to deploy.
+Curious **why the roles are written the way they are**? The implementation rationale, plus the hard-won Ansible/Spur quirks baked into the tasks, lives in [`CONTRIBUTING.md`](CONTRIBUTING.md) — that's maintainer reference, not something you need to deploy.
