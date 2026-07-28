@@ -36,12 +36,9 @@ ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=
 
 # Without PostgreSQL accounting (jobs still run, sacct/fairshare unavailable):
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD" -e spur_accounting_enabled=false
-
-# PostgreSQL on a DEDICATED accounting node — see note below:
-ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD" -e spur_accounting_host=acct-0
 ```
 
-> **Dedicated accounting node:** put that host in its own `[spur_accounting_node]` group in the inventory, and name it with `-e` — a play's `hosts:` field doesn't reliably read inventory `[all:vars]`. It runs only Postgres (no spur daemons), and every controller connects to it remotely.
+> **Dedicated accounting node:** to run PostgreSQL on its own host (not a controller or agent), just add that host to a `[spur_accounting_node]` group in your inventory — the playbook auto-detects it, so the deploy command is unchanged (no `-e` needed). That host runs only Postgres (no spur daemons), and every controller connects to it remotely. See [Accounting](#accounting-postgresql-embedded-in-spurctld) for the inventory layout.
 
 A few things to know:
 
@@ -253,7 +250,7 @@ Before the controllers start, the `spur_accounting` role:
 3. Configures Postgres to accept remote TCP connections from every controller's IP (via `listen_addresses` and `pg_hba.conf`). Each controller's embedded accounting service connects to Postgres over the network — not just the one that happens to be co-located with it.
 4. Writes an `[accounting]` block into every controller's `spur.conf`, pointing `database_url` at that host.
 
-**Dedicated accounting node.** You can set `spur_accounting_host` to any managed host — a controller, an agent, or a standalone host in its own group. For a standalone host, put it in an `[spur_accounting_node]` group. It needs no spur binaries, since only Postgres runs there.
+**Dedicated accounting node.** To run Postgres on its own host — not a controller or agent — add that host to a `[spur_accounting_node]` group in your inventory. That's all it takes: the playbook auto-detects the group and runs Postgres there. The host needs no spur binaries, since only Postgres runs on it.
 
 ```ini
 [spur_controllers]
@@ -266,15 +263,21 @@ gpu-1 ansible_host=10.0.0.11 ansible_user=root
 acct-0 ansible_host=10.0.0.20 ansible_user=root   ; Postgres only, no spur daemons
 ```
 
-Then name it via `-e`.
+Deploy exactly as usual — no accounting-specific flag needed:
 
-> Pass the host with `-e` rather than inventory `[all:vars]` — a play's `hosts:` field doesn't reliably read `[all:vars]`.
+```bash
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini
+```
+
+The accounting host is resolved in this order: an explicit `spur_accounting_host` → the first host in `[spur_accounting_node]` → the first controller (the co-located default). So the group alone is enough to pin a dedicated node.
+
+**Pointing accounting at a specific host instead.** To use an existing host without adding a group — say a particular controller or agent — set `spur_accounting_host` (it takes highest precedence). Pass it with `-e`:
 
 ```bash
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_accounting_host=acct-0
 ```
 
-Every controller connects to it over the network; the role opens `listen_addresses`/`pg_hba.conf` for each controller's IP. If the host's PostgreSQL isn't on the default port, pass `-e spur_accounting_db_port=<port>`.
+Every controller connects to the accounting host over the network; the role opens `listen_addresses`/`pg_hba.conf` for each controller's IP. If the host's PostgreSQL isn't on the default port, pass `-e spur_accounting_db_port=<port>`.
 
 On **controller nodes**, the playbook writes `SPUR_CONTROLLER_ADDR` (listing every controller) to `/etc/environment`. This means the whole CLI works there with no per-command flags — `squeue`/`sinfo`/`scontrol` and `sacct`/`sacctmgr`/`sreport`/`sshare` alike. Accounting rides the same address; there's no separate env var for it anymore. On non-controller nodes, or to override, set it yourself:
 
