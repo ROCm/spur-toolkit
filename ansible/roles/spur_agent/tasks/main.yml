@@ -20,6 +20,81 @@
       {{ (spur_controller_endpoints | default([])) + ["http://" ~ controller_ip ~ ":" ~ spur_controller_port] }}
   loop: "{{ groups['spur_controllers'] }}"
 
+- name: Ensure MPI plugin directory exists
+  ansible.builtin.file:
+    path: "{{ spur_mpi_plugin_dir }}"
+    state: directory
+    mode: "0755"
+  when: spur_mpi_plugin_enabled | default(true) | bool
+
+- name: Locate MPI plugin in spur_binary_src on control node
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: spur_mpi_src_stats
+  loop:
+    - "{{ spur_binary_src }}/spur_mpi_pmix.so"
+    - "{{ spur_binary_src }}/libspur_mpi_pmix.so"
+    - "{{ spur_binary_src }}/lib/spur/spur_mpi_pmix.so"
+    - "{{ spur_binary_src | dirname }}/lib/spur/spur_mpi_pmix.so"
+  delegate_to: localhost
+  become: false
+  when:
+    - spur_mpi_plugin_enabled | default(true) | bool
+    - spur_binary_src | default('') | length > 0
+
+- name: Pick MPI plugin source from spur_binary_src
+  ansible.builtin.set_fact:
+    spur_mpi_plugin_src: "{{ spur_mpi_src_stats.results | selectattr('stat.exists') | map(attribute='item') | first | default('') }}"
+  when:
+    - spur_mpi_plugin_enabled | default(true) | bool
+    - spur_binary_src | default('') | length > 0
+
+- name: Install MPI plugin from spur_binary_src
+  ansible.builtin.copy:
+    src: "{{ spur_mpi_plugin_src }}"
+    dest: "{{ spur_mpi_plugin_dir }}/spur_mpi_pmix.so"
+    mode: "0755"
+  when:
+    - spur_mpi_plugin_enabled | default(true) | bool
+    - spur_mpi_plugin_src | default('') | length > 0
+
+- name: Stat MPI plugin left by install.sh on agent
+  ansible.builtin.stat:
+    path: "{{ spur_install_dir | regex_replace('/[^/]+$', '') }}/lib/spur/spur_mpi_pmix.so"
+  register: spur_mpi_install_sh_stat
+  when:
+    - spur_mpi_plugin_enabled | default(true) | bool
+    - spur_binary_src | default('') | length == 0
+
+- name: Install MPI plugin from install.sh layout to {{ spur_mpi_plugin_dir }}
+  ansible.builtin.copy:
+    src: "{{ spur_install_dir | regex_replace('/[^/]+$', '') }}/lib/spur/spur_mpi_pmix.so"
+    dest: "{{ spur_mpi_plugin_dir }}/spur_mpi_pmix.so"
+    remote_src: true
+    mode: "0755"
+  when:
+    - spur_mpi_plugin_enabled | default(true) | bool
+    - spur_binary_src | default('') | length == 0
+    - spur_mpi_install_sh_stat.stat.exists | default(false)
+
+- name: Note MPI plugin not found (PMIx jobs will fail until installed)
+  ansible.builtin.debug:
+    msg: >-
+      spur_mpi_pmix.so not found for {{ inventory_hostname }} —
+      skipping MPI plugin install (set spur_mpi_plugin_enabled=false to silence).
+  when:
+    - spur_mpi_plugin_enabled | default(true) | bool
+    - spur_mpi_plugin_src | default('') | length == 0
+    - >-
+      (spur_binary_src | default('') | length > 0)
+      or (
+        spur_binary_src | default('') | length == 0
+        and not (
+          spur_mpi_install_sh_stat.stat is defined
+          and spur_mpi_install_sh_stat.stat.exists | default(false)
+        )
+      )
+
 - name: Install spurd systemd unit
   # WorkingDirectory in the unit is {{ spur_home }} so job stdout (spur-<N>.out)
   # always lands there regardless of where the daemon was launched from.

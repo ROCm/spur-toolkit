@@ -90,6 +90,10 @@ jobs:
               test -n "$bindir" || { echo "spurctld not found in $tarball"; exit 1; }
               mkdir -p "$GITHUB_WORKSPACE/$dest"
               for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/$dest/$b"; done
+              plugin=$(find . -path '*/lib/spur/spur_mpi_pmix.so' -o -name spur_mpi_pmix.so 2>/dev/null | head -1)
+              if [ -n "$plugin" ] && [ -f "$plugin" ]; then
+                cp "$plugin" "$GITHUB_WORKSPACE/$dest/spur_mpi_pmix.so"
+              fi
               chmod +x "$GITHUB_WORKSPACE/$dest"/*
             )
           }
@@ -206,6 +210,14 @@ jobs:
           echo "== spur nodes =="
           docker exec ctl-0 /usr/local/bin/spur nodes
           [ -z "$missing" ] || { echo "agents still missing:$missing"; exit 1; }
+
+      - name: Assert MPI plugin installed on agents
+        run: |
+          set -euo pipefail
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" test -f /usr/lib/spur/spur_mpi_pmix.so
+          done
+          echo "MPI plugin present on all agents"
 
       - name: Assert a job runs to completion
         run: |
@@ -465,6 +477,10 @@ jobs:
               test -n "$bindir" || { echo "spurctld not found in $tarball"; exit 1; }
               mkdir -p "$GITHUB_WORKSPACE/$dest"
               for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/$dest/$b"; done
+              plugin=$(find . -path '*/lib/spur/spur_mpi_pmix.so' -o -name spur_mpi_pmix.so 2>/dev/null | head -1)
+              if [ -n "$plugin" ] && [ -f "$plugin" ]; then
+                cp "$plugin" "$GITHUB_WORKSPACE/$dest/spur_mpi_pmix.so"
+              fi
               chmod +x "$GITHUB_WORKSPACE/$dest"/*
             )
           }
@@ -549,6 +565,14 @@ jobs:
             sleep 2
           done
           [ -z "$missing" ] || { echo "agents still missing:$missing"; exit 1; }
+
+      - name: Assert MPI plugin installed on agents
+        run: |
+          set -euo pipefail
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" test -f /usr/lib/spur/spur_mpi_pmix.so
+          done
+          echo "MPI plugin present on all agents"
 
       # --- spur.conf preservation test ------------------------------------
       - name: Stamp a sentinel line into spur.conf to detect overwrites

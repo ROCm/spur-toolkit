@@ -15,7 +15,7 @@ Run everything from this repo's `ansible/` directory.
 
 `spur` (the upstream source) is a separate repo. Clone and build it wherever's convenient, then point `spur_binary_src` straight at the build output — no need to copy it anywhere.
 
-> The role only ever reads the three named files `spur`/`spurctld`/`spurd` out of that directory.
+> The role only ever reads the three named files `spur`/`spurctld`/`spurd` out of that directory. The MPI PMIx plugin (`spur_mpi_pmix.so`) is installed separately on agents by the `spur_agent` role (see [Build prerequisites](#build-prerequisites)).
 
 ```bash
 # 1. Build spur (picks up mainline changes not yet in a tagged release; see Build prerequisites)
@@ -77,6 +77,8 @@ A local build produces three binaries under `target/release/`:
 | `spur` | multi-call CLI, symlinked to 18 Slurm-compatible names (`sbatch`, `squeue`, `sacct`, `sacctmgr`, `scontrol`, `salloc`, `srun`, `sinfo`, `scancel`, `sattach`, `scrontab`, `sdiag`, `smd`, `sprio`, `sreport`, `sshare`, `sstat`, `strigger`) |
 | `spurctld` | controller / scheduler / Raft — also serves accounting in-process on the same gRPC port when `[accounting].database_url` is set |
 | `spurd` | node agent |
+
+Release and nightly tarballs from [ROCm/spur](https://github.com/ROCm/spur/releases) also ship `lib/spur/spur_mpi_pmix.so`. The playbooks install it on **agents only** at `/usr/lib/spur/` (matches `spurd`'s default plugin path). For a local build, also run `cargo build --release -p spur-mpi-pmix` and stage `target/release/libspur_mpi_pmix.so` (or rename to `spur_mpi_pmix.so`) in `spur_binary_src`. PMIx jobs (`--mpi=pmix`) additionally require `libpmix` and Open MPI on agent hosts — the playbooks do not install those packages.
 
 > A pre-merge build (before upstream folded `spurdbd` into `spurctld`) also produces a `spurdbd` binary. It's harmless sitting alongside the other three — the role only ever reads `spur`/`spurctld`/`spurd` by exact name.
 
@@ -302,6 +304,8 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 | `spur_version` | `latest` | Which `install.sh` channel to pull: `latest` / `nightly` / `vX.Y.Z`. |
 | `spur_install_dir` | `/root/.local/bin` | Where binaries and Slurm symlinks land (added to `/etc/environment`). |
 | `spur_home` | `/root/spur` | Per-host root for state, logs, and config. |
+| `spur_mpi_plugin_dir` | `/usr/lib/spur` | Where `spur_mpi_pmix.so` is installed on agents (matches `spurd` default). |
+| `spur_mpi_plugin_enabled` | `true` | Install the MPI plugin on agents when a source file is available. |
 | `spur_transport` | `direct` | Network transport: `direct` or `wireguard`. |
 | `spur_accounting_enabled` | `true` | Deploy PostgreSQL accounting (embedded in spurctld). Set `false` to skip. |
 | `spur_accounting_host` | first controller | Host that runs Postgres (any managed host). Pass via `-e`. |

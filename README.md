@@ -15,4 +15,4 @@ The Ansible and skill paths reach the same end state (systemd-managed daemons, S
 
 ## Relationship to ROCm/spur
 
-Building the `spur`/`spurctld`/`spurd`/`spurdbd` binaries still happens in [ROCm/spur](https://github.com/ROCm/spur) (`cargo build --release -p spur-cli -p spurctld -p spurd -p spurdbd`). See `ansible/README.md` for the full clone-build-stage-deploy walkthrough. This repo only consumes those binaries (via `spur_binary_src`/`SPUR_BINARY_SRC`) or the upstream `install.sh`.
+Building the `spur`/`spurctld`/`spurd` binaries still happens in [ROCm/spur](https://github.com/ROCm/spur) (`cargo build --release -p spur-cli -p spurctld -p spurd`). Release tarballs also include `spur_mpi_pmix.so`; the Ansible playbooks install it on agents at `/usr/lib/spur/`. See `ansible/README.md` for the full clone-build-stage-deploy walkthrough. This repo only consumes those binaries (via `spur_binary_src`/`SPUR_BINARY_SRC`) or the upstream `install.sh`.
