@@ -21,7 +21,8 @@ Defaults (override only if the user asks):
 | `SPUR_HOME` | `/root/spur` |
 | `SPUR_INSTALL_DIR` | `/root/.local/bin` |
 | `SPUR_VERSION` | `latest` (passed to `install.sh`; or `nightly` / `vX.Y.Z`) |
-| `SPUR_BINARY_SRC` | *(empty)* — local dir with pre-built `spur/spurctld/spurd`; used when set, else `install.sh` |
+| `SPUR_BINARY_SRC` | *(empty)* — local dir with pre-built `spur`/`spurctld`/`spurd` and optionally `spur_mpi_pmix.so`; used when set, else `install.sh` |
+| `SPUR_MPI_PLUGIN_DIR` | `/usr/lib/spur` — where `spur_mpi_pmix.so` is installed on **agents** (matches `spurd` default) |
 | `SPUR_CONTROLLER_PORT` | `6817` |
 | `SPUR_AGENT_PORT` | `6818` |
 | `SPUR_RAFT_PORT` | `6821` (hardcoded inside spurctld; cannot be changed via CLI) |
@@ -86,6 +87,7 @@ SPUR_HOME=/root/spur
 SPUR_INSTALL_DIR=/root/.local/bin
 SPUR_VERSION=latest
 SPUR_BINARY_SRC=                                     # e.g. /tmp/spur-bin to push pre-built binaries
+SPUR_MPI_PLUGIN_DIR=/usr/lib/spur
 SPUR_CONTROLLER_PORT=6817; SPUR_AGENT_PORT=6818; SPUR_RAFT_PORT=6821; ACCT_DB_PORT=5432
 SPUR_CLUSTER_NAME=spur-cluster; SPUR_LOG_LEVEL=info; SPUR_WIPE_STATE=false
 ACCT_DB_NAME=spur; ACCT_DB_USER=spur; ACCT_DB_PASSWORD=spur
@@ -131,9 +133,38 @@ Fail-fast rules:
 
 ## Step 2: install Spur binaries on all hosts (idempotent)
 
-Two sources, same as the playbook. ROCm/spur publishes releases (https://github.com/ROCm/spur/releases) — `install.sh` (no `SPUR_BINARY_SRC` set) downloads one automatically (`SPUR_VERSION=latest` by default, or `nightly` for a mainline build, or a specific `vX.Y.Z`). Set `SPUR_BINARY_SRC` to a local dir holding pre-built `spur`, `spurctld`, `spurd` instead when you need mainline changes not yet released, an air-gapped install, or a custom build.
+Two sources, same as the playbook. ROCm/spur publishes releases (https://github.com/ROCm/spur/releases) — `install.sh` (no `SPUR_BINARY_SRC` set) downloads one automatically (`SPUR_VERSION=latest` by default, or `nightly` for a mainline build, or a specific `vX.Y.Z`). Set `SPUR_BINARY_SRC` to a local dir holding pre-built `spur`, `spurctld`, `spurd`, and optionally `spur_mpi_pmix.so`, instead when you need mainline changes not yet released, an air-gapped install, or a custom build.
 
 ```bash
+resolve_mpi_plugin_src() {
+  local d="$1"
+  for p in \
+    "$d/spur_mpi_pmix.so" \
+    "$d/libspur_mpi_pmix.so" \
+    "$d/lib/spur/spur_mpi_pmix.so" \
+    "$(dirname "$d")/lib/spur/spur_mpi_pmix.so"; do
+    [ -f "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+install_mpi_plugin_on_agent() {
+  local tgt="$1" src="${2:-}"
+  ssh "$tgt" "sudo mkdir -p ${SPUR_MPI_PLUGIN_DIR}"
+  if [ -n "$src" ]; then
+    scp -q "$src" "${tgt}:/tmp/spur_mpi_pmix.so.spur-push"
+    ssh "$tgt" "sudo install -m 0755 /tmp/spur_mpi_pmix.so.spur-push ${SPUR_MPI_PLUGIN_DIR}/spur_mpi_pmix.so && rm -f /tmp/spur_mpi_pmix.so.spur-push"
+    return 0
+  fi
+  local prefix="${SPUR_INSTALL_DIR%/*}"
+  ssh "$tgt" "
+    set -euo pipefail
+    if [ -f ${prefix}/lib/spur/spur_mpi_pmix.so ]; then
+      sudo install -m 0755 ${prefix}/lib/spur/spur_mpi_pmix.so ${SPUR_MPI_PLUGIN_DIR}/spur_mpi_pmix.so
+    fi
+  "
+}
+
 for tgt in "${HOSTS_ALL[@]}"; do
   ssh "$tgt" "
     set -euo pipefail
@@ -165,9 +196,25 @@ for tgt in "${HOSTS_ALL[@]}"; do
     echo 'spur installed + symlinks created'
   "
 done
+
+# MPI PMIx plugin — agents only, at SPUR_MPI_PLUGIN_DIR (default /usr/lib/spur).
+for tgt in "${AGENTS[@]}"; do
+  if [ -n "$SPUR_BINARY_SRC" ]; then
+    src=$(resolve_mpi_plugin_src "$SPUR_BINARY_SRC" || true)
+    if [ -n "$src" ]; then
+      install_mpi_plugin_on_agent "$tgt" "$src"
+    else
+      echo "note: no spur_mpi_pmix.so in SPUR_BINARY_SRC — skipping MPI plugin on $tgt"
+    fi
+  else
+    install_mpi_plugin_on_agent "$tgt" ""
+  fi
+done
 ```
 
 > Do NOT rely on `spur --version` — it is not a supported flag and errors. Check for the file with `test -x` instead.
+
+> **MPI plugin:** release/nightly tarballs ship `lib/spur/spur_mpi_pmix.so`. `install.sh` places it under `$(dirname SPUR_INSTALL_DIR)/lib/spur/`; this step copies it to `${SPUR_MPI_PLUGIN_DIR}` where `spurd` looks by default. `--mpi=pmix` jobs still need `libpmix` and Open MPI on the agent — not installed here.
 
 Optional: prepend `${SPUR_INSTALL_DIR}` to `/etc/environment` so non-interactive SSH gets `spur`/`sbatch`/etc. on PATH.
 
@@ -654,7 +701,7 @@ To also remove accounting data (destructive): `ssh "$ACCT_HOST" "sudo -u postgre
 
 ## Step 12: rolling upgrade (only when asked to upgrade a live cluster)
 
-Use this instead of re-running Steps 1–9 when jobs are currently running and a full-cluster daemon bounce (which Steps 1-9 do — no draining, no batching) is not acceptable. Assumes the cluster is already up and healthy; refuse to proceed otherwise. Requires `SPUR_BINARY_SRC` pointing at the new build (rebuild all three binaries together — same caveat as any upgrade). Only exercised so far with `TRANSPORT=direct`; the `IP[]` map this step reuses from Step 3 still needs to hold real addresses (`WG_IP[]` per Step 2b) for a wireguard cluster — re-derive it in this shell session first if it isn't already populated.
+Use this instead of re-running Steps 1–9 when jobs are currently running and a full-cluster daemon bounce (which Steps 1-9 do — no draining, no batching) is not acceptable. Assumes the cluster is already up and healthy; refuse to proceed otherwise. Requires `SPUR_BINARY_SRC` pointing at the new build (rebuild all three binaries together — same caveat as any upgrade). Push `spur_mpi_pmix.so` to agents when present in `SPUR_BINARY_SRC`. Only exercised so far with `TRANSPORT=direct`; the `IP[]` map this step reuses from Step 3 still needs to hold real addresses (`WG_IP[]` per Step 2b) for a wireguard cluster — re-derive it in this shell session first if it isn't already populated.
 
 **This step only pushes new binaries and restarts daemons — it does not touch `spur.conf` or Postgres.** If the cluster is still on the pre-merge standalone-`spurdbd` architecture, do the Step 5b migration first (a full-flow, bounce-based operation: Steps 2/4/5b/5/6/7/8/9/10) and confirm it's healthy on the merged-accounting build *before* using this step for further low-disruption upgrades. Running this step against a still-unmigrated cluster would push a spurctld binary that expects the new embedded-accounting config shape without updating `spur.conf`/`pg_hba.conf` to match — don't do that.
 
@@ -712,6 +759,10 @@ while [ $i -lt ${#AGENTS[@]} ]; do
       scp -q "${SPUR_BINARY_SRC}/${b}" "${ag}:/tmp/${b}.spur-push"
       ssh "$ag" "sudo install -m 0755 /tmp/${b}.spur-push ${SPUR_INSTALL_DIR}/${b} && rm -f /tmp/${b}.spur-push"
     done
+    src=$(resolve_mpi_plugin_src "$SPUR_BINARY_SRC" || true)
+    if [ -n "$src" ]; then
+      install_mpi_plugin_on_agent "$ag" "$src"
+    fi
     ssh "$ag" "sudo systemctl restart spurd"
   done
   for ag in "${batch[@]}"; do

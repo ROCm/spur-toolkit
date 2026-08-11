@@ -1,1 +1,3 @@
 ---
+spur_mpi_plugin_dir: /usr/lib/spur
+spur_mpi_plugin_enabled: true
