@@ -26,10 +26,12 @@ on:
       - main
     paths:
       - 'ansible/**'
+      - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
   pull_request:
     paths:
       - 'ansible/**'
+      - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
 
 concurrency:
