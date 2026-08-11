@@ -1,5 +1,5 @@
 # ============================================================================
-# Playbook integration tests — two parallel jobs, each with its own cluster.
+# Playbook integration tests — three parallel jobs, each with its own cluster.
 #
 # integration-resilience:
 #   deploy + rolling upgrade covering all three agent states + force upgrade
@@ -7,6 +7,11 @@
 #
 # integration-conf:
 #   deploy + spur.conf preservation (default: preserve, opt-in: overwrite)
+#
+# techsupport:
+#   deploy, then exercise techsupport/spur-techsupport.sh end-to-end over real
+#   SSH (the only job that installs sshd in the containers) — default run,
+#   skip-flags, and the fail/--partial paths.
 #
 # Full HA/accounting/login-node coverage lives in deploy.yml's own path.
 # Day-2 playbooks (add_nodes/remove_nodes/manage_accounts/healthcheck/teardown)
@@ -613,3 +618,228 @@ jobs:
         run: |
           for n in $NODES; do docker rm -f "$n" || true; done
           docker network rm spur-ci || true
+
+  # ---------------------------------------------------------------------------
+  # Job 3: techsupport/spur-techsupport.sh end-to-end over real SSH
+  # ---------------------------------------------------------------------------
+  techsupport:
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      NODES: "ctl-0 gpu-1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download + verify Spur binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl-spur-bin
+          ( cd dl-spur-bin
+            tag=$(gh api repos/ROCm/spur/releases --jq 'map(select(.tag_name != "nightly"))[0].tag_name')
+            gh release download "$tag" --repo ROCm/spur \
+              --pattern '*-linux-amd64.tar.gz' \
+              --pattern '*-linux-amd64.tar.gz.sha256'
+            tarball=$(ls *-linux-amd64.tar.gz)
+            hash=$(awk '{print $1}' "${tarball}.sha256")
+            echo "${hash}  ${tarball}" | sha256sum -c -
+            tar xzf "$tarball"
+            bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
+            mkdir -p "$GITHUB_WORKSPACE/spur-bin"
+            for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"; done
+            chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
+          )
+
+      - name: Start systemd containers on a docker network
+        env:
+          IMG: jrei/systemd-ubuntu:22.04
+        run: |
+          set -euo pipefail
+          docker network create spur-ci-ts
+          docker pull "$IMG"
+          for n in $NODES; do
+            docker run -d --name "$n" --hostname "$n" \
+              --network spur-ci-ts \
+              --privileged \
+              --cgroupns=host \
+              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+              "$IMG"
+          done
+
+      - name: Wait for systemd to be ready in every container
+        run: |
+          set -uo pipefail
+          for n in $NODES; do
+            ok=""
+            for i in $(seq 1 30); do
+              st=$(docker exec "$n" systemctl is-system-running 2>/dev/null || true)
+              case "$st" in running|degraded) ok=1; break ;; esac
+              sleep 2
+            done
+            [ -n "$ok" ] || { echo "::error::systemd never became ready in $n"; exit 1; }
+          done
+
+      - name: Install preflight deps + sshd in every container
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" bash -c '
+              apt-get update -qq
+              apt-get install -y -qq curl tar iproute2 python3 sudo openssh-server postgresql-client
+              mkdir -p /root/.ssh && chmod 700 /root/.ssh
+              systemctl enable --now ssh
+            '
+          done
+
+      - name: Install ansible + docker connection plugin
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ansible-core
+          ansible-galaxy collection install community.docker
+
+      - name: deploy.yml (1 ctl + 1 agent, accounting on)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          # group_vars/ only auto-loads next to the inventory file or the playbook
+          # dir; ci-techsupport.ini lives in .github/workflows/ (kept out of
+          # inventory/ on purpose), so load the same defaults explicitly.
+          # Password contains "@" and "#" on purpose — exercises the redaction
+          # regex against more than the plain default (see the password-leak
+          # assertion below).
+          ansible-playbook -i ../.github/workflows/ci-techsupport.ini playbooks/deploy.yml \
+            -e @inventory/group_vars/all.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_accounting_db_password='p@ss#word'
+
+      - name: Assert the agent registered
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null \
+              | grep -qx "NodeName=gpu-1" && { echo "gpu-1 registered"; break; }
+            sleep 2
+          done
+
+      - name: Wire up passwordless SSH between the containers
+        run: |
+          set -euo pipefail
+          ssh-keygen -t ed25519 -N '' -f ts_key -q
+          for n in $NODES; do
+            docker exec -i "$n" bash -c 'cat >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys' < ts_key.pub
+          done
+          docker cp ts_key ctl-0:/root/.ssh/id_ed25519
+          docker exec ctl-0 chmod 600 /root/.ssh/id_ed25519
+          # Both containers share the spur-ci-ts network, so ctl-0 can reach
+          # gpu-1 by container name; localhost covers ctl-0 collecting itself.
+          docker exec ctl-0 ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 root@gpu-1 true
+          docker exec ctl-0 ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 root@localhost true
+
+      - name: Copy spur-techsupport.sh into ctl-0
+        run: |
+          docker cp techsupport/spur-techsupport.sh ctl-0:/usr/local/bin/spur-techsupport.sh
+          docker exec ctl-0 chmod +x /usr/local/bin/spur-techsupport.sh
+
+      - name: Default run — collects everything, must succeed with a clean manifest
+        run: |
+          set -euo pipefail
+          docker exec -e SPUR_HOME=/opt/spur -e SPUR_INSTALL_DIR=/usr/local/bin ctl-0 spur-techsupport.sh \
+            --controllers root@localhost --agents root@gpu-1 --acct-host root@localhost \
+            --output /root/ts-default
+          bundle=$(docker exec ctl-0 bash -c 'ls /root/ts-default/spur-techsupport-*.tar.gz')
+          docker cp "ctl-0:$bundle" ts-default.tar.gz
+          echo "== manifest =="
+          tar xzOf ts-default.tar.gz --wildcards '*/manifest.txt'
+          failures=$(tar xzOf ts-default.tar.gz --wildcards '*/manifest.txt' | grep -c '^\[FAILED\]' || true)
+          [ "$failures" -eq 0 ] || { echo "::error::default run had $failures FAILED item(s)"; exit 1; }
+          for expect in manifest.txt controller-localhost/spurctld.journal.log \
+                        controller-localhost/raft-state.tar.gz controller-localhost/spur.conf.sanitized \
+                        controller-localhost/build-fingerprint.txt cluster-state/sinfo.txt \
+                        accounting/postgres-version.txt accounting/accounting-db.sql \
+                        agent-gpu-1/spurd.journal.log \
+                        agent-gpu-1/spurd.service agent-gpu-1/build-fingerprint.txt; do
+            tar tzf ts-default.tar.gz | grep -q "$expect" || { echo "::error::missing $expect from archive"; exit 1; }
+          done
+
+      - name: Assert spur.conf's DB password (containing @ and #) was redacted, not the whole line
+        run: |
+          set -euo pipefail
+          conf=$(tar xzOf ts-default.tar.gz --wildcards '*/controller-localhost/spur.conf.sanitized')
+          echo "$conf" | grep -q 'database_url' || { echo "::error::sanitized spur.conf missing database_url entirely"; exit 1; }
+          echo "$conf" | grep -qF 'p@ss#word' && { echo "::error::DB password leaked unredacted into the archive"; exit 1; }
+          echo "$conf" | grep -q 'REDACTED@' || { echo "::error::database_url password was not redacted"; exit 1; }
+
+      - name: Auto-detect the DB host when --acct-host is omitted
+        run: |
+          set -euo pipefail
+          docker exec -e SPUR_HOME=/opt/spur -e SPUR_INSTALL_DIR=/usr/local/bin ctl-0 spur-techsupport.sh \
+            --controllers root@localhost --agents root@gpu-1 \
+            --output /root/ts-autodetect
+          bundle=$(docker exec ctl-0 bash -c 'ls /root/ts-autodetect/spur-techsupport-*.tar.gz')
+          docker cp "ctl-0:$bundle" ts-autodetect.tar.gz
+          manifest=$(tar xzOf ts-autodetect.tar.gz --wildcards '*/manifest.txt')
+          echo "$manifest" | grep -q '^\[OK\] accounting db: postgres version' || \
+            { echo "::error::DB host auto-detection failed to find postgresql on the controller"; echo "$manifest"; exit 1; }
+
+      - name: prefix[N-M] range syntax resolves to the real host
+        run: |
+          set -euo pipefail
+          docker exec -e SPUR_HOME=/opt/spur -e SPUR_INSTALL_DIR=/usr/local/bin ctl-0 spur-techsupport.sh \
+            --controllers root@localhost --agents 'root@gpu-[1-1]' --acct-host root@localhost \
+            --output /root/ts-range
+          bundle=$(docker exec ctl-0 bash -c 'ls /root/ts-range/spur-techsupport-*.tar.gz')
+          docker cp "ctl-0:$bundle" ts-range.tar.gz
+          tar tzf ts-range.tar.gz | grep -q 'agent-gpu-1/spurd.journal.log' || \
+            { echo "::error::root@gpu-[1-1] did not expand to root@gpu-1"; exit 1; }
+
+      - name: --skip-db --skip-raft run — those items must be absent and marked SKIPPED
+        run: |
+          set -euo pipefail
+          docker exec -e SPUR_HOME=/opt/spur -e SPUR_INSTALL_DIR=/usr/local/bin ctl-0 spur-techsupport.sh \
+            --controllers root@localhost --agents root@gpu-1 --acct-host root@localhost \
+            --skip-db --skip-raft --output /root/ts-skip
+          bundle=$(docker exec ctl-0 bash -c 'ls /root/ts-skip/spur-techsupport-*.tar.gz')
+          docker cp "ctl-0:$bundle" ts-skip.tar.gz
+          tar tzf ts-skip.tar.gz | grep -q 'raft-state.tar.gz' && { echo "::error::raft archive present despite --skip-raft"; exit 1; }
+          tar tzf ts-skip.tar.gz | grep -qE 'accounting/(postgres-version.txt|accounting-db.sql)' && { echo "::error::db info present despite --skip-db"; exit 1; }
+          manifest=$(tar xzOf ts-skip.tar.gz --wildcards '*/manifest.txt')
+          echo "$manifest" | grep -q '\[SKIPPED\].*raft state.*--skip-raft' || { echo "::error::manifest missing raft SKIPPED entry"; exit 1; }
+          echo "$manifest" | grep -q '\[SKIPPED\] accounting db (--skip-db)' || { echo "::error::manifest missing db SKIPPED entry"; exit 1; }
+
+      - name: Unreachable agent — fails closed by default, --partial still packages
+        run: |
+          set -euo pipefail
+          if docker exec -e SPUR_HOME=/opt/spur -e SPUR_INSTALL_DIR=/usr/local/bin ctl-0 spur-techsupport.sh \
+              --controllers root@localhost --agents root@unreachable-host-ts \
+              --acct-host root@localhost --output /root/ts-fail; then
+            echo "::error::expected non-zero exit on an unreachable agent without --partial"; exit 1
+          fi
+          docker exec ctl-0 bash -c 'ls /root/ts-fail/spur-techsupport-*.tar.gz 2>/dev/null' && \
+            { echo "::error::archive must not be written on a failed collection without --partial"; exit 1; }
+
+          docker exec -e SPUR_HOME=/opt/spur -e SPUR_INSTALL_DIR=/usr/local/bin ctl-0 spur-techsupport.sh \
+            --controllers root@localhost --agents root@unreachable-host-ts \
+            --acct-host root@localhost --partial --output /root/ts-partial
+          bundle=$(docker exec ctl-0 bash -c 'ls /root/ts-partial/spur-techsupport-*.tar.gz')
+          docker cp "ctl-0:$bundle" ts-partial.tar.gz
+          tar xzOf ts-partial.tar.gz --wildcards '*/manifest.txt' | grep -q '\[FAILED\].*unreachable-host-ts' || \
+            { echo "::error::--partial archive missing the expected FAILED entry"; exit 1; }
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          for n in $NODES; do
+            echo "===== $n journal (spur*) ====="
+            docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -50' || true
+          done
+
+      - name: Teardown containers
+        if: always()
+        run: |
+          for n in $NODES; do docker rm -f "$n" || true; done
+          docker network rm spur-ci-ts || true
