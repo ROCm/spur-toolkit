@@ -32,9 +32,11 @@ PARTIAL=false
 
 usage() {
   cat <<'EOF'
-Usage: spur-techsupport.sh --controllers <ssh-targets> [options]
+Usage: spur-techsupport.sh [--controllers <ssh-targets>] [--agents <ssh-targets>] [--acct-host <target>] [options]
 
-Required:
+At least one of --controllers, --agents, or --acct-host is required — pass
+only what you want collected (e.g. --agents alone for just agent logs).
+
   --controllers <list>   comma-separated SSH targets (user@host), e.g. root@ctl-0
                           (or set $CONTROLLERS). Supports prefix[N-M] ranges,
                           e.g. root@ctl-[1-3] or root@gpu-[001,010-012]
@@ -143,8 +145,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$CONTROLLERS" ]; then
-  echo "error: --controllers is required (or set \$CONTROLLERS)" >&2
+if [ -z "$CONTROLLERS" ] && [ -z "$AGENTS" ] && [ -z "$ACCT_HOST" ]; then
+  echo "error: at least one of --controllers, --agents, or --acct-host is required" >&2
   usage >&2
   exit 2
 fi
@@ -371,6 +373,11 @@ collect_agent() {
 }
 
 collect_cluster_state() {
+  if [ ${#CONTROLLERS_ARR[@]} -eq 0 ]; then
+    progress_start "cluster state: sinfo/squeue/sdiag"
+    log_item SKIPPED "cluster state: sinfo/squeue/sdiag" "no --controllers given"
+    return 0
+  fi
   local target="${CONTROLLERS_ARR[0]}"
   local short; short=$(short_name "$target")
   local hostdir="$STAGE/cluster-state"

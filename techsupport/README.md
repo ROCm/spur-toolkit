@@ -10,6 +10,8 @@ Collects a diagnostic bundle from a Spur cluster into one `.tar.gz`. Plain SSH, 
 
 Single controller works the same way — just pass one target: `--controllers root@ctl-0`.
 
+`--controllers`, `--agents`, and `--acct-host` are each optional — pass only what you want collected. `--agents root@gpu-1` alone collects just agent logs; `--acct-host root@db-0` alone collects just the accounting DB. At least one of the three is required.
+
 For a large fleet, `--controllers`/`--agents`/`--nodes` accept Slurm-style `prefix[N-M]` ranges instead of spelling out every host: `--agents root@gpu-[1-100]`. Zero-padding, multiple ranges/singles, and a mix of both are all supported: `root@gpu-[001,010-012]`, `root@ctl-[1-3],root@gpu-[1-50]`.
 
 Writes `spur-techsupport-<UTC-timestamp>.tar.gz` to the current directory. Each collection step prints a `==>` progress line to stderr as it starts, so a slow or unreachable host shows exactly where things are stuck.
@@ -30,7 +32,7 @@ SSH targets are `user@host`. For password auth, set `SSHPASS` instead of putting
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--controllers <list>` | *(required, or `$CONTROLLERS`)* | comma-separated SSH targets running `spurctld` |
+| `--controllers <list>` | *(empty, or `$CONTROLLERS`)* | comma-separated SSH targets running `spurctld` |
 | `--agents <list>` | *(empty, or `$AGENTS`)* | comma-separated SSH targets running `spurd` |
 | `--acct-host <target>` | auto-detected among `--controllers` (or `$ACCT_HOST`) | SSH target running PostgreSQL |
 | `--nodes <names>` | all agents | limit **agent** log/config collection to these short hostnames (controller/cluster-state/DB collection is unaffected) |
