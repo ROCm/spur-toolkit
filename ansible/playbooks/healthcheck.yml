@@ -1,11 +1,15 @@
 ---
 # Read-only health check for a running Spur cluster. Safe to run anytime — it
 # only inspects state, never changes it. Every probe is failed_when:false so one
-# unhealthy host doesn't abort the report; problems are collected and summarized
-# at the end (and the play exits non-zero if any were found).
+# unhealthy host doesn't abort the report; each play asserts its own hosts at
+# the end (ansible-playbook exits non-zero if any assert fails, so the overall
+# run still fails when anything is unhealthy — no separate summary pass needed).
 #
 # Run:
 #   ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini
+#
+# Skip agents unreachable over SSH (default false = strict, abort the check):
+#   ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini -e spur_ignore_unreachable_agents=true
 
 - name: Controller health
   hosts: spur_controllers
@@ -37,6 +41,21 @@
       failed_when: false
       when: spur_accounting_enabled | default(true) | bool
 
+    - name: Raft/state dir size + free disk under spur_home
+      ansible.builtin.shell: |
+        set +e
+        avail_kb=$(df -Pk "{{ spur_home }}" 2>/dev/null | awk 'NR==2{print $4}')
+        state_sz=$(du -sh "{{ spur_home }}/state" 2>/dev/null | awk '{print $1}')
+        echo "state=${state_sz:-n/a} free=$(( ${avail_kb:-0} / 1024 ))MB"
+        # Warn if <1GB free where spur_home lives.
+        [ "${avail_kb:-0}" -lt 1048576 ] && echo "LOW_DISK"
+        exit 0
+      args:
+        executable: /bin/bash
+      register: hc_disk
+      changed_when: false
+      failed_when: false
+
     - name: Controller findings
       ansible.builtin.set_fact:
         hc_problems: >-
@@ -44,12 +63,30 @@
              + (hc_nodes.rc != 0) | ternary(['`spur nodes` failed (controller/leader down?)'], [])
              + (hc_nodes.rc == 0 and (hc_nodes.stdout | regex_search('no leader|not the Raft leader'))) | ternary(['no Raft leader elected'], [])
              + (hc_queue.rc != 0) | ternary(['`spur queue` failed'], [])
-             + ((spur_accounting_enabled | default(true) | bool) and (hc_sacct.rc | default(0) != 0)) | ternary(['accounting/sacct unreachable'], []) }}
+             + ((spur_accounting_enabled | default(true) | bool) and (hc_sacct.rc | default(0) != 0)) | ternary(['accounting/sacct unreachable'], [])
+             + (hc_disk.stdout is search('LOW_DISK')) | ternary(['low disk (<1GB free) under ' ~ spur_home], []) }}
+
+    - name: Per-host status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ (hc_problems | length == 0) | ternary('OK', (hc_problems | join('; '))) }}
+
+    - name: Fail if this host reported a problem
+      ansible.builtin.assert:
+        that:
+          - hc_problems | length == 0
+        fail_msg: "{{ inventory_hostname }}: {{ hc_problems | join('; ') }}"
+        quiet: true
 
 - name: Agent health
   hosts: spur_agents
   become: true
   gather_facts: no
+  # Skip unreachable agents when spur_ignore_unreachable_agents=true (they're
+  # simply not reported); a reachable-but-unhealthy agent still fails its own
+  # assert below without aborting the check of the rest of the fleet.
+  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   tasks:
     - name: spurd active?
       ansible.builtin.command: systemctl is-active spurd
@@ -65,11 +102,51 @@
       register: hc_port
       failed_when: false
 
+    - name: Raft/state dir size + free disk under spur_home
+      ansible.builtin.shell: |
+        set +e
+        avail_kb=$(df -Pk "{{ spur_home }}" 2>/dev/null | awk 'NR==2{print $4}')
+        state_sz=$(du -sh "{{ spur_home }}/state" 2>/dev/null | awk '{print $1}')
+        echo "state=${state_sz:-n/a} free=$(( ${avail_kb:-0} / 1024 ))MB"
+        # Warn if <1GB free where spur_home lives.
+        [ "${avail_kb:-0}" -lt 1048576 ] && echo "LOW_DISK"
+        exit 0
+      args:
+        executable: /bin/bash
+      register: hc_disk
+      changed_when: false
+      failed_when: false
+
+    # An ignored-unreachable host still gets a registered var per probe (its
+    # ansible "unreachable" result dict, not the probe's real output) — gate on
+    # that flag so it's reported as skipped instead of falsely "unhealthy".
     - name: Agent findings
       ansible.builtin.set_fact:
         hc_problems: >-
           {{ (hc_spurd.stdout | default('') != 'active') | ternary(['spurd not active'], [])
-             + (hc_port.failed | default(false)) | ternary(['agent port ' ~ spur_agent_port ~ ' not listening'], []) }}
+             + (hc_port.failed | default(false)) | ternary(['agent port ' ~ spur_agent_port ~ ' not listening'], [])
+             + (hc_disk.stdout | default('') is search('LOW_DISK')) | ternary(['low disk (<1GB free) under ' ~ spur_home], []) }}
+      when: not (hc_spurd.unreachable | default(false))
+
+    - name: Per-host status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ (hc_problems | length == 0) | ternary('OK', (hc_problems | join('; '))) }}
+      when: not (hc_spurd.unreachable | default(false))
+
+    - name: Note unreachable agent was skipped
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: SKIPPED (unreachable, spur_ignore_unreachable_agents=true)"
+      when: hc_spurd.unreachable | default(false)
+
+    - name: Fail if this host reported a problem
+      ansible.builtin.assert:
+        that:
+          - hc_problems | length == 0
+        fail_msg: "{{ inventory_hostname }}: {{ hc_problems | join('; ') }}"
+        quiet: true
+      when: not (hc_spurd.unreachable | default(false))
 
 - name: Accounting host (PostgreSQL) health
   hosts: "{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
@@ -92,48 +169,19 @@
     - name: Accounting-host findings
       ansible.builtin.set_fact:
         hc_problems: >-
-          {{ hc_problems | default([]) + (hc_pg.stdout | default('') | trim | length > 0) | ternary([hc_pg.stdout | default('') | trim], []) }}
+          {{ (hc_pg.stdout | default('') | trim | length > 0) | ternary([hc_pg.stdout | default('') | trim], []) }}
       when: spur_accounting_enabled | default(true) | bool
 
-- name: Per-host resource check (all spur hosts)
-  hosts: "spur_controllers:spur_agents"
-  become: true
-  gather_facts: no
-  tasks:
-    - name: Raft/state dir size + free disk under spur_home
-      ansible.builtin.shell: |
-        set +e
-        avail_kb=$(df -Pk "{{ spur_home }}" 2>/dev/null | awk 'NR==2{print $4}')
-        state_sz=$(du -sh "{{ spur_home }}/state" 2>/dev/null | awk '{print $1}')
-        echo "state=${state_sz:-n/a} free=$(( ${avail_kb:-0} / 1024 ))MB"
-        # Warn if <1GB free where spur_home lives.
-        [ "${avail_kb:-0}" -lt 1048576 ] && echo "LOW_DISK"
-        exit 0
-      args:
-        executable: /bin/bash
-      register: hc_disk
-      changed_when: false
-      failed_when: false
-
-    - name: Resource findings
-      ansible.builtin.set_fact:
-        hc_problems: >-
-          {{ hc_problems | default([]) + (hc_disk.stdout is search('LOW_DISK')) | ternary(['low disk (<1GB free) under ' ~ spur_home], []) }}
-
-- name: Summary
-  hosts: "spur_controllers:spur_agents:{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
-  become: no
-  gather_facts: no
-  tasks:
     - name: Per-host status
       ansible.builtin.debug:
         msg: >-
           {{ inventory_hostname }}:
           {{ (hc_problems | default([]) | length == 0) | ternary('OK', (hc_problems | default([]) | join('; '))) }}
 
-    - name: Fail if any host reported a problem
+    - name: Fail if this host reported a problem
       ansible.builtin.assert:
         that:
           - hc_problems | default([]) | length == 0
         fail_msg: "{{ inventory_hostname }}: {{ hc_problems | default([]) | join('; ') }}"
         quiet: true
+      when: spur_accounting_enabled | default(true) | bool

@@ -16,6 +16,14 @@
 # ansible_hostname — the same value spur.conf uses). Draining/removal are done
 # from the first controller; the spurd stop is attempted on the matching
 # inventory host when one exists (an already-dead host is fine — it's skipped).
+#
+# A node with a job still running does not finish draining. Same job-safety
+# model as deploy.yml/rolling_upgrade.yml/teardown.yml: by default the run
+# aborts before removing anything. Re-run with -e spur_skip_busy_agents=true
+# to remove only the nodes that drained cleanly (leaving busy ones in the
+# cluster, un-removed), or -e spur_force_remove_busy_nodes=true to kill the
+# running job on a busy node and remove it anyway:
+#   ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4 -e spur_force_remove_busy_nodes=true
 
 - name: Guard rails + node decommission
   hosts: "{{ groups['spur_controllers'][0] }}"
@@ -47,13 +55,18 @@
       loop: "{{ remove_list }}"
       changed_when: true
 
+    # Also accept DOWN: a genuinely unreachable node may independently cross
+    # its heartbeat timeout and flip to DOWN, an equally valid "stopped
+    # scheduling here" outcome — same acceptance as drain_and_guard_agent.yml.
     - name: Wait for each node to fully drain
       ansible.builtin.shell: |
-        for i in $(seq 1 120); do
+        for i in $(seq 1 {{ spur_drain_wait_secs | default(120) }}); do
           st=$({{ spur_install_dir }}/spur show node {{ item }} 2>/dev/null \
                | awk -v n="{{ item }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
                | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
-          [ "$st" = "DRAINED" ] && exit 0
+          case "$st" in
+            DRAINED|DOWN) exit 0 ;;
+          esac
           sleep 1
         done
         echo "timed out waiting for {{ item }} to drain (last state: $st)"
@@ -61,7 +74,58 @@
       args:
         executable: /bin/bash
       loop: "{{ remove_list }}"
+      register: rn_drain_wait
       changed_when: false
+      # Non-fatal here — a still-busy node is an expected case handled below
+      # via rn_busy_nodes, not an error.
+      failed_when: false
+
+    - name: Determine which nodes are busy (reachable but still draining)
+      ansible.builtin.set_fact:
+        rn_busy_nodes: "{{ rn_drain_wait.results | selectattr('rc', 'ne', 0) | map(attribute='item') | list }}"
+
+    - name: Refuse to remove busy nodes unless skip or force is set
+      ansible.builtin.fail:
+        msg: >-
+          These nodes still have a running job and did not drain within
+          {{ spur_drain_wait_secs | default(120) }}s: {{ rn_busy_nodes | join(', ') }}.
+          Node removal never force-kills running work by default. Re-run with
+          -e spur_skip_busy_agents=true to remove only the nodes that drained
+          cleanly and leave these in the cluster, or with
+          -e spur_force_remove_busy_nodes=true to remove them immediately and
+          accept that their running jobs will be killed.
+      when: >-
+        rn_busy_nodes | length > 0
+        and not (spur_skip_busy_agents | default(false) | bool)
+        and not (spur_force_remove_busy_nodes | default(false) | bool)
+
+    - name: Note busy nodes are being left in the cluster
+      ansible.builtin.debug:
+        msg: >-
+          Leaving these busy nodes in the cluster, un-removed
+          (spur_skip_busy_agents=true): {{ rn_busy_nodes | join(', ') }}
+      when: >-
+        rn_busy_nodes | length > 0
+        and (spur_skip_busy_agents | default(false) | bool)
+        and not (spur_force_remove_busy_nodes | default(false) | bool)
+
+    - name: Warn that running jobs on busy nodes WILL be killed
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: spur_force_remove_busy_nodes=true — killing job processes
+          on: {{ rn_busy_nodes | join(', ') }}
+      when: >-
+        rn_busy_nodes | length > 0
+        and (spur_force_remove_busy_nodes | default(false) | bool)
+
+    # Everything proceeds when forced; otherwise busy nodes are dropped from
+    # the list (they were already refused above unless spur_skip_busy_agents
+    # was set) so play 3 only removes the nodes that actually drained.
+    - name: Compute the final list of nodes to actually remove
+      ansible.builtin.set_fact:
+        rn_actual_remove_list: >-
+          {{ remove_list if (spur_force_remove_busy_nodes | default(false) | bool)
+             else (remove_list | difference(rn_busy_nodes)) }}
 
 - name: Stop the agent on each removed node (best effort, if in inventory)
   # Map each requested name back to the inventory host whose spur_node_name /
@@ -71,23 +135,35 @@
   hosts: spur_agents
   become: true
   gather_facts: yes
+  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  vars:
+    # rn_actual_remove_list was set via plain set_fact on the controller in
+    # play 1 (a DIFFERENT host) — a bare reference here would look at THIS
+    # host's own (unset) vars, not the controller's, so it must go through
+    # hostvars[] explicitly (same lesson as spur_accounting_listen_ip).
+    rn_actual_remove_list: "{{ hostvars[groups['spur_controllers'][0]].rn_actual_remove_list | default([]) }}"
   tasks:
+    # Only nodes actually being removed — a node left in the cluster via
+    # spur_skip_busy_agents must NOT have spurd touched at all, or it would
+    # gracefully deregister on SIGTERM despite being "left in the cluster".
+    - name: Kill workloads still running on a node being force-removed
+      ansible.builtin.include_tasks: tasks/kill_workload_processes.yml
+      when: >-
+        (spur_force_remove_busy_nodes | default(false) | bool)
+        and (rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length > 0)
+
     - name: Stop + disable spurd on nodes being removed
       ansible.builtin.systemd:
         name: spurd
         state: stopped
         enabled: false
-      when: >-
-        (nodes_to_remove | default('') | split(',') | map('trim') | list)
-        | intersect([ansible_hostname, inventory_hostname]) | length > 0
+      when: rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length > 0
       failed_when: false
 
 - name: Remove each node from the cluster + remind about inventory
   hosts: "{{ groups['spur_controllers'][0] }}"
   become: true
   gather_facts: no
-  vars:
-    remove_list: "{{ nodes_to_remove | default('') | split(',') | map('trim') | select | list }}"
   tasks:
     # Belt-and-suspenders: spurd deregisters gracefully on SIGTERM, so a node
     # whose agent we just stopped is usually already gone from the controller.
@@ -98,7 +174,7 @@
       ansible.builtin.command: >-
         {{ spur_install_dir }}/spur node remove {{ item }}
         --force --reason "ansible decommission"
-      loop: "{{ remove_list }}"
+      loop: "{{ rn_actual_remove_list }}"
       register: rn_remove
       changed_when: "'not found' not in (rn_remove.stderr | default(''))"
       failed_when:
@@ -112,10 +188,15 @@
 
     - name: Result + inventory reminder
       ansible.builtin.debug:
-        msg:
-          - "Removed from the running cluster: {{ remove_list | join(', ') }}"
-          - "IMPORTANT: also delete these hosts from [spur_agents] in your inventory,"
-          - "otherwise a future `deploy.yml` run will re-add them. No re-deploy is"
-          - "needed just to complete the removal — it's already done."
-          - "Current nodes:"
-          - "{{ rn_after.stdout_lines }}"
+        msg: >-
+          {{
+            (["Removed from the running cluster: " ~ (rn_actual_remove_list | join(', '))]
+             if (rn_actual_remove_list | length > 0) else [])
+            + (["Left in the cluster, un-removed (still busy): " ~ (rn_busy_nodes | difference(rn_actual_remove_list) | join(', '))]
+               if (rn_busy_nodes | default([]) | difference(rn_actual_remove_list) | length > 0) else [])
+            + ["IMPORTANT: also delete removed hosts from [spur_agents] in your inventory,",
+               "otherwise a future `deploy.yml` run will re-add them. No re-deploy is",
+               "needed just to complete the removal — it's already done.",
+               "Current nodes:"]
+            + rn_after.stdout_lines
+          }}

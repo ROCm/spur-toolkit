@@ -1,0 +1,80 @@
+---
+# Canonical implementation of "kill everything a spur job left running on this
+# host" — shared by every playbook that can force through a busy node
+# (drain_and_guard_agent.yml, and remove_nodes.yml's force-remove path).
+# Include-time `when:` controls whether this actually runs; the script itself
+# is a no-op if the spur cgroup is already empty (job finished on its own).
+#
+# Three layers, in order:
+#
+# 1. Container runtimes — if a job launched containers (Docker, containerd/nerdctl,
+#    Podman, or any OCI runtime) those containers live under their own cgroup
+#    subtree and are invisible to a plain cgroup.procs kill. Detect containers
+#    whose cgroup ancestry includes a spur job cgroup and stop them via the
+#    runtime's own CLI first, which cleanly tears down the network namespace,
+#    volume mounts, and GPU device contexts before the kernel sees SIGKILL.
+#
+# 2. SIGTERM to surviving bare PIDs — catches any non-containerised processes
+#    still in spur cgroups (MPI ranks, Python scripts, bare GPU processes, etc.)
+#    and gives them 5s to flush/checkpoint.
+#
+# 3. SIGKILL to anything still alive after the grace period.
+- name: Kill job processes and containers in spur cgroups
+  ansible.builtin.shell: |
+    set -uo pipefail
+
+    spur_pids() {
+      find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null \
+        | xargs cat 2>/dev/null | sort -u
+    }
+
+    pids=$(spur_pids)
+    [ -z "$pids" ] && { echo "no spur job processes found, nothing to kill"; exit 0; }
+    echo "spur job PIDs before kill: $pids"
+
+    container_ids=""
+    for pid in $pids; do
+      [ -f /proc/$pid/cgroup ] || continue
+      ids=$(grep -oE '(docker|cri-containerd|libpod)-([a-f0-9]{64})\.scope' \
+              /proc/$pid/cgroup 2>/dev/null \
+            | grep -oE '[a-f0-9]{64}' || true)
+      container_ids="${container_ids} ${ids}"
+    done
+    container_ids=$(echo "$container_ids" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+
+    if [ -n "$container_ids" ]; then
+      echo "found containers to kill: $container_ids"
+      for cid in $container_ids; do
+        short="${cid:0:12}"
+        if command -v docker &>/dev/null; then
+          docker kill "$short" 2>/dev/null && echo "docker kill $short: ok" || true
+        fi
+        if command -v nerdctl &>/dev/null; then
+          nerdctl kill "$short" 2>/dev/null && echo "nerdctl kill $short: ok" || true
+        fi
+        if command -v podman &>/dev/null; then
+          podman kill "$short" 2>/dev/null && echo "podman kill $short: ok" || true
+        fi
+        if command -v crictl &>/dev/null; then
+          crictl stop "$short" 2>/dev/null && echo "crictl stop $short: ok" || true
+        fi
+      done
+      sleep 2
+    fi
+
+    pids=$(spur_pids)
+    if [ -n "$pids" ]; then
+      echo "sending SIGTERM to bare PIDs: $pids"
+      echo "$pids" | xargs kill -TERM 2>/dev/null || true
+      sleep 5
+    fi
+
+    pids=$(spur_pids)
+    if [ -n "$pids" ]; then
+      echo "sending SIGKILL to surviving PIDs: $pids"
+      echo "$pids" | xargs kill -KILL 2>/dev/null || true
+    fi
+
+    echo "kill sequence complete"
+  args:
+    executable: /bin/bash

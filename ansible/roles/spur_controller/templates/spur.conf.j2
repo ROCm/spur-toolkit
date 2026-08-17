@@ -6,7 +6,9 @@ hosts = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['spur_controll
 state_dir = "{{ spur_home }}/state"
 raft_listen_addr = "[::]:{{ spur_raft_port }}"
 {% if spur_ha_enabled %}
+{% if inventory_hostname in groups['spur_controllers'] %}
 node_id = {{ spur_controller_node_id }}
+{% endif %}
 peers = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['spur_controller_listen_ip'] }}:{{ spur_raft_port }}"{% if not loop.last %}, {% endif %}{% endfor %}]
 {% endif %}
 
@@ -17,9 +19,11 @@ interval_secs = 1
 {% if spur_accounting_enabled | default(true) | bool %}
 [accounting]
 # Accounting runs in-process inside spurctld (served on the same port as the
-# controller API) and reaches Postgres over the network — spur_accounting_listen_ip
-# is the Postgres host, which may or may not be this controller.
-database_url = "postgresql://{{ spur_accounting_db_user | default('spur') }}:{{ spur_accounting_db_password | default('spur') }}@{{ spur_accounting_listen_ip }}:{{ spur_accounting_db_port | default(5432) }}/{{ spur_accounting_db_name | default('spur') }}"
+# controller API) and reaches Postgres over the network — the accounting IP
+# is the Postgres host, which may or may not be this controller. Read via
+# hostvars off a controller (not a bare var) so this template also renders
+# correctly on agents, which never compute this fact themselves.
+database_url = "postgresql://{{ spur_accounting_db_user | default('spur') }}:{{ spur_accounting_db_password | default('spur') }}@{{ hostvars[groups['spur_controllers'][0]].spur_accounting_listen_ip }}:{{ spur_accounting_db_port | default(5432) }}/{{ spur_accounting_db_name | default('spur') }}"
 fairshare_refresh_secs = 30
 {% endif %}
 

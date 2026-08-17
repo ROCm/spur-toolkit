@@ -10,6 +10,23 @@
 #
 # Tear down (keeps installed binaries):
 #   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini
+#
+# Submit a real test job at the end to verify scheduling works (default false
+# — off for routine deploys, on in CI):
+#   ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_verify_enabled=true
+#
+# Re-running against an already-running cluster restarts spurd on every agent —
+# full convergence is the whole point of deploy.yml, so this is disruptive by
+# design (see "In-flight jobs are disrupted" above). An already-registered
+# agent is drained first; if it's still busy, its job is killed and the
+# restart proceeds anyway, by default. Pass -e spur_skip_busy_agents=true to
+# opt OUT of that and leave busy nodes untouched instead, continuing with the
+# rest of the fleet:
+#   ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true
+#
+# Agents get spur.conf too now (spurd reads it best-effort for [cluster]/k0s
+# and [devices]/GRES settings). A missing spur.conf is always written; an
+# existing one is left alone unless you pass -e spur_overwrite_conf=true.
 
 - name: Preflight + install Spur on all hosts
   # Accounting is embedded in spurctld now — a dedicated (non-controller/non-agent)
@@ -17,13 +34,28 @@
   # included here (spur_accounting role handles it independently). Login nodes DO
   # need the CLI binaries, so they're included (the group is empty by default,
   # making login nodes opt-in).
-  hosts: "spur_controllers:spur_agents:spur_login"
+  #
+  # Split strict/lenient by `hosts:` (not a templated any_errors_fatal) because
+  # ansible-core does not honor a Jinja-templated any_errors_fatal alongside
+  # ignore_unreachable — it stays fatal regardless of the resolved value. Each
+  # variant below uses a static literal instead; only one ever matches hosts.
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if not (spur_ignore_unreachable_agents | default(false) | bool) else ':!all' }}"
   become: true
   gather_facts: yes
+  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  any_errors_fatal: true
+  roles:
+    - role: spur_install
+
+- name: Preflight + install Spur on all hosts (tolerate unreachable agents)
   # A down agent is skipped when spur_ignore_unreachable_agents=true; a down
   # controller is still caught by the strict "Start controller" play below.
-  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
-  any_errors_fatal: "{{ not (spur_ignore_unreachable_agents | default(false) | bool) }}"
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if (spur_ignore_unreachable_agents | default(false) | bool) else ':!all' }}"
+  become: true
+  gather_facts: yes
+  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  ignore_unreachable: true
+  any_errors_fatal: false
   roles:
     - role: spur_install
 
@@ -42,57 +74,119 @@
   roles:
     - role: spur_wireguard
 
-- name: Deploy accounting stack (PostgreSQL) on the accounting host
-  # Runs BEFORE the controllers so Postgres is reachable when spurctld starts and
-  # first tries to connect its embedded accounting service. Accounting is a single
-  # database for the whole cluster; Postgres runs on spur_accounting_host (default:
-  # first controller, but may be any managed host incl. a dedicated node). Every
-  # controller connects to it directly over the network. Set
-  # spur_accounting_enabled=false to skip the stack entirely.
-  hosts: "{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
+- name: Deploy accounting, start controllers, configure login nodes
+  # Merged into one play: a play runs its role list as a sequence of tasks
+  # across ALL matching hosts (role N finishes on every host before role N+1
+  # starts), so per-role `when:` gating on this union of hosts preserves the
+  # original ordering (accounting up before controllers connect to it; login
+  # reads each controller's spur_controller_listen_ip, set via delegate_facts
+  # inside the controller role, which has already run by then).
+  hosts: >-
+    {{ (groups['spur_controllers'] + groups.get('spur_login', []) +
+        [spur_accounting_host | default(groups['spur_accounting_node'][0]
+          if (groups['spur_accounting_node'] | default([]) | length > 0)
+          else groups['spur_controllers'][0])]) | unique | join(':') }}
   become: true
   gather_facts: yes
+  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   any_errors_fatal: true
   roles:
-    # No role-level `when` here: spur_accounting's pre-merge spurdbd cleanup tasks
-    # are intentionally unconditional (see the role's tasks/main.yml), and a
-    # role-level `when` would AND itself onto every task in the role, including
-    # those — gating happens per-task inside the role instead.
+    # No role-level `when` on spur_accounting itself here: its pre-merge
+    # spurdbd cleanup tasks are intentionally unconditional (see the role's
+    # tasks/main.yml) — gating happens per-task inside the role instead. The
+    # `when` below only decides WHICH host runs the role at all.
     - role: spur_accounting
-
-- name: Start controller
-  hosts: spur_controllers
-  become: true
-  gather_facts: no
-  any_errors_fatal: true
-  roles:
+      when: >-
+        inventory_hostname == (spur_accounting_host | default(groups['spur_accounting_node'][0]
+          if (groups['spur_accounting_node'] | default([]) | length > 0)
+          else groups['spur_controllers'][0]))
     - role: spur_controller
+      when: inventory_hostname in groups['spur_controllers']
+    # Login (submission) nodes: opt-in via the [spur_login] inventory group
+    # (empty -> matches nothing here and no-ops). No daemon runs here — just
+    # the CLI (installed above) + the client env pointing at the controllers.
+    - role: spur_login
+      when: inventory_hostname in groups.get('spur_login', [])
 
 - name: Start agents
-  hosts: spur_agents
-  become: true
-  gather_facts: no
-  # Agents only: optionally skip unreachable ones (see spur_ignore_unreachable_agents).
-  any_errors_fatal: "{{ not (spur_ignore_unreachable_agents | default(false) | bool) }}"
-  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
-  serial: 0      # parallel
-  roles:
-    - role: spur_agent
-
-# Login (submission) nodes: opt-in via the [spur_login] inventory group (empty ->
-# this play matches zero hosts and no-ops). No daemon runs here — just the CLI
-# (installed above) + the client env pointing at the controllers. Runs after the
-# controllers so SPUR_CONTROLLER_ADDR points at a live control plane.
-- name: Configure login (submission) nodes
-  hosts: spur_login
+  # Same strict/lenient split as the install play above, and for the same
+  # reason: a templated any_errors_fatal does not combine correctly with
+  # ignore_unreachable in ansible-core.
+  hosts: "spur_agents{{ '' if not (spur_ignore_unreachable_agents | default(false) | bool) else ':!all' }}"
   become: true
   gather_facts: no
   any_errors_fatal: true
+  serial: 0      # parallel
+  vars: &deploy_agents_vars
+    dckj_action: deploy
+    dckj_skip_busy: "{{ spur_skip_busy_agents | default(false) | bool }}"
+    # Full convergence is deploy.yml's whole contract (see header comment) — a
+    # busy node is drained and, if still busy, force-killed by default. Skip is
+    # the opt-OUT here, not force the opt-in, unlike rolling_upgrade/teardown.
+    dckj_force_busy: "{{ not (spur_skip_busy_agents | default(false) | bool) }}"
+    # Unused here: force is deploy.yml's default, so the shared file's refusal
+    # branch (the only place this is read) can never trigger.
+    dckj_force_flag: ""
+  pre_tasks: &deploy_agents_pre_tasks
+    - name: Resolve this node's registered name
+      ansible.builtin.set_fact:
+        spur_node_name: "{{ spur_node_name | default(ansible_hostname | default(inventory_hostname)) }}"
+
+    # One query for the whole fleet instead of one delegate_to call per agent —
+    # `spur show node` with NO name argument lists every registered node, so a
+    # single run_once here is enough for every host to check itself against
+    # the cached list below (a name argument, even a bogus one, filters
+    # server-side to just that name — do not add one here).
+    - name: Query full node registration list once for the whole fleet
+      ansible.builtin.command: "{{ spur_install_dir }}/spur show node"
+      delegate_to: "{{ groups['spur_controllers'][0] }}"
+      run_once: true
+      register: deploy_all_nodes
+      changed_when: false
+      failed_when: false
+
+    # A brand-new agent (first-ever deploy) was never registered, so there is no
+    # running job to protect and draining it would just error against an
+    # unknown node name — only guard agents that already exist in the cluster.
+    - name: Is this node already registered with the controller?
+      ansible.builtin.set_fact:
+        deploy_agent_registered: "{{ ('NodeName=' + spur_node_name) in (deploy_all_nodes.stdout_lines | default([])) }}"
+
+    - name: Drain + guard already-registered agents against job loss
+      ansible.builtin.include_tasks: tasks/drain_and_guard_agent.yml
+      when: deploy_agent_registered
   roles:
-    - role: spur_login
+    - role: spur_agent
+      when: >-
+        not deploy_agent_registered or
+        not (spur_node_busy | default(false)) or
+        dckj_force_busy
+  post_tasks: &deploy_agents_post_tasks
+    - name: Re-register + undrain the node now that it's back
+      ansible.builtin.include_tasks: tasks/resume_and_undrain_agent.yml
+      when: deploy_agent_registered
+
+- name: Start agents (tolerate unreachable agents)
+  hosts: "spur_agents{{ '' if (spur_ignore_unreachable_agents | default(false) | bool) else ':!all' }}"
+  become: true
+  gather_facts: no
+  ignore_unreachable: true
+  any_errors_fatal: false
+  serial: 0      # parallel
+  vars: *deploy_agents_vars
+  pre_tasks: *deploy_agents_pre_tasks
+  roles:
+    - role: spur_agent
+      when: >-
+        not deploy_agent_registered or
+        not (spur_node_busy | default(false)) or
+        dckj_force_busy
+  post_tasks: *deploy_agents_post_tasks
 
 - name: Verify with test jobs
-  hosts: spur_controllers[0]
+  # Opt-in (see spur_verify_enabled) — submits a real job, so it's off by
+  # default for routine deploys and enabled explicitly in CI.
+  hosts: "spur_controllers[0]{{ '' if (spur_verify_enabled | default(false) | bool) else ':!all' }}"
   become: true
   gather_facts: no
   roles:

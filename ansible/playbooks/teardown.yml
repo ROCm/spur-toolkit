@@ -2,18 +2,52 @@
 # Stop all Spur daemons. Leaves binaries and state in place.
 #   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini
 #
-# Add -e wipe=true to also wipe ~/spur and /etc/wireguard/spur0.* (destructive).
+# Add -e wipe=true to also wipe ~/spur and /etc/wireguard/spur0.conf (destructive).
+#
+# Skip agents unreachable over SSH (default false = strict):
+#   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_ignore_unreachable_agents=true
+#
+# An agent with a job still running is drained first; if it doesn't finish
+# draining, teardown aborts for that host by default rather than silently
+# killing the job. Re-run with -e spur_skip_busy_agents=true to leave busy
+# agents running and tear down the rest of the fleet, or with
+# -e spur_force_teardown_busy_agents=true to kill the running job and tear
+# it down anyway:
+#   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_force_teardown_busy_agents=true
 
-- name: Stop Spur daemons
-  # Include the accounting host too, in case it is a dedicated node not in either
-  # group — this also cleans up a standalone spurdbd left over from a pre-merge
-  # deployment (accounting is embedded in spurctld now, no separate daemon).
-  # Login nodes are included so their WireGuard interface is torn down too (they
-  # run no daemon, so the systemd/pkill steps are harmless no-ops there).
-  hosts: "spur_controllers:spur_agents:spur_login:{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
+- name: Stop Spur daemons — agents
+  # Agents are drained first, while the controller is still up — the drain
+  # guard needs a live controller to query/update node state. This MUST run
+  # before the controllers play below, which stops spurctld; draining after
+  # the controller is already dead would just fail to connect.
+  hosts: spur_agents
   become: true
-  gather_facts: no
-  tasks:
+  gather_facts: yes
+  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
+  vars:
+    <<: &spur_teardown_vars
+      dckj_action: teardown
+      dckj_skip_busy: "{{ spur_skip_busy_agents | default(false) | bool }}"
+      dckj_force_busy: "{{ spur_force_teardown_busy_agents | default(false) | bool }}"
+      dckj_force_flag: spur_force_teardown_busy_agents
+    spur_teardown_is_agent_play: true
+  tasks: &spur_teardown_tasks
+    # Only in THIS play, and only for hosts that are actually agents — a host
+    # that's both a controller and an agent (spur_controller_runs_agent) would
+    # otherwise get drain-guarded twice (once per play), and the second
+    # attempt would try to drain a node already deregistered by the first.
+    - name: Drain + guard the agent daemon against job loss before tearing it down
+      ansible.builtin.include_tasks: tasks/drain_and_guard_agent.yml
+      when: spur_teardown_is_agent_play and (inventory_hostname in groups['spur_agents'])
+
+    - name: Determine whether it's safe to disrupt this host
+      ansible.builtin.set_fact:
+        spur_ok_to_disrupt: >-
+          {{ (inventory_hostname not in groups['spur_agents']) or
+             not (spur_node_busy | default(false)) or
+             dckj_force_busy }}
+
     - name: Stop and disable Spur systemd services
       ansible.builtin.systemd:
         name: "{{ item }}"
@@ -24,6 +58,7 @@
         - spurctld
         - spurdbd
       failed_when: false
+      when: spur_ok_to_disrupt
 
     - name: Reap any stray daemons started outside systemd (exact-name match)
       ansible.builtin.shell: |
@@ -39,6 +74,7 @@
       args:
         executable: /bin/bash
       changed_when: false
+      when: spur_ok_to_disrupt
 
     - name: Tear down WireGuard interface
       ansible.builtin.shell: |
@@ -47,7 +83,7 @@
         fi
       args:
         executable: /bin/bash
-      when: spur_transport == 'wireguard'
+      when: spur_transport == 'wireguard' and spur_ok_to_disrupt
       changed_when: false
 
     - name: Wipe state (only when -e wipe=true)
@@ -57,4 +93,31 @@
       loop:
         - "{{ spur_home }}"
         - "/etc/wireguard/{{ spur_wg_interface }}.conf"
-      when: wipe | default(false) | bool
+      when: (wipe | default(false) | bool) and spur_ok_to_disrupt
+
+    - name: Note this host was left untouched (still has a running job)
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: still has a running job — left untouched
+          (spur_skip_busy_agents=true). Re-run teardown once the job finishes,
+          or with -e spur_force_teardown_busy_agents=true to kill it now.
+      when: not spur_ok_to_disrupt
+
+- name: Stop Spur daemons — controllers, login nodes, accounting host
+  # Include the accounting host too, in case it is a dedicated node not in either
+  # group — this also cleans up a standalone spurdbd left over from a pre-merge
+  # deployment (accounting is embedded in spurctld now, no separate daemon).
+  # Login nodes are included so their WireGuard interface is torn down too (they
+  # run no daemon, so the systemd/pkill steps are harmless no-ops there). Runs
+  # after the agents play above, which needs the controller alive to drain.
+  hosts: "spur_controllers:spur_login:{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
+  become: true
+  # Needed for ansible_hostname — the drain guard below resolves spur_node_name
+  # from it (same as deploy.yml/rolling_upgrade.yml) so `spur node drain` gets
+  # the actual registered name, not the inventory alias.
+  gather_facts: yes
+  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  vars:
+    <<: *spur_teardown_vars
+    spur_teardown_is_agent_play: false
+  tasks: *spur_teardown_tasks

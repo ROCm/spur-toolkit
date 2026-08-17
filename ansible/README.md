@@ -43,7 +43,7 @@ ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=
 A few things to know:
 
 - **Where Postgres runs:** by default (no `spur_accounting_host` set) it runs on the **first controller**, which is fine for most clusters. See [Accounting](#accounting-postgresql-embedded-in-spurctld) for the dedicated-node inventory layout and details.
-- **The run ends with a test job.** Check the `spur nodes` output and job stdout near the end.
+- **Verify with a real test job is opt-in** (`-e spur_verify_enabled=true`) — off by default so routine deploys don't add job noise; check `spur nodes` yourself, or enable it to have the playbook submit and confirm one.
 - **Your real inventory is git-ignored** (see `.gitignore`) — only `inventory/*.example.ini` templates are tracked.
 
 | Shape | Inventory pattern | Transport |
@@ -54,7 +54,7 @@ A few things to know:
 | HA — multi-controller Raft | **≥ 3 hosts** in `spur_controllers` (any number in `spur_agents`); auto-enabled | direct or wireguard |
 | HA — separate compute | `spur_controllers` and `spur_agents` are **disjoint** host sets | direct or wireguard |
 
-`deploy.yml` is idempotent — re-running it on a healthy cluster re-applies config and restarts daemons.
+`deploy.yml` is idempotent — re-running it on a healthy cluster re-applies controller config and restarts daemons. Agent `spur.conf` is preserved instead of re-applied (see [below](#variables-defaults-in-inventorygroup_varsallyml)), unless you pass `-e spur_overwrite_conf=true`.
 
 **Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Login nodes](#login-submission-nodes) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Admin operations](#admin-operations) · [Tear down](#tear-down) · [Troubleshooting](#troubleshooting)
 
@@ -81,6 +81,8 @@ A local build produces three binaries under `target/release/`:
 Release and nightly tarballs from [ROCm/spur](https://github.com/ROCm/spur/releases) also ship `lib/spur/spur_mpi_pmix.so`. The playbooks install it on **agents only** at `/usr/lib/spur/` (matches `spurd`'s default plugin path). For a local build, also run `cargo build --release -p spur-mpi-pmix` and stage `target/release/libspur_mpi_pmix.so` (or rename to `spur_mpi_pmix.so`) in `spur_binary_src`. PMIx jobs (`--mpi=pmix`) additionally require `libpmix` and Open MPI on agent hosts — the playbooks do not install those packages.
 
 > A pre-merge build (before upstream folded `spurdbd` into `spurctld`) also produces a `spurdbd` binary. It's harmless sitting alongside the other three — the role only ever reads `spur`/`spurctld`/`spurd` by exact name.
+
+**Each host only gets the binaries it needs.** Agent-only hosts (in `[spur_agents]` but not `[spur_controllers]`/`[spur_login]`) get `spurd` only — no `spur` CLI, no `spurctld`, no Slurm symlinks. Controllers get `spur` + `spurctld` + symlinks (and `spurd` too if also an agent); login nodes get `spur` + symlinks. This keeps compute nodes free of an interactive CLI and the controller daemon they never run.
 
 Omit `spur_binary_src` and the playbook falls back to downloading a published release via upstream `install.sh` instead (see [Build prerequisites](#build-prerequisites)).
 
@@ -121,6 +123,7 @@ ansible-playbook playbooks/deploy.yml -i <inventory> -e spur_binary_src=<path> [
 | Preserve Raft state on re-deploy (production default) | `inventory/ha.ini` | `-e spur_wipe_state=false` |
 | One host only (e.g. re-push config to a single agent) | `inventory/multi.ini` | `--limit gpu-1` |
 | Dry-run without applying | `inventory/multi.ini` | `--check --diff` |
+| Large fleet, tolerate a few agents being down for maintenance | `inventory/multi.ini` | `-e spur_ignore_unreachable_agents=true` |
 
 ---
 
@@ -194,7 +197,7 @@ ctl-1 ansible_host=10.0.0.11 ansible_user=root
 ctl-2 ansible_host=10.0.0.12 ansible_user=root
 
 [spur_agents]
-gpu-1 ansible_host=10.0.0.21 ansible_user=root   ; dedicated compute — no spurctld here
+gpu-1 ansible_host=10.0.0.21 ansible_user=root   ; dedicated compute — no spurctld, no spur CLI/symlinks
 gpu-2 ansible_host=10.0.0.22 ansible_user=root
 ```
 
@@ -317,6 +320,16 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 | `spur_wipe_state` | `false` | Wipe `~/spur/state` (Raft job queue/registrations) on (re)deploy. Safe default for re-runs and upgrades; set `true` for a fresh install or intentional Raft reinit. |
 | `spur_force_reinstall` | `false` | Re-pull/re-copy binaries via `spur_install` even if already present. Used by `rolling_upgrade.yml`. |
 | `spur_rolling_batch_size` | `1` | Agents upgraded per batch in `rolling_upgrade.yml` (`serial`). Controllers always upgrade one at a time regardless. |
+| `spur_controller_upgrade_order` | inventory order | Comma-separated controller names — upgrade them in this order instead of `[spur_controllers]`'s inventory order. Must name every controller exactly once; `rolling_upgrade.yml` fails fast otherwise. |
+| `spur_ignore_unreachable_agents` | `false` | Skip agents unreachable over SSH instead of aborting — `deploy.yml`, `rolling_upgrade.yml`, `healthcheck.yml`, `teardown.yml`. Never loosens controller/accounting-host reachability. |
+| `spur_verify_enabled` | `false` | Submit and wait for a real test job at the end of `deploy.yml` / `rolling_upgrade.yml` (`spur_verify` role). Off by default to avoid job noise on routine runs; CI enables it as a smoke test. |
+| `spur_gather_subset` | `['!all', network, hardware, distribution]` | Facts subset gathered by every `gather_facts: yes` play. Restricts Ansible's default full gather (every mount/PCI device/interface) to just what the roles use. Set `-e spur_gather_subset=all` to fall back to full gathering. |
+| `spur_overwrite_conf` | `false` | Overwrite an agent's existing `spur.conf` instead of leaving it alone. Controllers always re-render theirs regardless. |
+| `spur_drain_wait_secs` | `120` | How long to wait for a node to reach `DRAINED`/`DOWN` before treating it as busy — used by `deploy.yml`, `teardown.yml`, `rolling_upgrade.yml`, and `remove_nodes.yml` via the shared drain guard. |
+| `spur_skip_busy_agents` | `false` | Leave a still-busy node untouched and continue with the rest of the fleet, instead of the playbook's default (refuse, or force for `deploy.yml`). Shared by `deploy.yml`, `teardown.yml`, `rolling_upgrade.yml`, `remove_nodes.yml`. |
+| `spur_force_teardown_busy_agents` | `false` | `teardown.yml`-specific: kill a busy node's running job and tear it down anyway. |
+| `spur_force_upgrade_busy_agents` | `false` | `rolling_upgrade.yml`-specific: kill a busy node's running job and upgrade it anyway. |
+| `spur_force_remove_busy_nodes` | `false` | `remove_nodes.yml`-specific: kill a busy node's running job and remove it anyway. |
 
 Override any of these per run with `-e key=value` (repeatable):
 
@@ -339,9 +352,17 @@ Two ways to roll out newer binaries. Pick based on whether the cluster can take 
 
 ### Full convergence (`deploy.yml`) — simplest, brief outage
 
-This is the simplest path. It's non-destructive by default: `spur_wipe_state=false` preserves job state and registrations. The catch is that it restarts **every** daemon on **every** host in the same play, with no batching. In-flight jobs are disrupted, and in HA all controllers bounce together and briefly lose the Raft leader.
+This is the simplest path. It's non-destructive by default: `spur_wipe_state=false` preserves job state and registrations. The catch is that it restarts **every** daemon on **every** host in the same play, with no batching, and in HA all controllers bounce together and briefly lose the Raft leader.
 
 Reach for it when you're making a topology change — migrating off `spurdbd`, adding or removing hosts — or when a short full-cluster blip is acceptable.
+
+An already-registered agent with a job still running is drained first; if it's still busy afterward, its job is killed and the restart proceeds anyway — full convergence is the point of this playbook. Opt out with `-e spur_skip_busy_agents=true` to leave busy agents untouched instead and deploy the rest of the fleet:
+
+```bash
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true   # leave busy agents untouched, deploy the rest
+```
+
+Agents get `spur.conf` too (the same file controllers get — `spurd` reads it best-effort for `[cluster]`/k0s and `[devices]`/GRES settings). A missing one is always written; an existing one is left alone unless you pass `-e spur_overwrite_conf=true`.
 
 ```bash
 cargo build --release -p spur-cli -p spurctld -p spurd   # rebuild all three together, see caveat below
@@ -369,11 +390,20 @@ It reuses the same `spur_install`/`spur_controller`/`spur_agent`/`spur_verify` r
 1. **Guard rail.** Refuses to start if `spur_wipe_state=true`, if `spur_transport=wireguard` (this playbook doesn't support it yet), or if the cluster isn't already healthy (leader elected, `spur nodes` reachable).
 2. **Controllers, one at a time** (`serial: 1`; the whole run aborts on the first failure). For each: force-reinstall, restart `spurctld`, then wait on the existing HA-aware "wait for Raft leader" task as the health gate before moving to the next controller. Client-side failover keeps the rest serving while one is down, since every agent and CLI is pointed at *every* controller.
 3. **Agents, in configurable batches** (`spur_rolling_batch_size`, default `1`). For each node: `spur node drain <node>`, poll until `DRAINED` (once no running jobs are left), force-reinstall, restart `spurd`, wait for re-registration, then `scontrol update NodeName=<node> State=RESUME`.
-4. **Verify.** Submits a real test job at the end to confirm the upgraded cluster actually schedules work.
+4. **Verify** *(opt-in — `-e spur_verify_enabled=true`)*. Submits a real test job at the end to confirm the upgraded cluster actually schedules work. Off by default so routine upgrades don't add job noise; CI enables it.
 
 The same rebuild-all-three caveat from full convergence applies here too.
 
 `spur_rolling_batch_size` trades speed for blast radius. The default `1` disrupts at most one agent's capacity at a time; a higher value upgrades faster but drains more capacity concurrently.
+
+Controllers upgrade in inventory order by default. To upgrade them in a specific order instead — say, a known-stable Raft leader first — pass `-e spur_controller_upgrade_order=ctl-2,ctl-0,ctl-1`. It must name every controller in `[spur_controllers]` exactly once; the guard-rail play fails fast (before touching any host) if a name is missing, misspelled, or duplicated.
+
+A still-busy node that doesn't drain within `spur_drain_wait_secs` (default `120s`) aborts the run by default. Opt out per node or force through it:
+
+```bash
+ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_skip_busy_agents=true         # leave busy agents on the old build, upgrade the rest
+ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_force_upgrade_busy_agents=true  # kill the running job and upgrade it anyway
+```
 
 > A single-controller cluster has no other controller to fail over to during its own restart, so rolling it is still a short outage. Real zero-downtime needs HA — three or more controllers.
 
@@ -448,12 +478,20 @@ ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_r
 
 Use the names as they appear in `spur nodes`. Afterward, **delete those hosts from `[spur_agents]` in your inventory** — otherwise a later `deploy.yml` will re-add them. The playbook prints this reminder when it finishes.
 
+A node with a job still running does not finish draining — same job-safety model as `deploy.yml`/`rolling_upgrade.yml`/`teardown.yml`. By default the run aborts before removing anything:
+
+```bash
+ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4 -e spur_skip_busy_agents=true         # remove only the nodes that drained cleanly, leave busy ones in the cluster
+ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4 -e spur_force_remove_busy_nodes=true   # kill the running job and remove it anyway
+```
+
 ### Health check — `healthcheck.yml`
 
 Read-only cluster diagnostics. It checks that daemons are active, the controller is reachable with a leader elected, accounting/Postgres is up, agent ports are listening, and disk/Raft-state size is healthy. It never changes anything. If something's wrong it exits non-zero with a per-host problem list, which makes it usable as a cron or monitoring probe.
 
 ```bash
 ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini
+ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini -e spur_ignore_unreachable_agents=true  # skip unreachable agents instead of aborting
 ```
 
 > **Partitions** aren't manageable this way yet. Spur has no runtime partition CLI (unlike Slurm's `scontrol create/update/delete partition`), so partition changes still mean editing the `[[partitions]]` blocks in the controller role's `spur.conf` template and re-running `deploy.yml`, which involves a brief controller restart. This is tracked upstream as a Spur feature request.
@@ -466,10 +504,18 @@ Two flavors — the plain one stops the cluster, the `wipe=true` one also erases
 
 ```bash
 ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini              # stop + disable daemons, remove units
-ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e wipe=true  # also rm -rf ~/spur
+ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e wipe=true  # also rm -rf ~/spur and /etc/wireguard/spur0.conf
+ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_ignore_unreachable_agents=true  # skip unreachable agents instead of aborting
 ```
 
-Either way it stops and disables the systemd services and reaps any stray daemons. It deliberately leaves PostgreSQL installed and your accounting database intact — so if you want those gone too, drop them by hand on the accounting host:
+Either way it stops and disables the systemd services and reaps any stray daemons. It deliberately leaves PostgreSQL installed and your accounting database intact — so if you want those gone too, drop them by hand on the accounting host.
+
+An agent with a job still running is drained first; if it doesn't finish draining, that host is left running rather than silently killing the job:
+
+```bash
+ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true            # leave busy agents running, tear down the rest
+ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_force_teardown_busy_agents=true  # kill the running job and tear it down anyway
+```
 
 ```bash
 sudo -u postgres dropdb spur
@@ -485,7 +531,7 @@ A field guide to things you might see while running or operating a cluster — m
 | Symptom | What's going on |
 |---|---|
 | `spurctld` logs an `ERROR` on restart — `Can not initialize last_log_id=... vote=...:committed` | Harmless — normal on any restart with existing Raft state. Judge health from `spur nodes` / jobs / `sacct`, not this line. |
-| `spurd` logs `failed to load spur.conf ... /etc/spur/spur.conf` on startup | Harmless — `spurd` is configured entirely via CLI flags and never reads a config file. Always present. |
+| `spurd` logs `failed to load spur.conf` on startup | `spurd` loads `spur.conf` best-effort for the `[cluster]` (SPUR-managed k0s) and `[devices]` (GPU/GRES) sections; everything else it needs (controller, node name, ports) comes from CLI flags. This role writes `spur.conf` on agents too (same file controllers get), so this should only appear on a brand-new agent whose config hasn't rendered yet (e.g. mid-`add_nodes.yml`, before the next full `deploy.yml`/`rolling_upgrade.yml`) — harmless there, self-resolves on the next run. |
 | `invalid transition from Completed to Completed` after a multi-node job | Harmless — a follower's redundant terminal-state report, rejected by the leader. The job succeeded. |
 | `spur nodes` shows fewer rows than I have hosts | It collapses by partition — the NODES column is a count, not one row per host. Use `spur show node <name>` to check a specific host. |
 | Playbook fails during the accounting apt install with a dpkg-lock error | Another `apt`/unattended-upgrade is running. Wait for it to finish (don't force-clear the lock unless `apt-get` is genuinely hung). |

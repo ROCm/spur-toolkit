@@ -66,6 +66,24 @@ spur_force_reinstall: false
 # DB, so those plays stay strict regardless of this flag.
 spur_ignore_unreachable_agents: false
 
+# Submit a real test job at the end of deploy.yml / rolling_upgrade.yml to
+# verify the cluster actually schedules work (spur_verify role). Default false
+# so routine deploys/upgrades don't add job noise to a live cluster; CI enables
+# it explicitly (-e spur_verify_enabled=true) as a smoke test.
+spur_verify_enabled: false
+
+# Facts subset gathered by every gather_facts:yes play and by spur_controller's
+# on-demand per-agent gather. The roles only ever consume ansible_hostname,
+# ansible_processor_vcpus, ansible_memtotal_mb, ansible_default_ipv4.address,
+# and ansible_os_family — the default full gather also enumerates every mount,
+# PCI device, and interface, which is slow on HPC compute nodes with many NFS
+# mounts. Override with -e spur_gather_subset=all to fall back to full gathering.
+spur_gather_subset:
+  - '!all'
+  - network
+  - hardware
+  - distribution
+
 # Logging
 spur_log_level: info
 
