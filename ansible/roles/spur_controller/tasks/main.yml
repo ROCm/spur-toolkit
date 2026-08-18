@@ -33,6 +33,12 @@
       {{ hostvars[acct_host].spur_wg_address if spur_transport == 'wireguard'
          else (hostvars[acct_host].ansible_host
                | default(hostvars[acct_host].ansible_default_ipv4.address)) }}
+  # delegate_facts (not a plain set_fact) so this is a real hostvar on every
+  # controller, readable via hostvars[] from ANY host/play — including the
+  # spur_agent role's spur.conf render, which runs in a later, separate play.
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_controllers'] }}"
   run_once: true
   when:
     - spur_accounting_enabled | bool
@@ -54,6 +60,9 @@
 - name: Preserve accounting IP from live spur.conf
   ansible.builtin.set_fact:
     spur_accounting_listen_ip: "{{ spur_conf_acct_ip.stdout | trim }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_controllers'] }}"
   run_once: true
   when:
     - spur_accounting_enabled | bool
@@ -68,6 +77,9 @@
       {{ hostvars[acct_host].spur_wg_address if spur_transport == 'wireguard'
          else (hostvars[acct_host].ansible_host
                | default(hostvars[acct_host].ansible_default_ipv4.address)) }}
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_controllers'] }}"
   run_once: true
   when:
     - spur_accounting_enabled | bool
@@ -85,6 +97,7 @@
 # spur.conf is still rendered with the last-known or 0-fallback values for that node.
 - name: Gather facts for any agent missing them (needed for spur.conf [[nodes]] block)
   ansible.builtin.setup:
+    gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   delegate_to: "{{ item }}"
   delegate_facts: true
   loop: "{{ groups['spur_agents'] }}"
@@ -143,10 +156,6 @@
     dest: /etc/systemd/system/spurctld.service
     mode: "0644"
   register: spurctld_unit
-
-- name: Reload systemd so the unit is picked up
-  ansible.builtin.systemd:
-    daemon_reload: true
 
 # openraft ignores config peers after first init and uses the persisted
 # membership, so a changed controller set can't take effect on restart.
@@ -217,6 +226,7 @@
 - name: Enable and (re)start spurctld
   ansible.builtin.systemd:
     name: spurctld
+    daemon_reload: true
     enabled: true
     state: "{{ 'started' if (spur_controller_skip_restart | default(false) | bool) else 'restarted' }}"
 

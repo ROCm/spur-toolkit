@@ -28,6 +28,18 @@
     msg: "{{ spur_verify_wait.stdout }}"
   when: spur_verify_wait.rc != 0
 
+# Job output lands in spur_home (spurd's WorkingDirectory); sticky 1777 (like
+# /tmp) lets the submit user write there without letting users clobber each other's files.
+- name: Make spur_home writable for the job-submission user on every agent
+  ansible.builtin.file:
+    path: "{{ spur_home }}"
+    mode: "1777"
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['spur_agents'] }}"
+  when: spur_verify_submit_user is defined
+  ignore_unreachable: true
+  ignore_errors: true
+
 - name: Show spur nodes
   ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
   register: nodes_out
@@ -56,18 +68,25 @@
         #SBATCH --ntasks-per-node=1
         echo "node $SPUR_TASK_OFFSET of $SPUR_NUM_NODES on $(hostname); peers=$SPUR_PEER_NODES"
 
+# spur_verify_submit_user: submit as this user instead of whoever the play is
+# already running as (root, by default, since that's what deploys/upgrades
+# need). Newer spurd builds refuse a job submitted by uid 0 unless
+# [auth] allow_root_jobs=true, so anything that runs this role as root needs
+# either that config set or a real unprivileged submitter — set this var to
+# the latter. Left unset, behavior is unchanged (submits as the play's user).
 - name: Submit single-node test job
   ansible.builtin.shell: |
     cd {{ spur_home }}
     {{ spur_install_dir }}/spur submit /tmp/spur-test-single.sh | grep -oE '[0-9]+'
   args:
     executable: /bin/bash
+  become_user: "{{ spur_verify_submit_user | default(omit) }}"
   register: single_jobid
   changed_when: true
 
 - name: Wait for single-node job {{ single_jobid.stdout }} to finish
   ansible.builtin.shell: |
-    for i in $(seq 1 30); do
+    for i in $(seq 1 60); do
       st=$({{ spur_install_dir }}/spur show job {{ single_jobid.stdout }} 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
       case "$st" in
         COMPLETED|FAILED|CANCELLED|TIMEOUT|NODE_FAIL) echo "$st"; exit 0 ;;
@@ -95,8 +114,12 @@
   loop: "{{ groups['spur_agents'] }}"
   register: single_outs
   changed_when: false
-  # Best-effort output lookup; skip agents that are down.
+  # Best-effort output lookup; skip agents that are down. ignore_unreachable
+  # alone doesn't reliably suppress an UNREACHABLE delegate_to target from
+  # still counting toward the play's overall failed/exit-code stats — pair it
+  # with ignore_errors so a down agent here can never fail the whole run.
   ignore_unreachable: true
+  ignore_errors: true
 
 - name: Set single_out to first non-empty result
   ansible.builtin.set_fact:
@@ -112,6 +135,7 @@
     {{ spur_install_dir }}/spur submit /tmp/spur-test-multi.sh | grep -oE '[0-9]+'
   args:
     executable: /bin/bash
+  become_user: "{{ spur_verify_submit_user | default(omit) }}"
   register: multi_jobid
   when: groups['spur_agents'] | length > 1
   changed_when: true
@@ -151,7 +175,10 @@
   when: groups['spur_agents'] | length > 1
   changed_when: false
   failed_when: false
+  # See the single-node fetch above — ignore_errors is needed alongside
+  # ignore_unreachable for a delegate_to target that's actually down.
   ignore_unreachable: true
+  ignore_errors: true
 
 - name: Show multi-node outputs
   ansible.builtin.debug:

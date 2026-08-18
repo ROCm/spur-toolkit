@@ -1,34 +1,23 @@
 ---
-- name: Preflight — check required commands
-  ansible.builtin.shell: "command -v {{ item }}"
-  args:
-    executable: /bin/bash
-  register: pf_cmd
-  changed_when: false
-  failed_when: pf_cmd.rc != 0
-  loop:
-    - curl
-    - tar
-    - bash
+- name: Determine which Spur components this host needs
+  ansible.builtin.set_fact:
+    spur_needs_cli: "{{ inventory_hostname in groups['spur_controllers'] or inventory_hostname in groups.get('spur_login', []) }}"
+    spur_needs_ctld: "{{ inventory_hostname in groups['spur_controllers'] }}"
+    spur_needs_agent_bin: "{{ inventory_hostname in groups['spur_agents'] }}"
 
-- name: Preflight — detect existing Spur daemons (informational)
+# One round-trip for everything read-only up front (commands present,
+# already-running daemons, port conflicts, existing install marker, PATH) plus
+# the directory layout every host needs before binaries land.
+- name: Preflight — commands, daemons, ports, existing install, PATH, directory layout
   ansible.builtin.shell: |
     set +e
+    for c in curl tar bash; do
+      command -v "$c" >/dev/null 2>&1 || { echo "missing required command: $c"; exit 1; }
+    done
     for p in spurctld spurd spurrestd; do
       pid=$(pgrep -x "$p" 2>/dev/null | head -1)
       [ -n "$pid" ] && echo "$p running (PID $pid)"
     done
-    exit 0
-  register: pf_running
-  changed_when: false
-
-- name: Preflight — note any running daemons
-  ansible.builtin.debug:
-    msg: "{{ pf_running.stdout_lines | default(['no spur daemons running']) }}"
-
-- name: Preflight — fail if Spur ports are held by a non-Spur process
-  ansible.builtin.shell: |
-    set +e
     # ss -p prints "users:((\"<name>\",pid=...))" as the last column when run as root.
     # Any owner that is NOT spurctld/spurd/spurrestd on our ports is a conflict.
     bad=$(ss -tlnpH "( sport = :{{ spur_controller_port }} or sport = :{{ spur_agent_port }} or sport = :{{ spur_raft_port }} )" 2>/dev/null \
@@ -39,39 +28,28 @@
       echo "non-spur process(es) on spur ports: $bad"
       exit 1
     fi
+    [ -e "{{ spur_install_dir }}/{{ 'spur' if spur_needs_cli else 'spurd' }}" ] && echo MARKER_EXISTS
+    if grep -q "{{ spur_install_dir }}" /etc/environment 2>/dev/null; then
+      echo PATH_ALREADY_SET
+    else
+      sed -Ei 's#^PATH="(.*)"$#PATH="{{ spur_install_dir }}:\1"#' /etc/environment 2>/dev/null
+      echo PATH_UPDATED
+    fi
+    mkdir -p "{{ spur_home }}" "{{ spur_home }}/state" "{{ spur_home }}/log" "{{ spur_home }}/etc" "{{ spur_install_dir }}"
     exit 0
   args:
     executable: /bin/bash
-  register: pf_ports
-  changed_when: false
-  failed_when: pf_ports.rc != 0
+  register: pf_preflight
+  changed_when: "'PATH_UPDATED' in pf_preflight.stdout"
+  failed_when: pf_preflight.rc != 0
 
-- name: Create Spur directory layout
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: directory
-    mode: "0755"
-  loop:
-    - "{{ spur_home }}"
-    - "{{ spur_home }}/state"
-    - "{{ spur_home }}/log"
-    - "{{ spur_home }}/etc"
-    - "{{ spur_install_dir }}"
-
-# This role runs on every controller and agent, not just the accounting host —
-# a pre-merge deployment's binary push could have landed a spurdbd binary on any
-# of them (the old spur_install binary list included it), even though only the
-# accounting host ever ran it as a service. spur_accounting only cleans up the
-# systemd unit/process on the accounting host; sweep the stray binary everywhere.
-- name: Remove leftover spurdbd binary from a pre-merge deployment
-  ansible.builtin.file:
-    path: "{{ spur_install_dir }}/spurdbd"
-    state: absent
-
-- name: Check for existing spur binary
-  ansible.builtin.stat:
-    path: "{{ spur_install_dir }}/spur"
-  register: spur_bin_stat
+# An ignored-unreachable host (spur_ignore_unreachable_agents=true) still gets
+# a registered var here — its ansible "unreachable" result dict, which has no
+# stdout_lines — so gate on that flag instead of crashing on the missing attr.
+- name: Preflight — note any running daemons
+  ansible.builtin.debug:
+    msg: "{{ pf_preflight.stdout_lines | select('match', '^(spurctld|spurd|spurrestd) running') | list | default(['no spur daemons running']) }}"
+  when: not (pf_preflight.unreachable | default(false))
 
 # Two install sources:
 #   1. spur_binary_src (a directory on the Ansible control node holding pre-built
@@ -80,15 +58,16 @@
 #   2. upstream install.sh — downloads the latest published release.
 # Both are unconditional when spur_force_reinstall is set (rolling upgrades need
 # to overwrite an already-installed binary with a newer build of the same name).
+# Only the components this host role needs are copied (see spur_needs_*).
 - name: Copy pre-built Spur binaries from control node
   ansible.builtin.copy:
     src: "{{ spur_binary_src }}/{{ item }}"
     dest: "{{ spur_install_dir }}/{{ item }}"
     mode: "0755"
-  loop:
-    - spur
-    - spurctld
-    - spurd
+  loop: >-
+    {{ (['spur'] if spur_needs_cli else [])
+       + (['spurctld'] if spur_needs_ctld else [])
+       + (['spurd'] if spur_needs_agent_bin else []) }}
   when: spur_binary_src | default('') | length > 0
 
 - name: Install Spur via upstream installer
@@ -99,60 +78,59 @@
   args:
     executable: /bin/bash
   when:
+    - not (pf_preflight.unreachable | default(false))
     - spur_binary_src | default('') | length == 0
-    - (not spur_bin_stat.stat.exists) or (spur_force_reinstall | default(false) | bool)
+    - ('MARKER_EXISTS' not in (pf_preflight.stdout | default(''))) or (spur_force_reinstall | default(false) | bool)
   register: install_run
   changed_when: install_run.rc == 0
 
-- name: Verify spur binary is present
-  ansible.builtin.stat:
-    path: "{{ spur_install_dir }}/spur"
+# One exec handles all remaining binary/symlink housekeeping: drops the
+# pre-merge spurdbd binary and any component this host role doesn't need
+# (a host upgraded from an older role revision, or moved between inventory
+# groups, can carry binaries a prior run copied unconditionally), verifies
+# every needed binary is present, and (CLI hosts only) creates all 18
+# Slurm-compatible symlinks — or removes them on a host that doesn't need
+# the CLI. One round-trip instead of a stat-per-binary and a module-call-
+# per-symlink over the wire.
+- name: Remove unneeded binaries/symlinks, verify needed binaries, symlink Slurm-compatible CLI names
+  vars:
+    spur_needed_bins: >-
+      {{ (['spur'] if spur_needs_cli else [])
+         + (['spurctld'] if spur_needs_ctld else [])
+         + (['spurd'] if spur_needs_agent_bin else []) }}
+    spur_unneeded_bins: >-
+      {{ (['spurctld'] if not spur_needs_ctld else [])
+         + (['spur'] if not spur_needs_cli else [])
+         + (['spurd'] if not spur_needs_agent_bin else []) }}
+  ansible.builtin.shell: |
+    set -e
+    rm -f "{{ spur_install_dir }}/spurdbd"
+    {% for b in spur_unneeded_bins %}
+    rm -f "{{ spur_install_dir }}/{{ b }}"
+    {% endfor %}
+    for b in {{ spur_needed_bins | join(' ') }}; do
+      [ -f "{{ spur_install_dir }}/$b" ] || { echo "missing binary: $b"; exit 1; }
+    done
+    {% if spur_needs_cli %}
+    changed=0
+    for s in sbatch squeue sinfo scancel sacct sacctmgr scontrol salloc srun sattach scrontab sdiag smd sprio sreport sshare sstat strigger; do
+      link="{{ spur_install_dir }}/$s"
+      [ -L "$link" ] && [ "$(readlink "$link")" = "{{ spur_install_dir }}/spur" ] || changed=1
+      ln -sf "{{ spur_install_dir }}/spur" "$link"
+    done
+    [ "$changed" -eq 1 ] && echo SYMLINKS_UPDATED
+    {% else %}
+    for s in sbatch squeue sinfo scancel sacct sacctmgr scontrol salloc srun sattach scrontab sdiag smd sprio sreport sshare sstat strigger; do
+      rm -f "{{ spur_install_dir }}/$s"
+    done
+    {% endif %}
+    exit 0
+  args:
+    executable: /bin/bash
   register: spur_ver
-  failed_when: not spur_ver.stat.exists
-
-# Slurm-compatible entrypoints. The single `spur` multi-call binary dispatches
-# on argv[0], so these symlinks give users drop-in sbatch/squeue/etc. Created
-# regardless of install source (pre-built or upstream installer).
-- name: Symlink Slurm-compatible CLI names
-  ansible.builtin.file:
-    src: "{{ spur_install_dir }}/spur"
-    dest: "{{ spur_install_dir }}/{{ item }}"
-    state: link
-    force: true
-  loop:
-    - sbatch
-    - squeue
-    - sinfo
-    - scancel
-    - sacct
-    - sacctmgr
-    - scontrol
-    - salloc
-    - srun
-    - sattach
-    - scrontab
-    - sdiag
-    - smd
-    - sprio
-    - sreport
-    - sshare
-    - sstat
-    - strigger
+  changed_when: "'SYMLINKS_UPDATED' in spur_ver.stdout"
+  failed_when: spur_ver.rc != 0
 
 - name: Show install result
   ansible.builtin.debug:
     msg: "{{ inventory_hostname }}: spur binaries installed in {{ spur_install_dir }}"
-
-- name: Read remote /etc/environment
-  ansible.builtin.slurp:
-    src: /etc/environment
-  register: etc_environment
-  failed_when: false
-
-- name: Ensure ~/.local/bin is on PATH for non-interactive SSH sessions
-  ansible.builtin.lineinfile:
-    path: /etc/environment
-    backrefs: yes
-    regexp: '^PATH="(?!.*{{ spur_install_dir | regex_escape }})(.*)"$'
-    line: 'PATH="{{ spur_install_dir }}:\1"'
-  when: spur_install_dir not in (etc_environment.content | default('') | b64decode)

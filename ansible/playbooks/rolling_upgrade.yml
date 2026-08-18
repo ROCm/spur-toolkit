@@ -34,6 +34,15 @@
 # use when job disruption is acceptable (e.g. a maintenance window where you
 # know no production work is running, or when jobs are short/re-runnable):
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_force_upgrade_busy_agents=true
+#
+# Submit a real test job at the end to verify scheduling still works (default
+# false — off for routine upgrades, on in CI):
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_verify_enabled=true
+#
+# Upgrade controllers in a specific order instead of inventory order (still one
+# at a time — this only changes which one goes first/last, not the batching).
+# Must name every controller in [spur_controllers] exactly once:
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_controller_upgrade_order=ctl-2,ctl-0,ctl-1
 
 - name: Guard rails — refuse to start against a wipe-flagged or unhealthy cluster
   hosts: spur_controllers[0]
@@ -64,6 +73,18 @@
           rolling/drained batching.
       when: spur_transport == 'wireguard'
 
+    - name: Fail if spur_controller_upgrade_order doesn't name every controller exactly once
+      ansible.builtin.fail:
+        msg: >-
+          spur_controller_upgrade_order must name every controller in
+          [spur_controllers] exactly once (got: {{ spur_controller_upgrade_order }}).
+          Inventory has: {{ groups['spur_controllers'] | sort | join(',') }}.
+      vars:
+        requested_order: "{{ spur_controller_upgrade_order | split(',') | map('trim') | list }}"
+      when:
+        - spur_controller_upgrade_order | default('') | length > 0
+        - (requested_order | sort) != (groups['spur_controllers'] | sort)
+
     - name: Check the cluster is healthy before starting
       ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
       register: spur_pre_upgrade_health
@@ -78,6 +99,7 @@
   hosts: spur_controllers:spur_agents
   become: true
   gather_facts: yes
+  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   # ignore_unreachable: a temporarily down agent must not abort the whole upgrade.
   # The spur_controller role's setup task will re-attempt fact-gathering for any
   # agent still missing facts when spur.conf is re-rendered.
@@ -85,9 +107,13 @@
   tasks: []
 
 - name: Rolling upgrade — controllers, one at a time (preserves Raft quorum)
-  hosts: spur_controllers
+  # Custom order (validated above) if given, else natural inventory order.
+  hosts: >-
+    {{ (spur_controller_upgrade_order | default('') | split(',') | map('trim') | select | list)
+       or groups['spur_controllers'] }}
   become: true
   gather_facts: yes
+  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   serial: 1
   max_fail_percentage: 0
   roles:
@@ -105,205 +131,19 @@
   hosts: spur_agents
   become: true
   gather_facts: yes
+  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   serial: "{{ spur_rolling_batch_size | default(1) }}"
   # Skip unreachable agents when spur_ignore_unreachable_agents=true, else strict.
   ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   max_fail_percentage: "{{ 100 if (spur_ignore_unreachable_agents | default(false) | bool) else 0 }}"
+  vars:
+    dckj_action: upgrade
+    dckj_skip_busy: "{{ spur_skip_busy_agents | default(false) | bool }}"
+    dckj_force_busy: "{{ spur_force_upgrade_busy_agents | default(false) | bool }}"
+    dckj_force_flag: spur_force_upgrade_busy_agents
   pre_tasks:
-    # Reachability probe: ping actually connects, so an unreachable agent's
-    # result is registered unreachable (ignored via ignore_unreachable). A
-    # set_fact would NOT work here — it runs on the control node and "succeeds"
-    # even for a down host. The delegated drain/resume tasks gate on this so
-    # they skip cleanly for a skipped agent.
-    - name: Probe agent reachability
-      ansible.builtin.ping:
-      register: spur_agent_ping
-
-    # Default through inventory_hostname (always defined) so the delegated shell
-    # tasks below can template {{ spur_node_name }} even for an unreachable agent
-    # with no gathered facts — free-form shell args are finalized before `when`,
-    # so an undefined var would error despite the reachability gate.
-    - name: Resolve this node's registered name
-      ansible.builtin.set_fact:
-        spur_node_name: "{{ spur_node_name | default(ansible_hostname | default(inventory_hostname)) }}"
-
-    # Always drain, even for an agent that's unreachable over SSH: this is a
-    # controller-side command (delegate_to, no connection to the agent itself
-    # needed) and it's what actually stops the scheduler from still treating a
-    # down node as schedulable. Skipping it here would leave an unreachable
-    # agent sitting Idle in the scheduler's view until its heartbeat times out
-    # (default 90s) — long enough for the verify job below to be dispatched to
-    # a node that will never run it.
-    - name: Drain this node before touching its binaries
-      ansible.builtin.command: >-
-        {{ spur_install_dir }}/spur node drain {{ spur_node_name }}
-        --reason "ansible rolling upgrade"
-      delegate_to: "{{ groups['spur_controllers'][0] }}"
-      changed_when: true
-
-    # Draining stops new scheduling but lets running jobs finish on their own
-    # (DRAINING -> DRAINED); only proceed once the node reports fully drained.
-    # Also accept DOWN: an agent that's genuinely unreachable may independently
-    # cross its heartbeat timeout and flip to DOWN before (or instead of)
-    # settling on DRAINED, which is an equally valid "stopped scheduling here"
-    # outcome for our purposes.
-    - name: Wait for the node to fully drain
-      ansible.builtin.shell: |
-        for i in $(seq 1 {{ spur_drain_wait_secs | default(120) }}); do
-          st=$({{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
-               | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
-               | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
-          case "$st" in
-            DRAINED|DOWN) exit 0 ;;
-          esac
-          sleep 1
-        done
-        echo "timed out waiting for {{ spur_node_name }} to drain (last state: $st)"
-        exit 1
-      args:
-        executable: /bin/bash
-      delegate_to: "{{ groups['spur_controllers'][0] }}"
-      changed_when: false
-      # Non-fatal: an unreachable agent's exact state transition timing isn't
-      # guaranteed within this window, and a reachable-but-busy node (a job
-      # still running there) is a distinct, expected case handled below via
-      # spur_node_busy. The drain command above already told the scheduler to
-      # stop assigning new work here, which is what matters either way.
-      failed_when: false
-      register: spur_drain_wait
-
-    # Busy = reachable (drain wasn't skipped by unreachability) but the wait
-    # above didn't reach DRAINED/DOWN in time — i.e. a job is still running
-    # there. Draining never force-kills a running job, so this is expected,
-    # not an error; whether to proceed anyway is the operator's call below.
-    - name: Determine whether this node is busy (reachable but still draining)
-      ansible.builtin.set_fact:
-        spur_node_busy: "{{ (spur_drain_wait.rc | default(0) != 0) and not (spur_agent_ping.unreachable | default(false)) }}"
-
-    - name: Refuse to upgrade a busy node unless spur_skip_busy_agents=true or spur_force_upgrade_busy_agents=true
-      ansible.builtin.fail:
-        msg: >-
-          {{ spur_node_name }} still has a running job and did not drain
-          within {{ spur_drain_wait_secs | default(120) }}s. Rolling upgrade
-          never force-kills running work by default. Re-run with
-          -e spur_skip_busy_agents=true to leave busy nodes on their current
-          binary and continue upgrading the rest of the fleet, or with
-          -e spur_force_upgrade_busy_agents=true to upgrade immediately and
-          accept that running jobs will be marked NODE_FAIL.
-      when: >-
-        spur_node_busy and
-        not (spur_skip_busy_agents | default(false) | bool) and
-        not (spur_force_upgrade_busy_agents | default(false) | bool)
-
-    - name: Note busy node is being left on its current binary
-      ansible.builtin.debug:
-        msg: >-
-          {{ spur_node_name }} still has a running job — skipping its upgrade
-          (spur_skip_busy_agents=true) and resuming it as-is.
-      when: spur_node_busy and (spur_skip_busy_agents | default(false) | bool)
-
-    - name: Warn that running jobs WILL be killed (spur_force_upgrade_busy_agents=true)
-      ansible.builtin.debug:
-        msg: >-
-          WARNING: {{ spur_node_name }} still has a running job.
-          spur_force_upgrade_busy_agents=true — killing job processes now,
-          then proceeding with upgrade.
-      when: spur_node_busy and (spur_force_upgrade_busy_agents | default(false) | bool)
-
-    # Kill all workloads started by spur jobs before spurd restarts, so nothing
-    # lingers as an orphan consuming CPU/GPU/memory.
-    #
-    # Three layers, in order:
-    #
-    # 1. Container runtimes — if a job launched containers (Docker, containerd/nerdctl,
-    #    Podman, or any OCI runtime) those containers live under their own cgroup
-    #    subtree and are invisible to a plain cgroup.procs kill. Detect containers
-    #    whose cgroup ancestry includes a spur job cgroup and stop them via the
-    #    runtime's own CLI first, which cleanly tears down the network namespace,
-    #    volume mounts, and GPU device contexts before the kernel sees SIGKILL.
-    #
-    # 2. SIGTERM to surviving bare PIDs — catches any non-containerised processes
-    #    still in spur cgroups (MPI ranks, Python scripts, bare GPU processes, etc.)
-    #    and gives them 5s to flush/checkpoint.
-    #
-    # 3. SIGKILL to anything still alive after the grace period.
-    #
-    # All steps are best-effort (|| true / 2>/dev/null) — an already-empty cgroup
-    # (job finished during the drain wait) is silently skipped.
-    - name: Kill job processes and containers in spur cgroups before upgrade
-      ansible.builtin.shell: |
-        set -uo pipefail
-
-        # ── helper: collect all PIDs currently in spur job cgroups ──────────
-        spur_pids() {
-          find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null \
-            | xargs cat 2>/dev/null | sort -u
-        }
-
-        pids=$(spur_pids)
-        [ -z "$pids" ] && { echo "no spur job processes found, nothing to kill"; exit 0; }
-        echo "spur job PIDs before kill: $pids"
-
-        # ── 1. container runtime kills ───────────────────────────────────────
-        # For each spur job PID, walk /proc/<pid>/cgroup to find any container
-        # scope (docker-<id>.scope, cri-containerd-<id>.scope, libpod-<id>.scope).
-        # Then stop the container via whichever CLI is available.
-        container_ids=""
-        for pid in $pids; do
-          [ -f /proc/$pid/cgroup ] || continue
-          # Extract container IDs from cgroup paths for all known runtimes:
-          #   Docker/nerdctl : docker-<64hex>.scope
-          #   containerd CRI : cri-containerd-<64hex>.scope
-          #   Podman         : libpod-<64hex>.scope  or  machine.slice/.../libpod-...
-          #   generic OCI    : anything ending in -<64hex>.scope under a known scope dir
-          ids=$(grep -oE '(docker|cri-containerd|libpod)-([a-f0-9]{64})\.scope' \
-                  /proc/$pid/cgroup 2>/dev/null \
-                | grep -oE '[a-f0-9]{64}' || true)
-          container_ids="${container_ids} ${ids}"
-        done
-        container_ids=$(echo "$container_ids" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
-
-        if [ -n "$container_ids" ]; then
-          echo "found containers to kill: $container_ids"
-          for cid in $container_ids; do
-            short="${cid:0:12}"
-            # Try each runtime CLI in turn; skip silently if not installed.
-            if command -v docker &>/dev/null; then
-              docker kill "$short" 2>/dev/null && echo "docker kill $short: ok" || true
-            fi
-            if command -v nerdctl &>/dev/null; then
-              nerdctl kill "$short" 2>/dev/null && echo "nerdctl kill $short: ok" || true
-            fi
-            if command -v podman &>/dev/null; then
-              podman kill "$short" 2>/dev/null && echo "podman kill $short: ok" || true
-            fi
-            # containerd (crictl) — used by Kubernetes/containerd shim
-            if command -v crictl &>/dev/null; then
-              crictl stop "$short" 2>/dev/null && echo "crictl stop $short: ok" || true
-            fi
-          done
-          sleep 2
-        fi
-
-        # ── 2. SIGTERM to surviving bare PIDs ────────────────────────────────
-        pids=$(spur_pids)
-        if [ -n "$pids" ]; then
-          echo "sending SIGTERM to bare PIDs: $pids"
-          echo "$pids" | xargs kill -TERM 2>/dev/null || true
-          sleep 5
-        fi
-
-        # ── 3. SIGKILL to anything still alive ───────────────────────────────
-        pids=$(spur_pids)
-        if [ -n "$pids" ]; then
-          echo "sending SIGKILL to surviving PIDs: $pids"
-          echo "$pids" | xargs kill -KILL 2>/dev/null || true
-        fi
-
-        echo "kill sequence complete"
-      args:
-        executable: /bin/bash
-      when: spur_node_busy and (spur_force_upgrade_busy_agents | default(false) | bool)
+    - name: Drain + guard this node against job loss before touching its binaries
+      ansible.builtin.include_tasks: tasks/drain_and_guard_agent.yml
 
   roles:
     # Skipped for a busy node (spur_node_busy=true, opted in via
@@ -326,40 +166,13 @@
         (spur_force_upgrade_busy_agents | default(false) | bool)
 
   post_tasks:
-    - name: Wait for the node to re-register after the upgrade
-      ansible.builtin.shell: |
-        for i in $(seq 1 30); do
-          {{ spur_install_dir }}/spur show node {{ spur_node_name }} >/dev/null 2>&1 && exit 0
-          sleep 1
-        done
-        echo "{{ spur_node_name }} never re-registered after the upgrade"
-        exit 1
-      args:
-        executable: /bin/bash
-      delegate_to: "{{ groups['spur_controllers'][0] }}"
-      changed_when: false
-      # A skipped busy node was never touched (roles above didn't run for it),
-      # so spurd never restarted — there's nothing to wait for. A force-upgraded
-      # busy node DID have spurd restarted, so we do wait for re-registration.
-      when: >-
-        not (spur_agent_ping.unreachable | default(false)) and
-        (not (spur_node_busy | default(false)) or
-         (spur_force_upgrade_busy_agents | default(false) | bool))
-
-    # A drained node stays drained after spurd restarts — draining is server-side
-    # state, not tied to the agent process. Without this, upgraded capacity sits
-    # idle indefinitely. This also covers a skipped busy node: it's healthy and
-    # was only drained as part of attempting the upgrade, so put it back into
-    # service on its current binary.
-    - name: Resume the node (undrain) now that it's back
-      ansible.builtin.command: >-
-        {{ spur_install_dir }}/scontrol update NodeName={{ spur_node_name }} State=RESUME
-      delegate_to: "{{ groups['spur_controllers'][0] }}"
-      changed_when: true
-      when: not (spur_agent_ping.unreachable | default(false))
+    - name: Re-register + undrain the node now that it's back
+      ansible.builtin.include_tasks: tasks/resume_and_undrain_agent.yml
 
 - name: Verify the upgraded cluster still schedules work
-  hosts: spur_controllers[0]
+  # Opt-in (see spur_verify_enabled) — submits a real job, so it's off by
+  # default for routine upgrades and enabled explicitly in CI.
+  hosts: "spur_controllers[0]{{ '' if (spur_verify_enabled | default(false) | bool) else ':!all' }}"
   become: true
   gather_facts: no
   roles:

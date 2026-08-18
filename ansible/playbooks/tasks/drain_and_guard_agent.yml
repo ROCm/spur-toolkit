@@ -1,0 +1,120 @@
+---
+# Shared by rolling_upgrade.yml, deploy.yml, and teardown.yml: drains an agent,
+# waits for its running job (if any) to finish, and refuses to disrupt a still-
+# busy node unless the including play opted into skip or force. Sets
+# `spur_node_busy` for the caller's own role/task gating.
+#
+# Include with these vars already set by the caller:
+#   dckj_action      short verb for messages, e.g. "restart" / "teardown" / "upgrade"
+#   dckj_skip_busy   bool — leave a busy node untouched, continue with the rest
+#   dckj_force_busy  bool — kill running jobs on a busy node and proceed (may be
+#                    the caller's unconditional default, not necessarily an
+#                    explicit opt-in — see dckj_force_flag)
+#   dckj_force_flag  the -e flag name to mention in the REFUSAL message. Only
+#                    reachable when dckj_force_busy can be false (i.e. proceeding
+#                    isn't already the default) — see deploy.yml, where force is
+#                    the default and this branch never fires.
+
+- name: Probe agent reachability
+  ansible.builtin.ping:
+  register: spur_agent_ping
+
+- name: Resolve this node's registered name
+  ansible.builtin.set_fact:
+    spur_node_name: "{{ spur_node_name | default(ansible_hostname | default(inventory_hostname)) }}"
+
+# Always drain, even for an agent that's unreachable over SSH: this is a
+# controller-side command (delegate_to, no connection to the agent itself
+# needed) and it's what actually stops the scheduler from still treating a
+# down node as schedulable.
+#
+# "not found" is treated as success, same idiom remove_nodes.yml already uses
+# for `spur node remove` — a node can legitimately already be gone (e.g. a
+# prior remove_nodes.yml run, with the host still left in [spur_agents] by an
+# operator who hasn't updated inventory yet); there's nothing to drain and
+# nothing left to protect.
+- name: Drain this node before disrupting it
+  ansible.builtin.command: >-
+    {{ spur_install_dir }}/spur node drain {{ spur_node_name }}
+    --reason "ansible {{ dckj_action }}"
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  register: spur_drain_cmd
+  changed_when: "'not found' not in (spur_drain_cmd.stderr | default(''))"
+  failed_when:
+    - spur_drain_cmd.rc != 0
+    - "'not found' not in (spur_drain_cmd.stderr | default(''))"
+
+- name: Note the node is already gone from the cluster (nothing to drain)
+  ansible.builtin.set_fact:
+    spur_node_already_gone: "{{ spur_drain_cmd.rc != 0 }}"
+
+# Draining stops new scheduling but lets running jobs finish on their own
+# (DRAINING -> DRAINED); only proceed once the node reports fully drained.
+# Also accept DOWN: a genuinely unreachable agent may independently cross its
+# heartbeat timeout and flip to DOWN, an equally valid "stopped scheduling
+# here" outcome.
+- name: Wait for the node to fully drain
+  ansible.builtin.shell: |
+    for i in $(seq 1 {{ spur_drain_wait_secs | default(120) }}); do
+      st=$({{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
+           | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
+           | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
+      case "$st" in
+        DRAINED|DOWN) exit 0 ;;
+      esac
+      sleep 1
+    done
+    echo "timed out waiting for {{ spur_node_name }} to drain (last state: $st)"
+    exit 1
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  changed_when: false
+  # Non-fatal: a reachable-but-busy node (a job still running there) is a
+  # distinct, expected case handled below via spur_node_busy, not an error.
+  failed_when: false
+  register: spur_drain_wait
+  when: not spur_node_already_gone
+
+# Busy = reachable (drain wasn't skipped by unreachability or already being
+# gone) but the wait above didn't reach DRAINED/DOWN in time — i.e. a job is
+# still running there. Draining never force-kills a running job, so this is
+# expected.
+- name: Determine whether this node is busy (reachable but still draining)
+  ansible.builtin.set_fact:
+    spur_node_busy: >-
+      {{ (not spur_node_already_gone)
+         and (spur_drain_wait.rc | default(0) != 0)
+         and not (spur_agent_ping.unreachable | default(false)) }}
+
+- name: Refuse to disrupt a busy node unless skip or force is set
+  ansible.builtin.fail:
+    msg: >-
+      {{ spur_node_name }} still has a running job and did not drain within
+      {{ spur_drain_wait_secs | default(120) }}s. This {{ dckj_action }} never
+      force-kills running work by default. Re-run with
+      -e spur_skip_busy_agents=true to leave busy nodes untouched and continue
+      with the rest of the fleet, or with -e {{ dckj_force_flag }}=true to
+      proceed immediately and accept that the running job will be killed.
+  when: >-
+    spur_node_busy and not dckj_skip_busy and not dckj_force_busy
+
+- name: Note busy node is being left untouched
+  ansible.builtin.debug:
+    msg: >-
+      {{ spur_node_name }} still has a running job — leaving it untouched
+      (spur_skip_busy_agents=true).
+  when: spur_node_busy and dckj_skip_busy and not dckj_force_busy
+
+- name: Warn that the running job WILL be killed
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ spur_node_name }} still has a running job.
+      Killing job processes now, then proceeding with {{ dckj_action }}.
+  when: spur_node_busy and dckj_force_busy
+
+# Same kill mechanism (raw processes + containers) used everywhere a busy
+# node can be force-disrupted — see kill_workload_processes.yml.
+- name: Kill workloads still running on this node
+  ansible.builtin.include_tasks: kill_workload_processes.yml
+  when: spur_node_busy and dckj_force_busy

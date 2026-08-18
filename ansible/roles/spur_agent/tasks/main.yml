@@ -95,6 +95,38 @@
         )
       )
 
+# spurd loads spur.conf best-effort at startup (missing file is fine) for the
+# [cluster] (SPUR-managed k0s) and [devices] (GPU/GRES) sections — everything
+# else in the file (controller/accounting/nodes/partitions) it simply ignores,
+# same shared format spurctld uses. Rendering is only possible once the
+# spur_controller role has resolved every controller's listen IP (set via
+# delegate_facts) — deploy.yml/rolling_upgrade.yml already run that role
+# before this one, but add_nodes.yml refreshes controller config in a LATER
+# play, so this is a no-op there until the next deploy/rolling_upgrade run.
+# Same reason a `--limit <agent-only>` run (deploy.yml's own --limit example)
+# is a no-op here too: the controller play that sets this fact never runs.
+- name: Determine whether controller config is resolved yet in this run
+  ansible.builtin.set_fact:
+    spur_agent_conf_can_render: >-
+      {{ (groups['spur_controllers']
+          | map('extract', hostvars)
+          | selectattr('spur_controller_listen_ip', 'defined')
+          | list | length == (groups['spur_controllers'] | length))
+         and ((not (spur_accounting_enabled | default(true) | bool))
+              or (hostvars[groups['spur_controllers'][0]].spur_accounting_listen_ip is defined)) }}
+
+# Respect an existing file unless the operator asks to re-render it — same
+# opt-in as rolling_upgrade.yml's spur_overwrite_conf for the controller.
+# force: no is template's own write-if-missing primitive, so this needs no
+# separate stat call (and no unreachable-result guard to hand-write for one).
+- name: Write spur.conf on the agent
+  ansible.builtin.template:
+    src: "{{ role_path }}/../spur_controller/templates/spur.conf.j2"
+    dest: "{{ spur_home }}/etc/spur.conf"
+    mode: "0644"
+    force: "{{ spur_overwrite_conf | default(false) | bool }}"
+  when: spur_agent_conf_can_render
+
 - name: Install spurd systemd unit
   # WorkingDirectory in the unit is {{ spur_home }} so job stdout (spur-<N>.out)
   # always lands there regardless of where the daemon was launched from.
@@ -104,13 +136,10 @@
     mode: "0644"
   register: spurd_unit
 
-- name: Reload systemd so the unit is picked up
-  ansible.builtin.systemd:
-    daemon_reload: true
-
 - name: Enable and (re)start spurd
   ansible.builtin.systemd:
     name: spurd
+    daemon_reload: true
     enabled: true
     state: restarted
 

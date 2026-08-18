@@ -1,12 +1,21 @@
 # ============================================================================
-# Playbook integration tests — three parallel jobs, each with its own cluster.
+# Playbook integration tests — four parallel jobs, each with its own cluster.
 #
 # integration-resilience:
-#   deploy + rolling upgrade covering all three agent states + force upgrade
-#   with OS-level kill verification (bare process AND Docker container)
+#   initial deploy with one agent unreachable (spur_ignore_unreachable_agents)
+#   + deploy.yml's default busy-agent behavior (drain-then-force-kill, and the
+#   spur_skip_busy_agents=true opt-out) + spur_controller_upgrade_order
+#   validation + rolling upgrade's default refusal on a busy node, covering
+#   all three agent states, + force upgrade with OS-level kill verification
+#   (bare process AND Docker container)
 #
 # integration-conf:
-#   deploy + spur.conf preservation (default: preserve, opt-in: overwrite)
+#   deploy + spur.conf preservation on BOTH controller and agent (default:
+#   preserve, opt-in: overwrite), and the two paths render an identical file
+#
+# integration-day2:
+#   remove_nodes.yml and teardown.yml's shared busy-node job-safety model
+#   (refuse by default, spur_skip_busy_agents=true, spur_force_*=true)
 #
 # techsupport:
 #   deploy, then exercise techsupport/spur-techsupport.sh end-to-end over real
@@ -14,8 +23,7 @@
 #   skip-flags, and the fail/--partial paths.
 #
 # Full HA/accounting/login-node coverage lives in deploy.yml's own path.
-# Day-2 playbooks (add_nodes/remove_nodes/manage_accounts/healthcheck/teardown)
-# are TODO — they build on the same running cluster.
+# add_nodes.yml / manage_accounts.yml / healthcheck.yml are still TODO.
 # ============================================================================
 name: playbook-ci
 
@@ -159,6 +167,16 @@ jobs:
             docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
           done
 
+      - name: Create a non-root job-submission user in every container
+        # Newer spurd builds refuse a job submitted by uid 0 unless
+        # [auth] allow_root_jobs=true (which we don't set) — submit as this
+        # user instead everywhere a job is submitted in this workflow.
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" useradd -m -s /bin/bash ciuser
+          done
+
       - name: Install Docker inside gpu-3 (for container kill test)
         run: |
           set -euo pipefail
@@ -185,12 +203,64 @@ jobs:
             sleep 2
           done
           docker exec gpu-3 docker info --format '{{.ServerVersion}}'
+          # spurd setuid/setgid/setgroups's to the submitting user before
+          # running the job (see privdrop.rs) — the force-docker test job's
+          # own `docker run` now executes as ciuser, not root, so it needs
+          # docker group membership on the host that actually runs it.
+          docker exec gpu-3 usermod -aG docker ciuser
 
       - name: Install ansible + docker connection plugin
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install ansible-core
           ansible-galaxy collection install community.docker
+
+      - name: Simulate gpu-3 unreachable before the initial deploy
+        run: docker stop gpu-3
+
+      - name: deploy.yml with spur_ignore_unreachable_agents=true (gpu-3 down)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_ignore_unreachable_agents=true \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
+
+      - name: Assert gpu-1/gpu-2 registered and gpu-3 was skipped, not registered
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            missing=""
+            for a in gpu-1 gpu-2; do
+              docker exec ctl-0 /usr/local/bin/spur show node "$a" 2>/dev/null \
+                | grep -qx "NodeName=$a" || missing="$missing $a"
+            done
+            [ -z "$missing" ] && break
+            sleep 2
+          done
+          echo "== spur nodes (gpu-3 must be absent) =="
+          docker exec ctl-0 /usr/local/bin/spur nodes
+          [ -z "$missing" ] || { echo "agents still missing:$missing"; exit 1; }
+          docker exec ctl-0 /usr/local/bin/spur show node gpu-3 2>/dev/null \
+            | grep -qx "NodeName=gpu-3" \
+            && { echo "FAIL: gpu-3 should not have registered while unreachable"; exit 1; }
+          echo "PASS: gpu-3 correctly skipped"
+
+      - name: Bring gpu-3 back and re-deploy (all four nodes healthy)
+        run: |
+          set -euo pipefail
+          docker start gpu-3
+          for i in $(seq 1 30); do
+            st=$(docker exec gpu-3 systemctl is-system-running 2>/dev/null || true)
+            case "$st" in running|degraded) break ;; esac
+            sleep 2
+          done
+          docker exec gpu-3 systemctl enable --now docker
 
       - name: deploy.yml (1 ctl + 3 agents)
         working-directory: ansible
@@ -200,7 +270,9 @@ jobs:
           ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
-            -e spur_home=/opt/spur
+            -e spur_home=/opt/spur \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
 
       - name: Assert all three agents registered
         run: |
@@ -229,7 +301,7 @@ jobs:
       - name: Assert a job runs to completion
         run: |
           set -euo pipefail
-          docker exec ctl-0 bash -lc '
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
             set -e
             cat > /tmp/ci-job.sh <<EOF
           #!/bin/bash
@@ -249,12 +321,122 @@ jobs:
             echo "job $jid did not complete in time (last: ${st:-none})"; exit 1
           '
 
+      # --- deploy.yml busy-agent job safety (drain, then force by default) --
+      - name: Submit a busy job on gpu-1 for the deploy.yml default-force test
+        run: |
+          set -euo pipefail
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=deploy-default-busy\nsleep 600\n" > /tmp/ci-deploy-busy.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-1 /tmp/ci-deploy-busy.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-deploy-busy.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "busy job $jid RUNNING on gpu-1"; exit 0; }
+              sleep 1
+            done
+            echo "busy job $jid never reached RUNNING"; exit 1
+          '
+
+      - name: deploy.yml default (must drain, kill the busy job, and restart gpu-1)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_drain_wait_secs=10 \
+            -e spur_verify_enabled=false
+
+      - name: Assert deploy.yml's default force-killed the busy job and gpu-1 re-registered
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-deploy-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
+          echo "job $jid state after deploy.yml: $st"
+          [ "$st" = RUNNING ] && { echo "FAIL: job still RUNNING — deploy.yml should force-kill a busy agent by default"; exit 1; }
+          found=""
+          for i in $(seq 1 30); do
+            docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null \
+              | grep -qx "NodeName=gpu-1" && { found=1; break; }
+            sleep 2
+          done
+          [ -n "$found" ] || { echo "FAIL: gpu-1 did not re-register after deploy.yml"; exit 1; }
+          echo "PASS: default deploy.yml force-killed the busy job and gpu-1 re-registered"
+
+      - name: Submit another busy job on gpu-1 for the spur_skip_busy_agents=true test
+        run: |
+          set -euo pipefail
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=deploy-skip-busy\nsleep 600\n" > /tmp/ci-deploy-skip.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-1 /tmp/ci-deploy-skip.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-deploy-skip.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "busy job $jid RUNNING on gpu-1"; exit 0; }
+              sleep 1
+            done
+            echo "busy job $jid never reached RUNNING"; exit 1
+          '
+
+      - name: deploy.yml spur_skip_busy_agents=true (must leave gpu-1 and its job untouched)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_drain_wait_secs=10 \
+            -e spur_skip_busy_agents=true \
+            -e spur_verify_enabled=false
+
+      - name: Assert spur_skip_busy_agents=true left the job on gpu-1 running
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-deploy-skip.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
+          echo "job $jid state after deploy.yml --skip-busy: $st"
+          [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING (spur_skip_busy_agents=true)"; exit 1; }
+          echo "PASS: spur_skip_busy_agents=true left the busy job on gpu-1 untouched"
+
+      - name: Clean up gpu-1's job so later steps see an idle node
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-deploy-skip.jid)
+          docker exec ctl-0 /usr/local/bin/spur scancel "$jid" || true
+          docker exec ctl-0 /usr/local/bin/scontrol update NodeName=gpu-1 State=RESUME || true
+          for i in $(seq 1 30); do
+            st=$(docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
+            [ "$st" = IDLE ] && break
+            sleep 2
+          done
+
+      - name: rolling_upgrade.yml spur_controller_upgrade_order validation (must fail fast on an unknown controller name)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          if ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+              -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+              -e spur_install_dir=/usr/local/bin \
+              -e spur_home=/opt/spur \
+              -e spur_controller_upgrade_order=ctl-does-not-exist; then
+            echo "FAIL: rolling_upgrade.yml should have refused an unknown controller name in spur_controller_upgrade_order"; exit 1
+          else
+            echo "PASS: rolling_upgrade.yml validated spur_controller_upgrade_order before touching any host"
+          fi
+
       # --- Pass 1: resilience (3 agent states in one run) ------------------
       - name: Simulate gpu-2 unreachable and gpu-3 busy
         run: |
           set -euo pipefail
           docker stop gpu-2
-          docker exec ctl-0 bash -lc '
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
             set -e
             printf "#!/bin/bash\n#SBATCH --job-name=busy\nsleep 600\n" > /tmp/ci-busy.sh
             jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-busy.sh | grep -oE "[0-9]+" | head -1)
@@ -266,6 +448,30 @@ jobs:
             done
             echo "busy job $jid never reached RUNNING (last: ${st:-none})"; exit 1
           '
+
+      - name: rolling_upgrade.yml default (must refuse on gpu-3's busy job, no skip/force set)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          if ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+              -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+              -e spur_install_dir=/usr/local/bin \
+              -e spur_home=/opt/spur \
+              -e spur_drain_wait_secs=10 \
+              --limit gpu-3; then
+            echo "FAIL: rolling_upgrade.yml should have refused on a busy node with no skip/force set"; exit 1
+          else
+            echo "PASS: rolling_upgrade.yml refused by default on a busy node"
+          fi
+
+      - name: Assert gpu-3's busy job is still running after the refused rolling upgrade
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING after a refused rolling upgrade (state: $st)"; exit 1; }
+          echo "PASS: gpu-3 untouched after the refused rolling upgrade"
 
       - name: rolling_upgrade.yml (gpu-1 normal, gpu-2 unreachable, gpu-3 busy)
         working-directory: ansible
@@ -279,7 +485,9 @@ jobs:
             -e spur_ignore_unreachable_agents=true \
             -e spur_skip_busy_agents=true \
             -e spur_drain_wait_secs=10 \
-            -e spur_rolling_batch_size=2
+            -e spur_rolling_batch_size=2 \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
 
       - name: Assert gpu-1 upgraded and still schedules work
         run: |
@@ -292,7 +500,7 @@ jobs:
           done
           [ -n "$found" ] || { echo "gpu-1 missing after upgrade"; exit 1; }
           echo "gpu-1 registered"
-          docker exec ctl-0 bash -lc '
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
             set -e
             printf "#!/bin/bash\n#SBATCH --job-name=post-upgrade\necho ok on \$(hostname)\n" > /tmp/ci-post.sh
             jid=$(/usr/local/bin/spur submit /tmp/ci-post.sh | grep -oE "[0-9]+" | head -1)
@@ -328,7 +536,7 @@ jobs:
           done
 
           # Job A: bare sleep (existing test path).
-          docker exec ctl-0 bash -lc '
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
             set -e
             printf "#!/bin/bash\n#SBATCH --job-name=force-bare\nsleep 600\n" > /tmp/ci-force-bare.sh
             jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-bare.sh | grep -oE "[0-9]+" | head -1)
@@ -344,7 +552,7 @@ jobs:
           # Job B: Docker container (tests the container-kill code path).
           # The job script launches a detached Docker container inside gpu-3
           # then sleeps in the foreground so the spur job stays RUNNING.
-          docker exec ctl-0 bash -lc '
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
             set -e
             cat > /tmp/ci-force-docker.sh <<EOF
           #!/bin/bash
@@ -381,7 +589,9 @@ jobs:
             -e spur_home=/opt/spur \
             -e spur_ignore_unreachable_agents=true \
             -e spur_force_upgrade_busy_agents=true \
-            -e spur_drain_wait_secs=10
+            -e spur_drain_wait_secs=10 \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
 
       - name: Assert bare job processes were killed (scheduler + OS cgroup check)
         run: |
@@ -543,6 +753,16 @@ jobs:
             docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
           done
 
+      - name: Create a non-root job-submission user in every container
+        # Newer spurd builds refuse a job submitted by uid 0 unless
+        # [auth] allow_root_jobs=true (which we don't set) — submit as this
+        # user instead everywhere a job is submitted in this workflow.
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" useradd -m -s /bin/bash ciuser
+          done
+
       - name: Install ansible + docker connection plugin
         run: |
           python3 -m pip install --upgrade pip
@@ -557,7 +777,9 @@ jobs:
           ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
-            -e spur_home=/opt/spur
+            -e spur_home=/opt/spur \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
 
       - name: Assert all three agents registered
         run: |
@@ -581,13 +803,38 @@ jobs:
           done
           echo "MPI plugin present on all agents"
 
-      # --- spur.conf preservation test ------------------------------------
-      - name: Stamp a sentinel line into spur.conf to detect overwrites
+      # --- Agents get spur.conf too, at the same path as controllers -------
+      - name: Assert spur.conf path is identical on controller and agents, and spurd loaded it
         run: |
-          docker exec ctl-0 bash -c 'echo "# CI-SENTINEL" >> /opt/spur/etc/spur.conf'
-          docker exec ctl-0 grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
-            || { echo "sentinel not written"; exit 1; }
-          echo "sentinel written to spur.conf"
+          set -euo pipefail
+          docker exec ctl-0 test -f /opt/spur/etc/spur.conf
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" test -f /opt/spur/etc/spur.conf \
+              || { echo "FAIL: $a has no spur.conf at /opt/spur/etc/spur.conf"; exit 1; }
+          done
+          echo "PASS: spur.conf present at the same path (/opt/spur/etc/spur.conf) on ctl-0 and every agent"
+
+          # database_url must match verbatim between controller and an agent —
+          # both render the same template from the same accounting-IP fact.
+          ctl_url=$(docker exec ctl-0 grep '^database_url' /opt/spur/etc/spur.conf)
+          agent_url=$(docker exec gpu-1 grep '^database_url' /opt/spur/etc/spur.conf)
+          [ "$ctl_url" = "$agent_url" ] \
+            && echo "PASS: accounting database_url matches between ctl-0 and gpu-1" \
+            || { echo "FAIL: database_url differs — ctl-0=[$ctl_url] gpu-1=[$agent_url]"; exit 1; }
+
+          docker exec gpu-1 journalctl -u spurd --no-pager | grep -q "loaded spur.conf" \
+            && echo "PASS: spurd log confirms it loaded spur.conf" \
+            || { echo "FAIL: spurd never logged loading spur.conf"; docker exec gpu-1 journalctl -u spurd --no-pager | tail -20; exit 1; }
+
+      # --- spur.conf preservation test (controller AND agent) ---------------
+      - name: Stamp a sentinel line into spur.conf on ctl-0 and gpu-1 to detect overwrites
+        run: |
+          for h in ctl-0 gpu-1; do
+            docker exec "$h" bash -c 'echo "# CI-SENTINEL" >> /opt/spur/etc/spur.conf'
+            docker exec "$h" grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
+              || { echo "sentinel not written on $h"; exit 1; }
+          done
+          echo "sentinel written to spur.conf on ctl-0 and gpu-1"
 
       - name: rolling_upgrade.yml (default — spur.conf must be preserved)
         working-directory: ansible
@@ -600,13 +847,17 @@ jobs:
             -e spur_home=/opt/spur \
             -e spur_ignore_unreachable_agents=true \
             -e spur_skip_busy_agents=true \
-            -e spur_drain_wait_secs=10
+            -e spur_drain_wait_secs=10 \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
 
-      - name: Assert spur.conf was NOT overwritten (sentinel must still be present)
+      - name: Assert spur.conf was NOT overwritten on ctl-0 or gpu-1 (sentinel must still be present)
         run: |
-          docker exec ctl-0 grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
-            && echo "PASS: spur.conf preserved (sentinel intact)" \
-            || { echo "FAIL: spur.conf was overwritten — sentinel gone"; exit 1; }
+          for h in ctl-0 gpu-1; do
+            docker exec "$h" grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
+              && echo "PASS: spur.conf preserved on $h (sentinel intact)" \
+              || { echo "FAIL: spur.conf was overwritten on $h — sentinel gone"; exit 1; }
+          done
 
       - name: rolling_upgrade.yml --overwrite-conf (spur.conf must be re-rendered)
         working-directory: ansible
@@ -620,16 +871,19 @@ jobs:
             -e spur_ignore_unreachable_agents=true \
             -e spur_skip_busy_agents=true \
             -e spur_drain_wait_secs=10 \
-            -e spur_overwrite_conf=true
+            -e spur_overwrite_conf=true \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
 
-      - name: Assert spur.conf WAS overwritten (sentinel must be gone)
+      - name: Assert spur.conf WAS overwritten on ctl-0 and gpu-1 (sentinel must be gone)
         run: |
-          docker exec ctl-0 grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
-            && { echo "FAIL: spur.conf was not overwritten — sentinel still present"; exit 1; } \
-            || echo "PASS: spur.conf re-rendered (sentinel gone)"
+          for h in ctl-0 gpu-1; do
+            docker exec "$h" grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
+              && { echo "FAIL: spur.conf was not overwritten on $h — sentinel still present"; exit 1; } \
+              || echo "PASS: spur.conf re-rendered on $h (sentinel gone)"
+          done
 
-      # TODO(next): add_nodes.yml / remove_nodes.yml / manage_accounts.yml
-      # TODO(next): healthcheck.yml (assert green) and teardown.yml
+      # TODO(next): add_nodes.yml / manage_accounts.yml / healthcheck.yml
 
       - name: Dump logs on failure
         if: failure()
@@ -646,7 +900,338 @@ jobs:
           docker network rm spur-ci || true
 
   # ---------------------------------------------------------------------------
-  # Job 3: techsupport/spur-techsupport.sh end-to-end over real SSH
+  # Job 3: remove_nodes.yml + teardown.yml busy-node job safety
+  # ---------------------------------------------------------------------------
+  integration-day2:
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      # ci.ini hardcodes [spur_agents] = gpu-1/gpu-2/gpu-3, so all three must
+      # exist as containers even though this job only actively uses gpu-1
+      # (remove_nodes.yml) and gpu-2 (teardown.yml) — gpu-3 is just a healthy
+      # bystander so deploy.yml's strict (non-ignore_unreachable) run succeeds.
+      NODES: "ctl-0 gpu-1 gpu-2 gpu-3"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download + verify Spur binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_TAG: ""
+        run: |
+          set -euo pipefail
+          deploy_tag="${DEPLOY_TAG:-}"
+          if [ -z "$deploy_tag" ]; then
+            deploy_tag=$(gh api repos/ROCm/spur/releases --jq \
+              'map(select(.tag_name != "nightly"))[0].tag_name')
+          fi
+          mkdir -p dl-spur-bin
+          ( cd dl-spur-bin
+            gh release download "$deploy_tag" --repo ROCm/spur \
+              --pattern '*-linux-amd64.tar.gz' \
+              --pattern '*-linux-amd64.tar.gz.sha256'
+            tarball=$(ls *-linux-amd64.tar.gz)
+            hash=$(awk '{print $1}' "${tarball}.sha256")
+            echo "${hash}  ${tarball}" | sha256sum -c -
+            tar xzf "$tarball"
+            bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
+            mkdir -p "$GITHUB_WORKSPACE/spur-bin"
+            for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"; done
+            chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
+          )
+
+      - name: Start systemd containers on a docker network
+        env:
+          IMG: jrei/systemd-ubuntu:22.04
+        run: |
+          set -euo pipefail
+          docker network create spur-ci
+          docker pull "$IMG"
+          for n in $NODES; do
+            docker run -d --name "$n" --hostname "$n" \
+              --network spur-ci \
+              --privileged \
+              --cgroupns=host \
+              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+              "$IMG"
+          done
+
+      - name: Wait for systemd to be ready in every container
+        run: |
+          set -uo pipefail
+          for n in $NODES; do
+            ok=""
+            for i in $(seq 1 30); do
+              st=$(docker exec "$n" systemctl is-system-running 2>/dev/null || true)
+              case "$st" in running|degraded) ok=1; break ;; esac
+              sleep 2
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::systemd never became ready in $n (last: ${st:-none})"
+              exit 1
+            fi
+            echo "$n: systemd ready ($st)"
+          done
+
+      - name: Install in-container preflight deps (curl/tar/iproute2/python3/sudo)
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
+          done
+
+      - name: Create a non-root job-submission user in every container
+        # Newer spurd builds refuse a job submitted by uid 0 unless
+        # [auth] allow_root_jobs=true (which we don't set) — submit as this
+        # user instead everywhere a job is submitted in this workflow.
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" useradd -m -s /bin/bash ciuser
+          done
+
+      - name: Install ansible + docker connection plugin
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ansible-core
+          ansible-galaxy collection install community.docker
+
+      - name: deploy.yml (1 ctl + 3 agents)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
+
+      - name: Assert all three agents registered
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            missing=""
+            for a in gpu-1 gpu-2 gpu-3; do
+              docker exec ctl-0 /usr/local/bin/spur show node "$a" 2>/dev/null \
+                | grep -qx "NodeName=$a" || missing="$missing $a"
+            done
+            [ -z "$missing" ] && { echo "all three agents registered"; break; }
+            sleep 2
+          done
+          [ -z "$missing" ] || { echo "agents still missing:$missing"; exit 1; }
+
+      # --- remove_nodes.yml: refuse / skip / force on a busy node -----------
+      - name: Submit a busy job on gpu-1 for the remove_nodes.yml tests
+        run: |
+          set -euo pipefail
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=remove-busy\nsleep 600\n" > /tmp/ci-remove-busy.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-1 /tmp/ci-remove-busy.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-remove-busy.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "busy job $jid RUNNING on gpu-1"; exit 0; }
+              sleep 1
+            done
+            echo "busy job $jid never reached RUNNING"; exit 1
+          '
+
+      - name: remove_nodes.yml default (must refuse — gpu-1 is busy)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          if ansible-playbook -i inventory/ci.ini playbooks/remove_nodes.yml \
+              -e spur_install_dir=/usr/local/bin \
+              -e nodes_to_remove=gpu-1 \
+              -e spur_drain_wait_secs=10; then
+            echo "FAIL: remove_nodes.yml should have refused on a busy node"; exit 1
+          else
+            echo "PASS: remove_nodes.yml refused by default on a busy node"
+          fi
+
+      - name: Assert gpu-1 is still registered and its job is still running (default refusal)
+        run: |
+          set -euo pipefail
+          docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" \
+            || { echo "FAIL: gpu-1 should still be registered after a refused removal"; exit 1; }
+          jid=$(docker exec ctl-0 cat /tmp/ci-remove-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING after a refused removal (state: $st)"; exit 1; }
+          echo "PASS: gpu-1 untouched after the refused removal"
+
+      - name: remove_nodes.yml spur_skip_busy_agents=true (must leave gpu-1 in the cluster, running)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/remove_nodes.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e nodes_to_remove=gpu-1 \
+            -e spur_drain_wait_secs=10 \
+            -e spur_skip_busy_agents=true
+
+      - name: Assert gpu-1 is still registered, spurd untouched, and its job is still running
+        run: |
+          set -euo pipefail
+          docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" \
+            || { echo "FAIL: gpu-1 should still be in the cluster (spur_skip_busy_agents=true)"; exit 1; }
+          jid=$(docker exec ctl-0 cat /tmp/ci-remove-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING (state: $st)"; exit 1; }
+          docker exec gpu-1 systemctl is-active spurd | grep -qx active \
+            || { echo "FAIL: spurd should not have been touched by spur_skip_busy_agents=true"; exit 1; }
+          echo "PASS: gpu-1 left fully untouched — still registered, spurd active, job running"
+
+      - name: remove_nodes.yml spur_force_remove_busy_nodes=true (must kill the job and remove gpu-1)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/remove_nodes.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e nodes_to_remove=gpu-1 \
+            -e spur_drain_wait_secs=10 \
+            -e spur_force_remove_busy_nodes=true
+
+      - name: Assert gpu-1's job was killed and it was removed from the cluster
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-remove-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] && { echo "FAIL: job should have been killed by spur_force_remove_busy_nodes=true"; exit 1; }
+          docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" \
+            && { echo "FAIL: gpu-1 should have been removed from the cluster"; exit 1; }
+          docker exec gpu-1 systemctl is-active spurd 2>&1 | grep -qx active \
+            && { echo "FAIL: spurd should have been stopped on gpu-1"; exit 1; }
+          orphan_pids=$(docker exec gpu-1 bash -c \
+            "find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null | xargs cat 2>/dev/null | sort -u" || true)
+          [ -z "$orphan_pids" ] || { echo "FAIL: orphan PIDs still in spur cgroups on gpu-1: $orphan_pids"; exit 1; }
+          echo "PASS: gpu-1's job was killed, spurd stopped, and it was removed from the cluster"
+
+      # --- teardown.yml: refuse / force on a busy node ----------------------
+      - name: Submit a busy job on gpu-2 for the teardown.yml tests
+        run: |
+          set -euo pipefail
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=teardown-busy\nsleep 600\n" > /tmp/ci-teardown-busy.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-2 /tmp/ci-teardown-busy.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-teardown-busy.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "busy job $jid RUNNING on gpu-2"; exit 0; }
+              sleep 1
+            done
+            echo "busy job $jid never reached RUNNING"; exit 1
+          '
+
+      - name: teardown.yml default (must refuse to touch busy gpu-2)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          if ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+              -e spur_install_dir=/usr/local/bin \
+              -e spur_home=/opt/spur \
+              -e spur_drain_wait_secs=10 \
+              --limit gpu-2; then
+            echo "FAIL: teardown.yml should have refused on a busy node"; exit 1
+          else
+            echo "PASS: teardown.yml refused by default on a busy node"
+          fi
+
+      - name: Assert gpu-2's job is still running and spurd is untouched
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-teardown-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING after a refused teardown (state: $st)"; exit 1; }
+          docker exec gpu-2 systemctl is-active spurd | grep -qx active \
+            || { echo "FAIL: spurd should not have been touched"; exit 1; }
+          echo "PASS: gpu-2 untouched after the refused teardown"
+
+      - name: teardown.yml spur_skip_busy_agents=true (must leave gpu-2 and its job untouched)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_drain_wait_secs=10 \
+            -e spur_skip_busy_agents=true \
+            --limit gpu-2
+
+      - name: Assert spur_skip_busy_agents=true left gpu-2's job and spurd untouched
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-teardown-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING (spur_skip_busy_agents=true)"; exit 1; }
+          docker exec gpu-2 systemctl is-active spurd | grep -qx active \
+            || { echo "FAIL: spurd should not have been touched by spur_skip_busy_agents=true"; exit 1; }
+          echo "PASS: spur_skip_busy_agents=true left gpu-2's job and spurd untouched"
+
+      - name: teardown.yml spur_force_teardown_busy_agents=true (must kill the job and tear down gpu-2)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_drain_wait_secs=10 \
+            -e spur_force_teardown_busy_agents=true \
+            --limit gpu-2
+
+      - name: Assert gpu-2's job was killed and spurd was stopped
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-teardown-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] && { echo "FAIL: job should have been killed by spur_force_teardown_busy_agents=true"; exit 1; }
+          docker exec gpu-2 systemctl is-active spurd 2>&1 | grep -qx active \
+            && { echo "FAIL: spurd should have been stopped on gpu-2"; exit 1; }
+          echo "PASS: gpu-2's job was killed and spurd stopped by teardown.yml --force"
+
+      # --- teardown.yml basic smoke: full teardown stops every daemon ------
+      - name: teardown.yml (full cluster — basic smoke)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur
+
+      - name: Assert every daemon is stopped after full teardown
+        run: |
+          set -euo pipefail
+          docker exec ctl-0 systemctl is-active spurctld 2>&1 | grep -qx active \
+            && { echo "FAIL: spurctld should be stopped on ctl-0"; exit 1; }
+          echo "PASS: full teardown stopped spurctld"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          for n in $NODES; do
+            echo "===== $n journal (spur*) ====="
+            docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -50' || true
+          done
+
+      - name: Teardown containers
+        if: always()
+        run: |
+          for n in $NODES; do docker rm -f "$n" || true; done
+          docker network rm spur-ci || true
+
+  # ---------------------------------------------------------------------------
+  # Job 4: techsupport/spur-techsupport.sh end-to-end over real SSH
   # ---------------------------------------------------------------------------
   techsupport:
     runs-on: ubuntu-latest

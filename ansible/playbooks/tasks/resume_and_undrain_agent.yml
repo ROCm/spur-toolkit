@@ -1,0 +1,36 @@
+---
+# Paired with drain_and_guard_agent.yml — undrains a node after a non-destructive
+# disruption (restart) so it goes back into service. Only include this from a
+# play that actually restarts the agent afterward (deploy.yml, rolling_upgrade.yml);
+# teardown.yml intentionally does not, since the node is being shut down, not
+# brought back.
+
+# A skipped busy node was never touched (the caller's role/task didn't run for
+# it), so the daemon never restarted — there's nothing to wait for. A force-
+# disrupted busy node DID have its daemon restarted, so we do wait.
+- name: Wait for the node to re-register
+  ansible.builtin.shell: |
+    for i in $(seq 1 30); do
+      {{ spur_install_dir }}/spur show node {{ spur_node_name }} >/dev/null 2>&1 && exit 0
+      sleep 1
+    done
+    echo "{{ spur_node_name }} never re-registered after the {{ dckj_action }}"
+    exit 1
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  changed_when: false
+  when: >-
+    not (spur_agent_ping.unreachable | default(false)) and
+    (not (spur_node_busy | default(false)) or dckj_force_busy)
+
+# A drained node stays drained after the daemon restarts — draining is server-
+# side state, not tied to the agent process. This also covers a skipped busy
+# node: it was only drained as part of attempting the disruption, so put it
+# back into service on its current binary.
+- name: Resume the node (undrain) now that it's back
+  ansible.builtin.command: >-
+    {{ spur_install_dir }}/scontrol update NodeName={{ spur_node_name }} State=RESUME
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  changed_when: true
+  when: not (spur_agent_ping.unreachable | default(false))

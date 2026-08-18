@@ -66,6 +66,24 @@ spur_force_reinstall: false
 # DB, so those plays stay strict regardless of this flag.
 spur_ignore_unreachable_agents: false
 
+# Submit a real test job at the end of deploy.yml / rolling_upgrade.yml to
+# verify the cluster actually schedules work (spur_verify role). Default false
+# so routine deploys/upgrades don't add job noise to a live cluster; CI enables
+# it explicitly (-e spur_verify_enabled=true) as a smoke test.
+spur_verify_enabled: false
+
+# Facts subset gathered by every gather_facts:yes play and by spur_controller's
+# on-demand per-agent gather. The roles only ever consume ansible_hostname,
+# ansible_processor_vcpus, ansible_memtotal_mb, ansible_default_ipv4.address,
+# and ansible_os_family — the default full gather also enumerates every mount,
+# PCI device, and interface, which is slow on HPC compute nodes with many NFS
+# mounts. Override with -e spur_gather_subset=all to fall back to full gathering.
+spur_gather_subset:
+  - '!all'
+  - network
+  - hardware
+  - distribution
+
 # Logging
 spur_log_level: info
 
@@ -85,3 +103,28 @@ spur_ha_enabled: "{{ (groups.get('spur_controllers', []) | length) > 1 }}"
 # Whether the controller node also runs spurd (lets controller be a compute target).
 # Auto: true if a host is in BOTH controller and agent groups.
 spur_controller_runs_agent: "{{ inventory_hostname in groups.get('spur_agents', []) and inventory_hostname in groups.get('spur_controllers', []) }}"
+
+# Job-safety: drain/skip/force behavior shared by deploy.yml, teardown.yml,
+# rolling_upgrade.yml, and remove_nodes.yml (see playbooks/tasks/drain_and_guard_agent.yml).
+# Leave a still-busy node untouched instead of the playbook's own default
+# (refuse for teardown/rolling_upgrade/remove_nodes, force for deploy.yml).
+spur_skip_busy_agents: false
+# How long to wait for a node to reach DRAINED/DOWN before treating it as busy.
+spur_drain_wait_secs: 120
+# Per-playbook force flags: kill a busy node's running job and proceed anyway.
+spur_force_teardown_busy_agents: false
+spur_force_upgrade_busy_agents: false
+spur_force_remove_busy_nodes: false
+
+# Re-render spur.conf from the Ansible template instead of preserving an
+# existing one (rolling_upgrade.yml controllers, and agents everywhere).
+spur_overwrite_conf: false
+
+# Agents upgraded per batch in rolling_upgrade.yml (serial). Controllers
+# always upgrade one at a time regardless.
+spur_rolling_batch_size: 1
+
+# Comma-separated controller names — upgrade them in this order in
+# rolling_upgrade.yml instead of [spur_controllers]'s inventory order. Must
+# name every controller exactly once; left empty, inventory order is used.
+spur_controller_upgrade_order: ""
