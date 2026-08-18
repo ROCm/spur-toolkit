@@ -31,7 +31,7 @@
   gather_facts: no
   any_errors_fatal: true
   vars:
-    remove_list: "{{ nodes_to_remove | default('') | split(',') | map('trim') | select | list }}"
+    remove_list: "{{ nodes_to_remove | default('') | split(',') | map('trim') | select | unique | list }}"
   tasks:
     - name: Require nodes_to_remove
       ansible.builtin.assert:
@@ -47,6 +47,19 @@
       register: rn_health
       changed_when: false
       failed_when: rn_health.rc != 0
+
+    # No name arg returns every node's NodeName= line in one call (a name arg
+    # filters server-side) — catches a typo before anything is touched.
+    - name: List registered nodes
+      ansible.builtin.command: "{{ spur_install_dir }}/spur show node"
+      register: rn_all_nodes
+      changed_when: false
+
+    - name: Fail if nodes_to_remove names a node that isn't currently registered
+      ansible.builtin.fail:
+        msg: "nodes_to_remove included {{ item }}, which isn't in `spur show node`."
+      loop: "{{ remove_list }}"
+      when: "('NodeName=' ~ item) not in (rn_all_nodes.stdout_lines | default([]))"
 
     - name: Drain each node (stop new scheduling; running jobs finish first)
       ansible.builtin.command: >-

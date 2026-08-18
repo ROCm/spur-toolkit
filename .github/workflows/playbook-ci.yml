@@ -1,12 +1,13 @@
 # ============================================================================
-# Playbook integration tests — three parallel jobs, each with its own cluster.
+# Playbook integration tests — four parallel jobs, each with its own cluster.
 #
 # integration-resilience:
 #   initial deploy with one agent unreachable (spur_ignore_unreachable_agents)
 #   + deploy.yml's default busy-agent behavior (drain-then-force-kill, and the
-#   spur_skip_busy_agents=true opt-out) + rolling upgrade covering all three
-#   agent states + force upgrade with OS-level kill verification (bare
-#   process AND Docker container)
+#   spur_skip_busy_agents=true opt-out) + spur_controller_upgrade_order
+#   validation + rolling upgrade's default refusal on a busy node, covering
+#   all three agent states, + force upgrade with OS-level kill verification
+#   (bare process AND Docker container)
 #
 # integration-conf:
 #   deploy + spur.conf preservation on BOTH controller and agent (default:
@@ -415,6 +416,21 @@ jobs:
             sleep 2
           done
 
+      - name: rolling_upgrade.yml spur_controller_upgrade_order validation (must fail fast on an unknown controller name)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          if ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+              -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+              -e spur_install_dir=/usr/local/bin \
+              -e spur_home=/opt/spur \
+              -e spur_controller_upgrade_order=ctl-does-not-exist; then
+            echo "FAIL: rolling_upgrade.yml should have refused an unknown controller name in spur_controller_upgrade_order"; exit 1
+          else
+            echo "PASS: rolling_upgrade.yml validated spur_controller_upgrade_order before touching any host"
+          fi
+
       # --- Pass 1: resilience (3 agent states in one run) ------------------
       - name: Simulate gpu-2 unreachable and gpu-3 busy
         run: |
@@ -432,6 +448,30 @@ jobs:
             done
             echo "busy job $jid never reached RUNNING (last: ${st:-none})"; exit 1
           '
+
+      - name: rolling_upgrade.yml default (must refuse on gpu-3's busy job, no skip/force set)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          if ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+              -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+              -e spur_install_dir=/usr/local/bin \
+              -e spur_home=/opt/spur \
+              -e spur_drain_wait_secs=10 \
+              --limit gpu-3; then
+            echo "FAIL: rolling_upgrade.yml should have refused on a busy node with no skip/force set"; exit 1
+          else
+            echo "PASS: rolling_upgrade.yml refused by default on a busy node"
+          fi
+
+      - name: Assert gpu-3's busy job is still running after the refused rolling upgrade
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING after a refused rolling upgrade (state: $st)"; exit 1; }
+          echo "PASS: gpu-3 untouched after the refused rolling upgrade"
 
       - name: rolling_upgrade.yml (gpu-1 normal, gpu-2 unreachable, gpu-3 busy)
         working-directory: ansible
@@ -1115,6 +1155,28 @@ jobs:
             || { echo "FAIL: spurd should not have been touched"; exit 1; }
           echo "PASS: gpu-2 untouched after the refused teardown"
 
+      - name: teardown.yml spur_skip_busy_agents=true (must leave gpu-2 and its job untouched)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_drain_wait_secs=10 \
+            -e spur_skip_busy_agents=true \
+            --limit gpu-2
+
+      - name: Assert spur_skip_busy_agents=true left gpu-2's job and spurd untouched
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-teardown-busy.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING (spur_skip_busy_agents=true)"; exit 1; }
+          docker exec gpu-2 systemctl is-active spurd | grep -qx active \
+            || { echo "FAIL: spurd should not have been touched by spur_skip_busy_agents=true"; exit 1; }
+          echo "PASS: spur_skip_busy_agents=true left gpu-2's job and spurd untouched"
+
       - name: teardown.yml spur_force_teardown_busy_agents=true (must kill the job and tear down gpu-2)
         working-directory: ansible
         env:
@@ -1169,7 +1231,7 @@ jobs:
           docker network rm spur-ci || true
 
   # ---------------------------------------------------------------------------
-  # Job 3: techsupport/spur-techsupport.sh end-to-end over real SSH
+  # Job 4: techsupport/spur-techsupport.sh end-to-end over real SSH
   # ---------------------------------------------------------------------------
   techsupport:
     runs-on: ubuntu-latest

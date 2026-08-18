@@ -28,15 +28,12 @@
     msg: "{{ spur_verify_wait.stdout }}"
   when: spur_verify_wait.rc != 0
 
-# spurd's WorkingDirectory is spur_home (root-owned, 0755) — a job submitted
-# as spur_verify_submit_user runs (and writes its output file) as that user
-# on whichever agent it lands on, which needs write access there. Only
-# touched when the feature is actually used (e.g. CI), so real deployments
-# that submit as root by default are unaffected.
+# Job output lands in spur_home (spurd's WorkingDirectory); sticky 1777 (like
+# /tmp) lets the submit user write there without letting users clobber each other's files.
 - name: Make spur_home writable for the job-submission user on every agent
   ansible.builtin.file:
     path: "{{ spur_home }}"
-    mode: "0777"
+    mode: "1777"
   delegate_to: "{{ item }}"
   loop: "{{ groups['spur_agents'] }}"
   when: spur_verify_submit_user is defined
