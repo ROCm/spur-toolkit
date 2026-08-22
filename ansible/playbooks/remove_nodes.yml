@@ -196,19 +196,20 @@
         - spur_transport | default('direct') == 'wireguard'
         - rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length > 0
 
-- name: Remove each node from the cluster + remind about inventory
-  hosts: "{{ groups['spur_controllers'][0] }}"
+# Drop each removed node's WG peer from EVERY controller (wireguard only). The reconcile only
+# prunes when [cluster].enabled, so a pure-spurd wg cluster needs this done explicitly — and on
+# ALL controllers, not just the bootstrap, or the others keep the removed node as a ghost peer
+# (mirrors the all-controllers peer REGISTRATION in the spur_wireguard role). Idempotent; skips
+# no-pubkey nodes. rn_actual_remove_list + each node's pubkey live on the FIRST controller's
+# hostvars (set in earlier plays), so read them via hostvars[] explicitly.
+- name: Remove each node's WG peer from every controller
+  hosts: spur_controllers
   become: true
   gather_facts: no
+  vars:
+    rn_actual_remove_list: "{{ hostvars[groups['spur_controllers'][0]].rn_actual_remove_list | default([]) }}"
   tasks:
-    # Belt-and-suspenders: spurd deregisters gracefully on SIGTERM, so a node
-    # whose agent we just stopped is usually already gone from the controller.
-    # This `remove` is what actually removes a node whose host was unreachable
-    # (never got the SIGTERM). Treat "node not found" as success — it means the
-    # node is already absent, which is the goal.
-    # Drop each removed node's WG peer from the controller (wireguard only) — the reconcile only
-    # prunes when [cluster].enabled, so a wg-only cluster needs this. Idempotent; skips no-pubkey nodes.
-    - name: Remove each node's WG peer from the controller
+    - name: spur net remove-peer on this controller
       ansible.builtin.command: >-
         {{ spur_install_dir }}/spur net remove-peer
           --key {{ hostvars[item].rn_wg_pubkey.stdout | trim }}
@@ -221,6 +222,16 @@
         - hostvars[item].rn_wg_pubkey is defined
         - (hostvars[item].rn_wg_pubkey.stdout | default('') | trim) | length > 0
 
+- name: Remove each node from the cluster + remind about inventory
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: true
+  gather_facts: no
+  tasks:
+    # Belt-and-suspenders: spurd deregisters gracefully on SIGTERM, so a node
+    # whose agent we just stopped is usually already gone from the controller.
+    # This `remove` is what actually removes a node whose host was unreachable
+    # (never got the SIGTERM). Treat "node not found" as success — it means the
+    # node is already absent, which is the goal.
     - name: spur node remove --force (authoritative, WAL-durable)
       ansible.builtin.command: >-
         {{ spur_install_dir }}/spur node remove {{ item }}

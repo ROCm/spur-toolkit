@@ -71,9 +71,14 @@
   tasks: []
 
 # Join the new node to the mesh BEFORE spurd starts (spurd reaches the controller over the mesh).
-# Controller + new node run the role together; the new node MUST have spur_wg_address in inventory.
+# ALL controllers + the new node run the role together: the new node net-joins the bootstrap,
+# and every controller registers the new node as a peer (its "already up" guard skips re-init).
+# Including all controllers (not just the bootstrap) is required for a multi-controller mesh so a
+# re-added node whose WG key changed is refreshed on EVERY controller, not only the bootstrap —
+# otherwise the others keep the stale key and drop the node's traffic. The new node MUST have
+# spur_wg_address in inventory. For a single-controller cluster this is just controllers[0] + node.
 - name: Join new node(s) to the WireGuard mesh
-  hosts: "spur_controllers[0]:{{ new_nodes | default('') | split(',') | map('trim') | select | join(':') }}"
+  hosts: "spur_controllers:{{ new_nodes | default('') | split(',') | map('trim') | select | join(':') }}"
   become: true
   gather_facts: no
   any_errors_fatal: true
