@@ -1,7 +1,9 @@
 ---
 - name: Determine which Spur components this host needs
+  # Under wireguard, agents also need the `spur` CLI — spur_wireguard runs `spur net join` on
+  # each agent. In direct transport agents need only spurd.
   ansible.builtin.set_fact:
-    spur_needs_cli: "{{ inventory_hostname in groups['spur_controllers'] or inventory_hostname in groups.get('spur_login', []) }}"
+    spur_needs_cli: "{{ inventory_hostname in groups['spur_controllers'] or inventory_hostname in groups.get('spur_login', []) or (spur_transport | default('direct') == 'wireguard' and inventory_hostname in groups['spur_agents']) }}"
     spur_needs_ctld: "{{ inventory_hostname in groups['spur_controllers'] }}"
     spur_needs_agent_bin: "{{ inventory_hostname in groups['spur_agents'] }}"
 

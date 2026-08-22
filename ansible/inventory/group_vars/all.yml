@@ -20,6 +20,33 @@ spur_transport: direct
 spur_wg_cidr: 10.44.0.0/16
 spur_wg_port: 51820
 spur_wg_interface: spur0
+# Persist the mesh across reboots: enable wg-quick@<iface> so the interface is
+# re-created on boot from /etc/wireguard/<iface>.conf. The controller's reconcile
+# then re-pushes peer membership; without this the node drops off the mesh on reboot.
+spur_wg_persist: true
+
+# SPUR-managed k0s cluster (spur k8s up). Disabled by default so a plain deploy
+# only stands up the scheduler + mesh. Set spur_k8s_enabled=true to write the
+# [cluster] section and drive k0s bring-up via playbooks/k8s_up.yml.
+spur_k8s_enabled: false
+spur_k8s_pod_cidr: 10.42.0.0/16
+spur_k8s_service_cidr: 10.43.0.0/16
+# CNI: "calico" runs bird native-routing so pods ride the WireGuard mesh (required
+# when spur_transport=wireguard and you want pod traffic on the mesh). "kuberouter"
+# is the k0s default (no custom config). Calico advertises the API on the mesh IP.
+spur_k8s_cni: calico
+spur_k8s_cni_mtu: 1450
+# k0s control plane: CSV of control-plane node names (as registered with spurctld). One name = a
+# single control plane; 3 or 5 = HA (etcd quorum). The first entry is the etcd bootstrap. Empty =
+# the playbook picks the first [spur_controllers] host. For a mesh where the spurctld controller
+# is NOT a k8s node, set this to the intended k8s control-plane agent(s). This is the k0s control
+# plane and is independent of how many SPUR controllers (spurctld) run.
+spur_k8s_control_plane_nodes: ""
+# Nodes to scope the k0s cluster to (hostlist/CSV of registered node names). Empty
+# = whole inventory. Set to the subset that should run k0s (e.g. control-plane +
+# GPU workers) when the mesh has more nodes than the k8s cluster.
+spur_k8s_nodes: ""
+spur_k8s_version: "v1.36.2+k0s.0"
 
 # Ports
 spur_controller_port: 6817

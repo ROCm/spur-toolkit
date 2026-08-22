@@ -95,6 +95,15 @@
         - "/etc/wireguard/{{ spur_wg_interface }}.conf"
       when: (wipe | default(false) | bool) and spur_ok_to_disrupt
 
+    - name: Remove SPUR_CONTROLLER_ADDR from /etc/environment (only when -e wipe=true)
+      # Otherwise a stale/wrong endpoint (e.g. a node's own underlay IP left by a prior run)
+      # persists and the CLI on this host talks to the wrong place after a fresh deploy.
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: '^SPUR_CONTROLLER_ADDR='
+        state: absent
+      when: (wipe | default(false) | bool) and spur_ok_to_disrupt
+
     - name: Note this host was left untouched (still has a running job)
       ansible.builtin.debug:
         msg: >-
