@@ -31,8 +31,27 @@ fairshare_refresh_secs = 30
 wg_enabled = {{ (spur_transport == 'wireguard') | string | lower }}
 {% if spur_transport == 'wireguard' %}
 wg_interface = "{{ spur_wg_interface }}"
+wg_cidr = "{{ spur_wg_cidr }}"
+wg_port = {{ spur_wg_port }}
 {% endif %}
 agent_port = {{ spur_agent_port }}
+
+{% if spur_k8s_enabled | default(false) | bool %}
+{% set _k8s_cp_list = spur_k8s_control_plane_nodes | default('') | split(',') | map('trim') | select | list %}
+[cluster]
+enabled = true
+distro = "k0s"
+pod_cidr = "{{ spur_k8s_pod_cidr }}"
+service_cidr = "{{ spur_k8s_service_cidr }}"
+cni = "{{ spur_k8s_cni }}"
+cni_mtu = {{ spur_k8s_cni_mtu }}
+{% if _k8s_cp_list | length > 0 %}
+{# spurctld's k0s control plane: bootstrap = first entry, replicas = count (1/3/5). #}
+control_plane_node = "{{ _k8s_cp_list[0] }}"
+control_plane_replicas = {{ _k8s_cp_list | length }}
+{% endif %}
+k0s_version = "{{ spur_k8s_version }}"
+{% endif %}
 
 {% for h in groups['spur_agents'] %}
 [[nodes]]

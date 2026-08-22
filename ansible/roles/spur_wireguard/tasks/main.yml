@@ -89,13 +89,16 @@
     - spur_wg_address is not defined
 
 - name: Initialize WireGuard mesh on the controller
-  # `spur net init` auto-assigns .1 from --cidr and logs to stderr. It is not
-  # idempotent, so only run it when the interface is not already up.
+  # Initialized only when the interface is up AND its conf exists; a live interface with no conf
+  # can't persist, so down the stale link and re-init to rewrite the conf.
   ansible.builtin.shell: |
     set -euo pipefail
-    if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+    if ip link show {{ spur_wg_interface }} >/dev/null 2>&1 \
+       && [ -f /etc/wireguard/{{ spur_wg_interface }}.conf ]; then
       echo "SPUR_WG_ALREADY_UP"
     else
+      ip link show {{ spur_wg_interface }} >/dev/null 2>&1 \
+        && { wg-quick down {{ spur_wg_interface }} 2>/dev/null || ip link del {{ spur_wg_interface }} 2>/dev/null || true; }
       {{ spur_install_dir }}/spur net init \
         --cidr {{ spur_wg_cidr }} \
         --port {{ spur_wg_port }} \
@@ -126,14 +129,16 @@
   when: inventory_hostname in spur_wg_joiners
 
 - name: Join WireGuard mesh on agents and login nodes
-  # `spur net join` needs --prefix-len to match spur_wg_cidr (defaults to 16),
-  # else the interface address/AllowedIPs are wrong. Logs to stderr. Login nodes
-  # join identically to agents — they just don't run a daemon afterward.
+  # --prefix-len must match spur_wg_cidr or the address/AllowedIPs are wrong. As with init,
+  # re-join when the interface is up but its conf is missing so the on-disk conf always exists.
   ansible.builtin.shell: |
     set -euo pipefail
-    if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+    if ip link show {{ spur_wg_interface }} >/dev/null 2>&1 \
+       && [ -f /etc/wireguard/{{ spur_wg_interface }}.conf ]; then
       echo "SPUR_WG_ALREADY_UP"
     else
+      ip link show {{ spur_wg_interface }} >/dev/null 2>&1 \
+        && { wg-quick down {{ spur_wg_interface }} 2>/dev/null || ip link del {{ spur_wg_interface }} 2>/dev/null || true; }
       {{ spur_install_dir }}/spur net join \
         --endpoint {{ spur_wg_controller_endpoint }} \
         --server-key {{ spur_wg_controller_pubkey }} \
@@ -158,15 +163,33 @@
     spur_wg_pubkey: "{{ wg_agent_pubkey.stdout | trim }}"
   when: inventory_hostname in spur_wg_joiners
 
-- name: Register all joiners (agents + login nodes) as peers on the controller
+# Only joiners in THIS play have a pubkey — add_nodes.yml runs just the new node, so existing
+# nodes have no spur_wg_pubkey in hostvars. Register only those that joined this run.
+- name: Select joiners that joined this run
+  ansible.builtin.set_fact:
+    spur_wg_registerable: "{{ spur_wg_joiners | select('in', groups['all']) | map('extract', hostvars) | selectattr('spur_wg_pubkey', 'defined') | map(attribute='inventory_hostname') | list }}"
+  when: inventory_hostname == groups['spur_controllers'][0]
+
+- name: Register joiners as peers on the controller
+  # --endpoint is the joiner's underlay address (NIC IP + wg port), not its mesh IP; the reconcile
+  # re-advertises it so worker↔worker tunnels form (full mesh, not just hub-and-spoke).
   ansible.builtin.command: >-
     {{ spur_install_dir }}/spur net add-peer
       --key {{ hostvars[item]['spur_wg_pubkey'] }}
       --allowed-ip {{ hostvars[item]['spur_wg_address'] }}/32
+      --endpoint {{ hostvars[item]['ansible_host'] | default(item) }}:{{ spur_wg_port }}
       --interface {{ spur_wg_interface }}
-  loop: "{{ spur_wg_joiners }}"
+  loop: "{{ spur_wg_registerable | default([]) }}"
   when: inventory_hostname == groups['spur_controllers'][0]
   changed_when: true
+
+# net init/join bring the interface up but never enable the systemd unit, so it's gone on reboot.
+# Enabling wg-quick@<iface> recreates it from the conf; spurctld then re-pushes peer membership.
+- name: Enable wg-quick@{{ spur_wg_interface }} so the mesh survives reboot
+  ansible.builtin.systemd:
+    name: "wg-quick@{{ spur_wg_interface }}"
+    enabled: true
+  when: spur_wg_persist | default(true) | bool
 
 - name: Verify mesh — every host pings controller WG IP
   ansible.builtin.command: "ping -c2 -W2 {{ hostvars[groups['spur_controllers'][0]]['spur_wg_address'] }}"

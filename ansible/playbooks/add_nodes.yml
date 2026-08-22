@@ -70,6 +70,17 @@
   gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   tasks: []
 
+# Join the new node to the mesh BEFORE spurd starts (spurd reaches the controller over the mesh).
+# Controller + new node run the role together; the new node MUST have spur_wg_address in inventory.
+- name: Join new node(s) to the WireGuard mesh
+  hosts: "spur_controllers[0]:{{ new_nodes | default('') | split(',') | map('trim') | select | join(':') }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  roles:
+    - role: spur_wireguard
+      when: spur_transport | default('direct') == 'wireguard'
+
 # --- Install + start spurd on the NEW nodes only ---
 # Skip any that are already registered (idempotent re-runs must not restart a
 # healthy new agent). spur_install + spur_agent only ever touch the node they run

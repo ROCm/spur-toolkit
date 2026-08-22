@@ -173,6 +173,29 @@
       when: rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length > 0
       failed_when: false
 
+    # Mesh cleanup (wireguard only). Capture this node's pubkey so the controller can drop it as a
+    # peer, then tear down its interface so it doesn't linger as a ghost peer or rejoin on reboot.
+    - name: Read removed node's WG pubkey (for controller peer removal)
+      ansible.builtin.command: "wg show {{ spur_wg_interface }} public-key"
+      register: rn_wg_pubkey
+      changed_when: false
+      failed_when: false
+      when:
+        - spur_transport | default('direct') == 'wireguard'
+        - rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length > 0
+
+    - name: Tear down the mesh interface on the removed node
+      ansible.builtin.shell: |
+        systemctl disable wg-quick@{{ spur_wg_interface }} 2>/dev/null || true
+        wg-quick down {{ spur_wg_interface }} 2>/dev/null || ip link del {{ spur_wg_interface }} 2>/dev/null || true
+        rm -f /etc/wireguard/{{ spur_wg_interface }}.conf
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when:
+        - spur_transport | default('direct') == 'wireguard'
+        - rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length > 0
+
 - name: Remove each node from the cluster + remind about inventory
   hosts: "{{ groups['spur_controllers'][0] }}"
   become: true
@@ -183,6 +206,21 @@
     # This `remove` is what actually removes a node whose host was unreachable
     # (never got the SIGTERM). Treat "node not found" as success — it means the
     # node is already absent, which is the goal.
+    # Drop each removed node's WG peer from the controller (wireguard only) — the reconcile only
+    # prunes when [cluster].enabled, so a wg-only cluster needs this. Idempotent; skips no-pubkey nodes.
+    - name: Remove each node's WG peer from the controller
+      ansible.builtin.command: >-
+        {{ spur_install_dir }}/spur net remove-peer
+          --key {{ hostvars[item].rn_wg_pubkey.stdout | trim }}
+          --interface {{ spur_wg_interface }}
+      loop: "{{ rn_actual_remove_list }}"
+      changed_when: true
+      failed_when: false
+      when:
+        - spur_transport | default('direct') == 'wireguard'
+        - hostvars[item].rn_wg_pubkey is defined
+        - (hostvars[item].rn_wg_pubkey.stdout | default('') | trim) | length > 0
+
     - name: spur node remove --force (authoritative, WAL-durable)
       ansible.builtin.command: >-
         {{ spur_install_dir }}/spur node remove {{ item }}
