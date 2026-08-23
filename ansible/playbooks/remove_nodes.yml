@@ -215,8 +215,16 @@
           --key {{ hostvars[item].rn_wg_pubkey.stdout | trim }}
           --interface {{ spur_wg_interface }}
       loop: "{{ rn_actual_remove_list }}"
-      changed_when: true
-      failed_when: false
+      register: rn_remove_peer
+      changed_when: rn_remove_peer.rc == 0
+      # net remove-peer is idempotent (removing an absent peer exits 0), so the only tolerated
+      # failure is the pre-#719 case where the subcommand doesn't exist yet ("unrecognized
+      # subcommand" / clap usage error). Any OTHER non-zero rc (bad key, permission, transient
+      # RPC) is a real failure and must surface, rather than a blanket failed_when: false.
+      failed_when:
+        - rn_remove_peer.rc != 0
+        - "'unrecognized subcommand' not in (rn_remove_peer.stderr | default(''))"
+        - "'unexpected argument' not in (rn_remove_peer.stderr | default(''))"
       when:
         - spur_transport | default('direct') == 'wireguard'
         - hostvars[item].rn_wg_pubkey is defined

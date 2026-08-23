@@ -176,7 +176,9 @@
       --version {{ spur_k8s_version | default('v1.36.2+k0s.0') }}
       --path {{ spur_k8s_binary | default('/usr/local/bin/k0s') }}
   register: spur_k0s_install
-  changed_when: "'Installed k0s' in spur_k0s_install.stdout"
+  # `spur k8s install-k0s` logs everything (incl. "Installed k0s ...") to STDERR, not stdout —
+  # so match on stderr. "already present" (no --force) is also stderr and is not a change.
+  changed_when: "'Installed k0s' in spur_k0s_install.stderr"
   when:
     - spur_k8s_enabled | default(false) | bool
     # In k0s scope when: scope is empty (whole inventory), OR this node is a named k0s worker

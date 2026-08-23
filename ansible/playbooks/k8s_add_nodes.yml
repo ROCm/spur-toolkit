@@ -43,19 +43,25 @@
           --nodes {{ add_list | join(',') }}
       register: k8s_add_out
       changed_when: "'add-nodes requested' in k8s_add_out.stdout"
+      # add-nodes prints its rejection reason to stderr ("... NOT accepted: ...") but exits 0, so
+      # fail here with the real reason instead of falling through to a generic readiness timeout.
+      failed_when: "'NOT accepted' in (k8s_add_out.stderr | default(''))"
 
     - name: Show the add-nodes response
       ansible.builtin.debug:
         var: k8s_add_out.stdout_lines
 
     - name: Wait for the cluster to settle back to ready
+      # pipefail so a failing `spur k8s status` surfaces instead of awk masking it as "not ready".
       ansible.builtin.shell: |
+        set -o pipefail
         {{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }} 2>/dev/null \
           | awk '/^phase:/ {print $2}'
       args:
         executable: /bin/bash
       register: k8s_phase
-      until: k8s_phase.stdout | trim == 'ready'
+      # Fold 'degraded' into `until` so it fails fast instead of exhausting the retry budget.
+      until: k8s_phase.stdout | trim in ['ready', 'degraded']
       retries: "{{ k8s_ready_retries }}"
       delay: "{{ k8s_ready_delay }}"
       changed_when: false

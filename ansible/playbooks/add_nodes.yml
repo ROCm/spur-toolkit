@@ -71,14 +71,16 @@
   tasks: []
 
 # Join the new node to the mesh BEFORE spurd starts (spurd reaches the controller over the mesh).
-# ALL controllers + the new node run the role together: the new node net-joins the bootstrap,
-# and every controller registers the new node as a peer (its "already up" guard skips re-init).
-# Including all controllers (not just the bootstrap) is required for a multi-controller mesh so a
-# re-added node whose WG key changed is refreshed on EVERY controller, not only the bootstrap —
-# otherwise the others keep the stale key and drop the node's traffic. The new node MUST have
-# spur_wg_address in inventory. For a single-controller cluster this is just controllers[0] + node.
+# ALL existing mesh members (controllers + agents + login) AND the new node run the role together:
+# the new node net-joins the bootstrap, and every existing member both registers the new node as a
+# peer and re-publishes its own pubkey so it appears in the full-mesh membership doc. Running only
+# controllers + new node would (a) leave a re-added node whose key changed with a stale key on the
+# non-bootstrap members, and (b) exclude pre-existing WORKERS from the membership doc, so the new
+# node would peer the controllers but not the other workers (full mesh only on a fresh deploy.yml).
+# Existing members whose conf already exists just restore it (A1 guard) — no re-key. The new node
+# MUST have spur_wg_address in inventory. Single-controller clusters collapse to controller + node.
 - name: Join new node(s) to the WireGuard mesh
-  hosts: "spur_controllers:{{ new_nodes | default('') | split(',') | map('trim') | select | join(':') }}"
+  hosts: "spur_controllers:spur_agents:spur_login:{{ new_nodes | default('') | split(',') | map('trim') | select | join(':') }}"
   become: true
   gather_facts: no
   any_errors_fatal: true

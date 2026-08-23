@@ -56,19 +56,28 @@
           {% if spur_k8s_nodes | default('') | length > 0 %}--nodes {{ spur_k8s_nodes }}{% endif %}
       register: k8s_up_out
       changed_when: "'up requested' in k8s_up_out.stdout"
+      # `spur k8s up` prints the rejection reason to stderr ("... NOT accepted: ...") but still
+      # exits 0, so without this a rejected request falls through to the readiness poll and times
+      # out with a generic error instead of surfacing why. Fail here with the real reason.
+      failed_when: "'NOT accepted' in (k8s_up_out.stderr | default(''))"
 
     - name: Show the up response
       ansible.builtin.debug:
         var: k8s_up_out.stdout_lines
 
     - name: Wait for the cluster to reach ready
+      # pipefail so a failing `spur k8s status` (e.g. controller unreachable) surfaces instead of
+      # awk swallowing it and looking identical to "not ready yet".
       ansible.builtin.shell: |
+        set -o pipefail
         {{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }} 2>/dev/null \
           | awk '/^phase:/ {print $2}'
       args:
         executable: /bin/bash
       register: k8s_phase
-      until: k8s_phase.stdout | trim == 'ready'
+      # Fold the terminal 'degraded' state into `until` so a degraded result fails fast instead of
+      # burning the whole retry budget (failed_when is only evaluated after the loop ends).
+      until: k8s_phase.stdout | trim in ['ready', 'degraded']
       retries: "{{ k8s_ready_retries }}"
       delay: "{{ k8s_ready_delay }}"
       changed_when: false

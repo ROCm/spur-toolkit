@@ -93,13 +93,20 @@
     - spur_wg_address is not defined
 
 - name: Initialize WireGuard mesh on the controller
-  # Initialized only when the interface is up AND its conf exists; a live interface with no conf
-  # can't persist, so down the stale link and re-init to rewrite the conf.
+  # `spur net init` mints a FRESH keypair every run, so re-running it rotates this node's
+  # identity and breaks every peer that trusts the old key. Gate strictly on the on-disk conf:
+  #   - conf present, iface up   -> nothing to do
+  #   - conf present, iface down -> bring it up from the existing conf (keep the key)
+  #   - conf absent              -> first-time init (writes conf + key, brings iface up)
   ansible.builtin.shell: |
     set -euo pipefail
-    if ip link show {{ spur_wg_interface }} >/dev/null 2>&1 \
-       && [ -f /etc/wireguard/{{ spur_wg_interface }}.conf ]; then
-      echo "SPUR_WG_ALREADY_UP"
+    if [ -f /etc/wireguard/{{ spur_wg_interface }}.conf ]; then
+      if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+        echo "SPUR_WG_ALREADY_UP"
+      else
+        wg-quick up {{ spur_wg_interface }} 1>&2
+        echo "SPUR_WG_RESTORED_FROM_CONF"
+      fi
     else
       ip link show {{ spur_wg_interface }} >/dev/null 2>&1 \
         && { wg-quick down {{ spur_wg_interface }} 2>/dev/null || ip link del {{ spur_wg_interface }} 2>/dev/null || true; }
@@ -133,13 +140,20 @@
   when: inventory_hostname in spur_wg_joiners
 
 - name: Join WireGuard mesh on agents and login nodes
-  # --prefix-len must match spur_wg_cidr or the address/AllowedIPs are wrong. As with init,
-  # re-join when the interface is up but its conf is missing so the on-disk conf always exists.
+  # `spur net join` also mints a FRESH keypair every run (same rotation hazard as init), so gate
+  # strictly on the on-disk conf — never re-join when a conf already exists, just restore it:
+  #   - conf present, iface up   -> nothing to do
+  #   - conf present, iface down -> wg-quick up from the existing conf (keep the key)
+  #   - conf absent              -> first-time join. --prefix-len must match spur_wg_cidr.
   ansible.builtin.shell: |
     set -euo pipefail
-    if ip link show {{ spur_wg_interface }} >/dev/null 2>&1 \
-       && [ -f /etc/wireguard/{{ spur_wg_interface }}.conf ]; then
-      echo "SPUR_WG_ALREADY_UP"
+    if [ -f /etc/wireguard/{{ spur_wg_interface }}.conf ]; then
+      if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+        echo "SPUR_WG_ALREADY_UP"
+      else
+        wg-quick up {{ spur_wg_interface }} 1>&2
+        echo "SPUR_WG_RESTORED_FROM_CONF"
+      fi
     else
       ip link show {{ spur_wg_interface }} >/dev/null 2>&1 \
         && { wg-quick down {{ spur_wg_interface }} 2>/dev/null || ip link del {{ spur_wg_interface }} 2>/dev/null || true; }
@@ -175,13 +189,9 @@
   when: inventory_hostname in groups['spur_controllers']
 
 - name: Register joiners as peers on EVERY controller
-  # Runs on every controller present in this play, not just the bootstrap: in a
-  # multi-controller mesh each controller must peer each joiner directly (Raft
-  # controller<->controller, and a re-added node whose key changed must be
-  # refreshed on ALL controllers, not only the bootstrap — otherwise the other
-  # controllers keep the stale key and drop its traffic). For a single-controller
-  # cluster this loops once on that one controller, unchanged from before.
-  # --endpoint is the joiner's underlay address (NIC IP + wg port), not its mesh IP.
+  # Every controller (not just the bootstrap) must peer each joiner, so a re-added node whose key
+  # changed is refreshed everywhere rather than leaving a stale key on the others. --endpoint is
+  # the joiner's underlay address (NIC IP + wg port), not its mesh IP. Single controller: loops once.
   ansible.builtin.command: >-
     {{ spur_install_dir }}/spur net add-peer
       --key {{ hostvars[item]['spur_wg_pubkey'] }}
@@ -194,27 +204,11 @@
     - item != inventory_hostname
   changed_when: true
 
-# ---------------------------------------------------------------------------
-# Full-mesh pass (HA only: more than one controller).
-#
-# `net join` + `add-peer` above build a hub-and-spoke — every joiner peers only
-# the bootstrap controller. That is fine when [cluster].enabled runs the
-# controller's reconcile loop (it converges the full mesh), but a pure-spurd HA
-# cluster has no such loop, and Raft REQUIRES the controllers to reach each other
-# directly (.1<->.3<->.4) to hold elections when the bootstrap is down. So on
-# every mesh node we run `spur net mesh`, which programs the remaining node<->node
-# tunnels from a shared membership document. Additive and idempotent; it does not
-# disturb the bootstrap peer each joiner already has.
-#
-# Gated on >1 controller so single-controller clusters are byte-for-byte
-# unchanged (they keep relying on the reconcile loop / hub-and-spoke as before).
-#
-# The membership doc is built only from members whose pubkey is known in THIS
-# play (spur_wg_selfkey defined). In a full deploy that is every node, giving a
-# complete mesh. In the incremental add_nodes.yml play — which runs only on the
-# bootstrap controller + the new node — it is just those, so `net mesh` still
-# wires the new node to the bootstrap (the other controllers keep their existing
-# full-mesh entries and re-handshake the new node from their side).
+# Full-mesh pass (HA only, >1 controller): net join/add-peer above yield hub-and-spoke, but a
+# pure-spurd HA cluster has no reconcile loop and Raft needs controller<->controller reachability,
+# so `net mesh` programs the remaining node<->node tunnels from a shared membership doc. Built only
+# from members whose pubkey is known this play (spur_wg_selfkey), so it never errors on a node that
+# didn't run. Gated on >1 controller so single-controller clusters are unchanged.
 - name: Read this node's own WG public key (all mesh members)
   ansible.builtin.command: "wg show {{ spur_wg_interface }} public-key"
   register: wg_selfkey
@@ -263,15 +257,30 @@
       --self {{ spur_wg_address }}
       --interface {{ spur_wg_interface }}
   register: wg_mesh_apply
-  changed_when: true
+  # `net mesh` prints how many peers it applied; treat a non-zero count as changed
+  # rather than always-changed, so an unchanged re-run isn't reported as a change.
+  changed_when: "'0 peer(s)' not in (wg_mesh_apply.stderr | default(''))"
   when:
     - groups['spur_controllers'] | length > 1
     - spur_wg_mesh_members | default([]) | length > 1
     - inventory_hostname in spur_wg_mesh_members
 
-# net init/join bring the interface up but never enable the systemd unit, so it's gone on reboot.
-# Enabling wg-quick@<iface> recreates it from the conf; spurctld then re-pushes peer membership.
-- name: Enable wg-quick@{{ spur_wg_interface }} so the mesh survives reboot
+# `net add-peer`/`net mesh` only program the LIVE kernel interface (`wg set`); they never write
+# the on-disk conf. `net init`/`join` wrote it once with zero (init) or one (join) peer. So the
+# conf does NOT reflect the full peer set, and enabling wg-quick@ alone would restore a nearly
+# empty mesh on reboot. Snapshot the live peers into the conf first with `wg-quick save`, then the
+# unit brings the full mesh back. (spurctld's reconcile re-pushes membership too, but only under
+# [cluster].enabled — a pure-spurd mesh relies on this saved conf.)
+- name: Persist the live peer set into the on-disk conf (wg-quick save)
+  ansible.builtin.command: "wg-quick save {{ spur_wg_interface }}"
+  register: wg_save
+  changed_when: true
+  # Only when the interface is actually up (it is, after init/join/mesh above); a save with no
+  # live interface would error. Harmless no-op to re-run.
+  when:
+    - spur_wg_persist | default(true) | bool
+
+- name: Enable wg-quick@{{ spur_wg_interface }} so the saved mesh survives reboot
   ansible.builtin.systemd:
     name: "wg-quick@{{ spur_wg_interface }}"
     enabled: true
