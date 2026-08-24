@@ -95,6 +95,27 @@
         - "/etc/wireguard/{{ spur_wg_interface }}.conf"
       when: (wipe | default(false) | bool) and spur_ok_to_disrupt
 
+    - name: Remove SPUR_CONTROLLER_ADDR from /etc/environment (only when -e wipe=true)
+      # Otherwise a stale/wrong endpoint (e.g. a node's own underlay IP left by a prior run)
+      # persists and the CLI on this host talks to the wrong place after a fresh deploy.
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: '^SPUR_CONTROLLER_ADDR='
+        state: absent
+      when: (wipe | default(false) | bool) and spur_ok_to_disrupt
+
+    - name: Note SPUR_CONTROLLER_ADDR is left in place on a non-wipe teardown
+      # A plain teardown stops the daemons but keeps SPUR_CONTROLLER_ADDR, which now points at a
+      # stopped controller — the CLI on this host will fail until the next deploy re-sets it. Flag
+      # it (matching the "still has a running job" note) so it isn't a silent surprise. Re-run with
+      # -e wipe=true to clear it.
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: SPUR_CONTROLLER_ADDR left in /etc/environment but the
+          controller is now stopped — the CLI here will fail until a redeploy. Re-run teardown
+          with -e wipe=true to clear it.
+      when: (not (wipe | default(false) | bool)) and spur_ok_to_disrupt
+
     - name: Note this host was left untouched (still has a running job)
       ansible.builtin.debug:
         msg: >-

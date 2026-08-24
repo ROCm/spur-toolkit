@@ -1,8 +1,14 @@
 ---
-# WireGuard mesh setup. The `spur net` CLI supports a single controller (which
-# auto-assigns itself .1) plus N agents that join and are registered as peers.
-# Multi-controller (HA) WireGuard is not supported by the CLI, so this role
-# asserts a single controller.
+# WireGuard mesh setup. `spur net init` bootstraps the mesh on the FIRST
+# controller (auto-assigns .1); every other node — additional controllers (HA),
+# agents, and login nodes — `spur net join`s and is registered as a peer.
+# Because `net join`/`add-peer` alone yield a hub-and-spoke (each joiner peers
+# only the bootstrap controller), a final `spur net mesh` pass programs the
+# remaining node↔node tunnels so the mesh is fully connected — required for
+# HA Raft, where controllers must reach each other directly (.1<->.3<->.4),
+# not only via the bootstrap node. Under [cluster].enabled the controller's own
+# reconcile loop maintains this; for a pure-spurd HA cluster this role is the
+# only thing that forms it.
 - name: Assert ansible.utils collection is available (provides ipaddr/ipmath)
   ansible.builtin.assert:
     that:
@@ -13,16 +19,6 @@
       ansible-galaxy collection install -r requirements.yml
   run_once: true
   delegate_to: localhost
-
-- name: Assert a single controller (CLI WireGuard mesh is single-controller only)
-  ansible.builtin.assert:
-    that:
-      - groups['spur_controllers'] | length == 1
-    fail_msg: >-
-      WireGuard transport supports exactly one controller (spur net init
-      auto-assigns the controller .1 and there is no multi-controller mesh
-      command). Use spur_transport=direct for HA, or a single controller.
-  run_once: true
 
 - name: Assert wireguard module is loadable
   ansible.builtin.shell: "modinfo wireguard >/dev/null 2>&1"
@@ -41,9 +37,21 @@
     state: present
   when: ansible_os_family == 'RedHat'
 
-# The controller always gets .1 (assigned by `spur net init`). Every other mesh
-# member (agents, then login-only nodes) gets a unique address by position:
-# .2, .3, ... A per-host spur_wg_address set in inventory always wins.
+# The bootstrap controller (first in the group) gets .1 via `spur net init`.
+# Every other mesh member — secondary controllers (HA), then non-controller
+# agents, then login-only nodes — joins and gets a unique address by position:
+# .2, .3, ... A per-host spur_wg_address set in inventory always wins (the HA
+# testbeds pin every node explicitly, which bypasses this positional scheme).
+- name: Identify the bootstrap controller (inits the mesh, .1)
+  ansible.builtin.set_fact:
+    spur_wg_bootstrap: "{{ groups['spur_controllers'][0] }}"
+
+# Secondary controllers (HA): controllers other than the bootstrap. They do NOT
+# init — they join the mesh like any other node so Raft peers reach each other.
+- name: Build ordered secondary-controller list (HA controllers that join)
+  ansible.builtin.set_fact:
+    spur_wg_secondary_controllers: "{{ groups['spur_controllers'][1:] }}"
+
 - name: Build ordered agent list (non-controller agents)
   ansible.builtin.set_fact:
     spur_wg_agents: "{{ groups['spur_agents'] | difference(groups['spur_controllers']) }}"
@@ -58,44 +66,50 @@
          | difference(groups['spur_controllers'])
          | difference(groups['spur_agents']) }}
 
-# Everything that joins the mesh (as opposed to the controller, which inits it):
-# agents first, then login-only nodes. Used for the join/pubkey/peer-registration
-# steps below so login nodes go through the identical flow as agents.
-- name: Build combined joiner list (agents + login-only nodes)
+# Everything that joins the mesh (as opposed to the bootstrap controller, which
+# inits it): secondary controllers first, then agents, then login-only nodes.
+# Used for the join/pubkey/peer-registration/full-mesh steps below so every
+# joiner class goes through the identical flow. For a single-controller cluster
+# spur_wg_secondary_controllers is empty, so this is unchanged from before.
+- name: Build combined joiner list (secondary controllers + agents + login-only)
   ansible.builtin.set_fact:
-    spur_wg_joiners: "{{ spur_wg_agents + spur_wg_login }}"
+    spur_wg_joiners: "{{ spur_wg_secondary_controllers + spur_wg_agents + spur_wg_login }}"
 
-- name: Set controller WG address to the mesh .1
+- name: Set bootstrap controller WG address to the mesh .1
   ansible.builtin.set_fact:
     spur_wg_address: "{{ spur_wg_cidr | ansible.utils.ipaddr('network') | ansible.utils.ipmath(1) }}"
   when:
-    - inventory_hostname in groups['spur_controllers']
+    - inventory_hostname == spur_wg_bootstrap
     - spur_wg_address is not defined
 
-- name: Assign each agent a unique WG address (.2, .3, ... by position)
+# Joiners are numbered .2, .3, ... by their position in the combined joiner list
+# (secondary controllers, then agents, then login). A single-controller cluster
+# has no secondary controllers, so agents still start at .2 exactly as before.
+- name: Assign each joiner a unique WG address (.2, .3, ... by position)
   ansible.builtin.set_fact:
-    spur_wg_address: "{{ spur_wg_cidr | ansible.utils.ipaddr('network') | ansible.utils.ipmath(spur_wg_agents.index(inventory_hostname) + 2) }}"
+    spur_wg_address: "{{ spur_wg_cidr | ansible.utils.ipaddr('network') | ansible.utils.ipmath(spur_wg_joiners.index(inventory_hostname) + 2) }}"
   when:
-    - inventory_hostname in spur_wg_agents
-    - spur_wg_address is not defined
-
-# Login-only nodes continue the numbering after the agents so addresses never
-# collide: first login node = .(len(agents)+2), next = +1, and so on.
-- name: Assign each login-only node a unique WG address (after the agents)
-  ansible.builtin.set_fact:
-    spur_wg_address: "{{ spur_wg_cidr | ansible.utils.ipaddr('network') | ansible.utils.ipmath(spur_wg_agents | length + spur_wg_login.index(inventory_hostname) + 2) }}"
-  when:
-    - inventory_hostname in spur_wg_login
+    - inventory_hostname in spur_wg_joiners
     - spur_wg_address is not defined
 
 - name: Initialize WireGuard mesh on the controller
-  # `spur net init` auto-assigns .1 from --cidr and logs to stderr. It is not
-  # idempotent, so only run it when the interface is not already up.
+  # `spur net init` mints a FRESH keypair every run, so re-running it rotates this node's
+  # identity and breaks every peer that trusts the old key. Gate strictly on the on-disk conf:
+  #   - conf present, iface up   -> nothing to do
+  #   - conf present, iface down -> bring it up from the existing conf (keep the key)
+  #   - conf absent              -> first-time init (writes conf + key, brings iface up)
   ansible.builtin.shell: |
     set -euo pipefail
-    if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
-      echo "SPUR_WG_ALREADY_UP"
+    if [ -f /etc/wireguard/{{ spur_wg_interface }}.conf ]; then
+      if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+        echo "SPUR_WG_ALREADY_UP"
+      else
+        wg-quick up {{ spur_wg_interface }} 1>&2
+        echo "SPUR_WG_RESTORED_FROM_CONF"
+      fi
     else
+      ip link show {{ spur_wg_interface }} >/dev/null 2>&1 \
+        && { wg-quick down {{ spur_wg_interface }} 2>/dev/null || ip link del {{ spur_wg_interface }} 2>/dev/null || true; }
       {{ spur_install_dir }}/spur net init \
         --cidr {{ spur_wg_cidr }} \
         --port {{ spur_wg_port }} \
@@ -105,18 +119,18 @@
     executable: /bin/bash
   register: wg_ctl_init
   changed_when: "'SPUR_WG_ALREADY_UP' not in wg_ctl_init.stdout"
-  when: inventory_hostname in groups['spur_controllers']
+  when: inventory_hostname == spur_wg_bootstrap
 
-- name: Read controller WG public key
+- name: Read bootstrap controller WG public key
   ansible.builtin.command: "wg show {{ spur_wg_interface }} public-key"
   register: wg_ctl_pubkey
   changed_when: false
-  when: inventory_hostname in groups['spur_controllers']
+  when: inventory_hostname == spur_wg_bootstrap
 
-- name: Broadcast controller pubkey + endpoint to all hosts
+- name: Broadcast bootstrap controller pubkey + endpoint to all hosts
   ansible.builtin.set_fact:
-    spur_wg_controller_pubkey: "{{ hostvars[groups['spur_controllers'][0]]['wg_ctl_pubkey'].stdout | trim }}"
-    spur_wg_controller_endpoint: "{{ hostvars[groups['spur_controllers'][0]]['ansible_host'] | default(groups['spur_controllers'][0]) }}:{{ spur_wg_port }}"
+    spur_wg_controller_pubkey: "{{ hostvars[spur_wg_bootstrap]['wg_ctl_pubkey'].stdout | trim }}"
+    spur_wg_controller_endpoint: "{{ hostvars[spur_wg_bootstrap]['ansible_host'] | default(spur_wg_bootstrap) }}:{{ spur_wg_port }}"
 
 - name: Assert each joiner (agent or login node) has a WG address before join
   ansible.builtin.assert:
@@ -126,14 +140,23 @@
   when: inventory_hostname in spur_wg_joiners
 
 - name: Join WireGuard mesh on agents and login nodes
-  # `spur net join` needs --prefix-len to match spur_wg_cidr (defaults to 16),
-  # else the interface address/AllowedIPs are wrong. Logs to stderr. Login nodes
-  # join identically to agents — they just don't run a daemon afterward.
+  # `spur net join` also mints a FRESH keypair every run (same rotation hazard as init), so gate
+  # strictly on the on-disk conf — never re-join when a conf already exists, just restore it:
+  #   - conf present, iface up   -> nothing to do
+  #   - conf present, iface down -> wg-quick up from the existing conf (keep the key)
+  #   - conf absent              -> first-time join. --prefix-len must match spur_wg_cidr.
   ansible.builtin.shell: |
     set -euo pipefail
-    if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
-      echo "SPUR_WG_ALREADY_UP"
+    if [ -f /etc/wireguard/{{ spur_wg_interface }}.conf ]; then
+      if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+        echo "SPUR_WG_ALREADY_UP"
+      else
+        wg-quick up {{ spur_wg_interface }} 1>&2
+        echo "SPUR_WG_RESTORED_FROM_CONF"
+      fi
     else
+      ip link show {{ spur_wg_interface }} >/dev/null 2>&1 \
+        && { wg-quick down {{ spur_wg_interface }} 2>/dev/null || ip link del {{ spur_wg_interface }} 2>/dev/null || true; }
       {{ spur_install_dir }}/spur net join \
         --endpoint {{ spur_wg_controller_endpoint }} \
         --server-key {{ spur_wg_controller_pubkey }} \
@@ -158,15 +181,110 @@
     spur_wg_pubkey: "{{ wg_agent_pubkey.stdout | trim }}"
   when: inventory_hostname in spur_wg_joiners
 
-- name: Register all joiners (agents + login nodes) as peers on the controller
+# Only joiners in THIS play have a pubkey — add_nodes.yml runs just the new node, so existing
+# nodes have no spur_wg_pubkey in hostvars. Register only those that joined this run.
+- name: Select joiners that joined this run
+  ansible.builtin.set_fact:
+    spur_wg_registerable: "{{ spur_wg_joiners | select('in', groups['all']) | map('extract', hostvars) | selectattr('spur_wg_pubkey', 'defined') | map(attribute='inventory_hostname') | list }}"
+  when: inventory_hostname in groups['spur_controllers']
+
+- name: Register joiners as peers on EVERY controller
+  # Every controller (not just the bootstrap) must peer each joiner, so a re-added node whose key
+  # changed is refreshed everywhere rather than leaving a stale key on the others. --endpoint is
+  # the joiner's underlay address (NIC IP + wg port), not its mesh IP. Single controller: loops once.
   ansible.builtin.command: >-
     {{ spur_install_dir }}/spur net add-peer
       --key {{ hostvars[item]['spur_wg_pubkey'] }}
       --allowed-ip {{ hostvars[item]['spur_wg_address'] }}/32
+      --endpoint {{ hostvars[item]['ansible_host'] | default(item) }}:{{ spur_wg_port }}
       --interface {{ spur_wg_interface }}
-  loop: "{{ spur_wg_joiners }}"
-  when: inventory_hostname == groups['spur_controllers'][0]
+  loop: "{{ spur_wg_registerable | default([]) }}"
+  when:
+    - inventory_hostname in groups['spur_controllers']
+    - item != inventory_hostname
   changed_when: true
+
+# Full-mesh pass (HA only, >1 controller): net join/add-peer above yield hub-and-spoke, but a
+# pure-spurd HA cluster has no reconcile loop and Raft needs controller<->controller reachability,
+# so `net mesh` programs the remaining node<->node tunnels from a shared membership doc. Built only
+# from members whose pubkey is known this play (spur_wg_selfkey), so it never errors on a node that
+# didn't run. Gated on >1 controller so single-controller clusters are unchanged.
+- name: Read this node's own WG public key (all mesh members)
+  ansible.builtin.command: "wg show {{ spur_wg_interface }} public-key"
+  register: wg_selfkey
+  changed_when: false
+  when: groups['spur_controllers'] | length > 1
+
+- name: Publish own pubkey as a hostvar
+  ansible.builtin.set_fact:
+    spur_wg_selfkey: "{{ wg_selfkey.stdout | trim }}"
+  when: groups['spur_controllers'] | length > 1
+
+- name: Build the set of mesh members whose pubkey is known this play
+  # selectattr on spur_wg_selfkey so a node that did NOT run in this play (e.g.
+  # the non-bootstrap controllers during add_nodes.yml) is excluded rather than
+  # rendering an undefined-attribute error.
+  ansible.builtin.set_fact:
+    spur_wg_mesh_members: >-
+      {{ (groups['spur_controllers'] + groups['spur_agents'] + groups.get('spur_login', []))
+         | unique
+         | map('extract', hostvars)
+         | selectattr('spur_wg_selfkey', 'defined')
+         | map(attribute='inventory_hostname') | list }}
+  when: groups['spur_controllers'] | length > 1
+
+- name: Assemble the full-mesh membership document on every node
+  # Render the JSON directly with a {% for %} block (Jinja list comprehensions
+  # inside a dict literal aren't accepted here, and a from_json round-trip hits
+  # Ansible's list/str coercion) — copy writes the string verbatim.
+  ansible.builtin.copy:
+    dest: "/etc/wireguard/{{ spur_wg_interface }}-mesh.json"
+    mode: "0600"
+    content: |
+      {"nodes": [
+      {% for h in spur_wg_mesh_members %}
+        {"hostname": "{{ h }}", "public_key": "{{ hostvars[h].spur_wg_selfkey }}", "mesh_ip": "{{ hostvars[h].spur_wg_address }}", "endpoint": "{{ hostvars[h].ansible_host | default(h) }}:{{ spur_wg_port }}"}{% if not loop.last %},{% endif %}
+      {% endfor %}
+      ]}
+  when:
+    - groups['spur_controllers'] | length > 1
+    - spur_wg_mesh_members | default([]) | length > 1
+
+- name: Apply full mesh on every node (forms node<->node tunnels, incl. controller<->controller)
+  ansible.builtin.command: >-
+    {{ spur_install_dir }}/spur net mesh
+      --config /etc/wireguard/{{ spur_wg_interface }}-mesh.json
+      --self {{ spur_wg_address }}
+      --interface {{ spur_wg_interface }}
+  register: wg_mesh_apply
+  # `net mesh` prints how many peers it applied; treat a non-zero count as changed
+  # rather than always-changed, so an unchanged re-run isn't reported as a change.
+  changed_when: "'0 peer(s)' not in (wg_mesh_apply.stderr | default(''))"
+  when:
+    - groups['spur_controllers'] | length > 1
+    - spur_wg_mesh_members | default([]) | length > 1
+    - inventory_hostname in spur_wg_mesh_members
+
+# `net add-peer`/`net mesh` only program the LIVE kernel interface (`wg set`); they never write
+# the on-disk conf. `net init`/`join` wrote it once with zero (init) or one (join) peer. So the
+# conf does NOT reflect the full peer set, and enabling wg-quick@ alone would restore a nearly
+# empty mesh on reboot. Snapshot the live peers into the conf first with `wg-quick save`, then the
+# unit brings the full mesh back. (spurctld's reconcile re-pushes membership too, but only under
+# [cluster].enabled — a pure-spurd mesh relies on this saved conf.)
+- name: Persist the live peer set into the on-disk conf (wg-quick save)
+  ansible.builtin.command: "wg-quick save {{ spur_wg_interface }}"
+  register: wg_save
+  changed_when: true
+  # Only when the interface is actually up (it is, after init/join/mesh above); a save with no
+  # live interface would error. Harmless no-op to re-run.
+  when:
+    - spur_wg_persist | default(true) | bool
+
+- name: Enable wg-quick@{{ spur_wg_interface }} so the saved mesh survives reboot
+  ansible.builtin.systemd:
+    name: "wg-quick@{{ spur_wg_interface }}"
+    enabled: true
+  when: spur_wg_persist | default(true) | bool
 
 - name: Verify mesh — every host pings controller WG IP
   ansible.builtin.command: "ping -c2 -W2 {{ hostvars[groups['spur_controllers'][0]]['spur_wg_address'] }}"

@@ -70,6 +70,24 @@
   gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   tasks: []
 
+# Join the new node to the mesh BEFORE spurd starts (spurd reaches the controller over the mesh).
+# ALL existing mesh members (controllers + agents + login) AND the new node run the role together:
+# the new node net-joins the bootstrap, and every existing member both registers the new node as a
+# peer and re-publishes its own pubkey so it appears in the full-mesh membership doc. Running only
+# controllers + new node would (a) leave a re-added node whose key changed with a stale key on the
+# non-bootstrap members, and (b) exclude pre-existing WORKERS from the membership doc, so the new
+# node would peer the controllers but not the other workers (full mesh only on a fresh deploy.yml).
+# Existing members whose conf already exists just restore it (A1 guard) — no re-key. The new node
+# MUST have spur_wg_address in inventory. Single-controller clusters collapse to controller + node.
+- name: Join new node(s) to the WireGuard mesh
+  hosts: "spur_controllers:spur_agents:spur_login:{{ new_nodes | default('') | split(',') | map('trim') | select | join(':') }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  roles:
+    - role: spur_wireguard
+      when: spur_transport | default('direct') == 'wireguard'
+
 # --- Install + start spurd on the NEW nodes only ---
 # Skip any that are already registered (idempotent re-runs must not restart a
 # healthy new agent). spur_install + spur_agent only ever touch the node they run

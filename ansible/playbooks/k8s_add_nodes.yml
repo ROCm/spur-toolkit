@@ -1,0 +1,79 @@
+---
+# Add worker node(s) to a RUNNING SPUR-managed k0s cluster.
+#
+# Wraps `spur k8s add-nodes`, which scopes additional registered nodes into the
+# k0s cluster with no down/reset: the controller assigns each a role/mesh IP/pod
+# CIDR, installs+joins k0s, and folds it into the WireGuard full mesh. The node(s)
+# MUST already be registered spur agents (run add_nodes.yml or deploy.yml first).
+#
+# Run:
+#   ansible-playbook playbooks/k8s_add_nodes.yml -i inventory/hosts.ini -e k8s_new_nodes=gpu-3,gpu-4
+
+- name: Add worker nodes to the k0s cluster
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    ctrl_addr: "http://{{ hostvars[groups['spur_controllers'][0]]['spur_controller_listen_ip'] | default('127.0.0.1') }}:{{ spur_controller_port }}"
+    add_list: "{{ k8s_new_nodes | default('') | split(',') | map('trim') | select | list }}"
+    k8s_ready_retries: 40
+    k8s_ready_delay: 15
+  tasks:
+    - name: Require k8s_new_nodes
+      ansible.builtin.assert:
+        that:
+          - add_list | length > 0
+        fail_msg: "Pass the node(s) to add, e.g. -e k8s_new_nodes=gpu-3,gpu-4"
+        quiet: true
+
+    - name: Each node must already be a registered spur agent
+      ansible.builtin.shell: |
+        {{ spur_install_dir }}/spur show node {{ item }} 2>/dev/null \
+          | grep -qx "NodeName={{ item }}"
+      args:
+        executable: /bin/bash
+      loop: "{{ add_list }}"
+      changed_when: false
+
+    - name: spur k8s add-nodes
+      ansible.builtin.command: >-
+        {{ spur_install_dir }}/spur k8s add-nodes
+          --controller {{ ctrl_addr }}
+          --nodes {{ add_list | join(',') }}
+      register: k8s_add_out
+      changed_when: "'add-nodes requested' in k8s_add_out.stdout"
+      # add-nodes prints its rejection reason to stderr ("... NOT accepted: ...") but exits 0, so
+      # fail here with the real reason instead of falling through to a generic readiness timeout.
+      failed_when: "'NOT accepted' in (k8s_add_out.stderr | default(''))"
+
+    - name: Show the add-nodes response
+      ansible.builtin.debug:
+        var: k8s_add_out.stdout_lines
+
+    - name: Wait for the cluster to settle back to ready
+      # pipefail so a failing `spur k8s status` surfaces instead of awk masking it as "not ready".
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }} 2>/dev/null \
+          | awk '/^phase:/ {print $2}'
+      args:
+        executable: /bin/bash
+      register: k8s_phase
+      # Fold 'degraded' into `until` so it fails fast instead of exhausting the retry budget.
+      until: k8s_phase.stdout | trim in ['ready', 'degraded']
+      retries: "{{ k8s_ready_retries }}"
+      delay: "{{ k8s_ready_delay }}"
+      changed_when: false
+      failed_when: k8s_phase.stdout | trim == 'degraded'
+
+    - name: Final cluster status
+      ansible.builtin.command: "{{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }}"
+      register: k8s_final
+      changed_when: false
+
+    - name: Result
+      ansible.builtin.debug:
+        msg:
+          - "Added to k0s cluster: {{ add_list | join(', ') }}"
+          - "{{ k8s_final.stdout_lines }}"
