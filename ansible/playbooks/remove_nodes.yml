@@ -151,6 +151,8 @@
   gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   # An unrelated agent being down must not abort the removal (the play already
   # intends to skip unreachable nodes). Opt in with spur_ignore_unreachable_agents.
+  # An unreachable host has no gathered facts, so the when: guards below fall back
+  # to inventory_hostname (ansible_hostname | default(...)) to avoid an undefined-var error.
   ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   vars:
     # rn_actual_remove_list was set via plain set_fact on the controller in
@@ -166,14 +168,14 @@
       ansible.builtin.include_tasks: tasks/kill_workload_processes.yml
       when: >-
         (spur_force_remove_busy_nodes | default(false) | bool)
-        and (rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length > 0)
+        and (rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0)
 
     - name: Stop + disable spurd on nodes being removed
       ansible.builtin.systemd:
         name: spurd
         state: stopped
         enabled: false
-      when: rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length > 0
+      when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
       failed_when: false
 
     # Mesh cleanup (wireguard only). Capture this node's pubkey so the controller can drop it as a
@@ -185,7 +187,7 @@
       failed_when: false
       when:
         - spur_transport | default('direct') == 'wireguard'
-        - rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length > 0
+        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
 
     - name: Tear down the mesh interface on the removed node
       ansible.builtin.shell: |
@@ -197,7 +199,7 @@
       changed_when: true
       when:
         - spur_transport | default('direct') == 'wireguard'
-        - rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length > 0
+        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
 
 # Drop the removed node's WG peer from every SURVIVING member (wireguard only), not just controllers:
 # net mesh peered it with every node and wg-quick save persisted that, so it lingers as a ghost peer
@@ -231,7 +233,7 @@
       when:
         - spur_transport | default('direct') == 'wireguard'
         # Skip members that are themselves being removed (interface already gone).
-        - rn_actual_remove_list | intersect([ansible_hostname, inventory_hostname]) | length == 0
+        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length == 0
         - hostvars[item].rn_wg_pubkey is defined
         - (hostvars[item].rn_wg_pubkey.stdout | default('') | trim) | length > 0
 
