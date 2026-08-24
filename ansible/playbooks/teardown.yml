@@ -76,8 +76,11 @@
       changed_when: false
       when: spur_ok_to_disrupt
 
-    - name: Tear down WireGuard interface
+    - name: Tear down WireGuard interface + disable its boot unit
+      # deploy.yml enables wg-quick@<iface>; without disabling it, `wg-quick down`
+      # stops the live interface but the mesh re-establishes on the next reboot.
       ansible.builtin.shell: |
+        systemctl disable wg-quick@{{ spur_wg_interface }} 2>/dev/null || true
         if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
           wg-quick down {{ spur_wg_interface }} || ip link del {{ spur_wg_interface }}
         fi

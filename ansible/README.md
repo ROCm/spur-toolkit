@@ -50,7 +50,7 @@ A few things to know:
 |---|---|---|
 | Single-node | one host in **both** `spur_controllers` and `spur_agents` | local loopback |
 | Multi-node — direct LAN | one host in `spur_controllers`, all compute in `spur_agents` | LAN IP, unencrypted |
-| Multi-node — WireGuard mesh | as above + `spur_transport=wireguard` (single controller only) | encrypted mesh on `spur0` |
+| Multi-node — WireGuard mesh | as above + `spur_transport=wireguard` | encrypted mesh on `spur0` |
 | HA — multi-controller Raft | **≥ 3 hosts** in `spur_controllers` (any number in `spur_agents`); auto-enabled | direct or wireguard |
 | HA — separate compute | `spur_controllers` and `spur_agents` are **disjoint** host sets | direct or wireguard |
 
@@ -119,7 +119,7 @@ ansible-playbook playbooks/deploy.yml -i <inventory> -e spur_binary_src=<path> [
 | HA, hyperconverged | `inventory/ha.ini` | *(none)* |
 | HA, separate compute | `inventory/ha-separate.ini` | *(none)* |
 | No accounting (jobs still run, `sacct` unavailable) | `inventory/multi.ini` | `-e spur_accounting_enabled=false` |
-| WireGuard transport | `inventory/multi.ini` | `-e spur_transport=wireguard` |
+| WireGuard transport (single- or multi-controller) | `inventory/multi.ini` or `inventory/ha.ini` | `-e spur_transport=wireguard` |
 | Preserve Raft state on re-deploy (production default) | `inventory/ha.ini` | `-e spur_wipe_state=false` |
 | One host only (e.g. re-push config to a single agent) | `inventory/multi.ini` | `--limit gpu-1` |
 | Dry-run without applying | `inventory/multi.ini` | `--check --diff` |
@@ -172,7 +172,7 @@ spur_wg_cidr=10.44.0.0/16
 spur_wg_port=51820
 ```
 
-> WireGuard is **single-controller only**, so use `direct` for HA. `spur net init` auto-assigns the controller `.1`, and there's no multi-controller mesh command. Agents auto-assign `.2`, `.3`, … by inventory position; override any host with `spur_wg_address=…`. This needs the `ansible.utils` collection on the control node.
+> WireGuard supports both single- and multi-controller (HA) clusters. The bootstrap controller (first in `spur_controllers`) runs `spur net init` and auto-assigns `.1`; every other node — secondary controllers, agents, and login nodes — joins and auto-assigns `.2`, `.3`, … by position. For HA (>1 controller) a full-mesh pass (`spur net mesh`) then peers every node with every other, including controller↔controller, so Raft elections work over the mesh. Override any host with `spur_wg_address=…`. This needs the `ansible.utils` collection on the control node. See [HA — WireGuard mesh](#ha--wireguard-mesh-multi-controller) below for the multi-controller layout.
 
 ### HA — multi-controller Raft (hyperconverged)
 
@@ -200,6 +200,25 @@ ctl-2 ansible_host=10.0.0.12 ansible_user=root
 gpu-1 ansible_host=10.0.0.21 ansible_user=root   ; dedicated compute — no spurctld, no spur CLI/symlinks
 gpu-2 ansible_host=10.0.0.22 ansible_user=root
 ```
+
+### HA — WireGuard mesh (multi-controller)
+
+Combine multi-controller Raft with `spur_transport=wireguard`: the control plane (and Raft) rides an encrypted mesh instead of the LAN. The bootstrap controller runs `net init` (`.1`); the other controllers and all agents join, then `net mesh` peers everyone directly so Raft elections work even if the bootstrap controller is down. See the tracked templates `inventory/hosts.d2ha.example.ini` + `inventory/d2ha.vars.yml`.
+
+```ini
+[spur_controllers]
+ctl-0 ansible_host=10.0.0.10 ansible_user=root spur_wg_address=10.44.0.1
+ctl-1 ansible_host=10.0.0.11 ansible_user=root spur_wg_address=10.44.0.3
+ctl-2 ansible_host=10.0.0.12 ansible_user=root spur_wg_address=10.44.0.4
+
+[spur_agents]
+ctl-0    ansible_host=10.0.0.10 ansible_user=root spur_wg_address=10.44.0.1   ; controllers also run agents
+ctl-1    ansible_host=10.0.0.11 ansible_user=root spur_wg_address=10.44.0.3
+ctl-2    ansible_host=10.0.0.12 ansible_user=root spur_wg_address=10.44.0.4
+worker-1 ansible_host=10.0.0.21 ansible_user=root spur_wg_address=10.44.0.2
+```
+
+> Pass the WireGuard run-vars via `-e @inventory/d2ha.vars.yml` (extra-vars), not inventory `[all:vars]`: `group_vars/all.yml` sets `spur_transport=direct` and outranks inventory group vars, so `spur_transport=wireguard` in `[all:vars]` is silently reverted and the mesh never forms. Pinning `spur_wg_address` per host (as above) is recommended for a fixed, readable layout; leave it unset to auto-assign positionally.
 
 **In HA mode, the playbook:**
 - Writes the same `peers = [...]` list to every controller's `spur.conf`. Order matters — don't reorder controllers between deploys without wiping state.
