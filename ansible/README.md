@@ -340,7 +340,7 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 | `spur_force_reinstall` | `false` | Re-pull/re-copy binaries via `spur_install` even if already present. Used by `rolling_upgrade.yml`. |
 | `spur_rolling_batch_size` | `1` | Agents upgraded per batch in `rolling_upgrade.yml` (`serial`). Controllers always upgrade one at a time regardless. |
 | `spur_controller_upgrade_order` | inventory order | Comma-separated controller names — upgrade them in this order instead of `[spur_controllers]`'s inventory order. Must name every controller exactly once; `rolling_upgrade.yml` fails fast otherwise. |
-| `spur_ignore_unreachable_agents` | `false` | Skip agents unreachable over SSH instead of aborting — `deploy.yml`, `rolling_upgrade.yml`, `healthcheck.yml`, `teardown.yml`. Never loosens controller/accounting-host reachability. |
+| `spur_ignore_unreachable_agents` | `false` | Skip agents unreachable over SSH instead of aborting — `deploy.yml`, `rolling_upgrade.yml`, `healthcheck.yml`, `teardown.yml`, `add_nodes.yml`, `remove_nodes.yml`. Never loosens controller/accounting-host reachability. |
 | `spur_verify_enabled` | `false` | Submit and wait for a real test job at the end of `deploy.yml` / `rolling_upgrade.yml` (`spur_verify` role). Off by default to avoid job noise on routine runs; CI enables it as a smoke test. |
 | `spur_verify_submit_user` | *(unset — submits as the play's own user)* | Submit the verify role's test job as this user instead. Needed if the cluster's `spurd` rejects uid-0 job submission (`[auth] allow_root_jobs=false`), which newer builds default to. |
 | `spur_gather_subset` | `['!all', network, hardware, distribution]` | Facts subset gathered by every `gather_facts: yes` play. Restricts Ansible's default full gather (every mount/PCI device/interface) to just what the roles use. Set `-e spur_gather_subset=all` to fall back to full gathering. |
@@ -488,6 +488,8 @@ ansible-playbook playbooks/add_nodes.yml -i inventory/hosts.ini -e new_nodes=gpu
 
 What it does: gathers facts across the cluster so the regenerated `spur.conf` has cpu/memory for every node, installs and starts `spurd` on the new hosts only, refreshes `spur.conf` on the controllers **without restarting them**, and verifies that each new node registered. It's idempotent — a node that's already registered is skipped, so re-runs never bounce a healthy agent. Adding a **controller** is out of scope, because that's a Raft membership change; use `deploy.yml` for that. `add_nodes.yml` refuses controller names.
 
+On a **WireGuard** cluster it joins the new node to the mesh before starting `spurd`, and meshes it with every existing member (controllers, agents, and login nodes) so it's fully peered — not just to the controllers. An unrelated existing member being down doesn't abort the add when `-e spur_ignore_unreachable_agents=true` is set. The new node must have a `spur_wg_address` (pinned in inventory, or auto-assigned by position).
+
 ### Decommission compute nodes — `remove_nodes.yml`
 
 Cleanly remove agents from a running cluster. The playbook drains each node, waits until it reaches `DRAINED` so running jobs finish first, stops `spurd` on the node, then runs `spur node remove`. There's no state wipe, since agents aren't Raft members.
@@ -497,6 +499,8 @@ ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_r
 ```
 
 Use the names as they appear in `spur nodes`. Afterward, **delete those hosts from `[spur_agents]` in your inventory** — otherwise a later `deploy.yml` will re-add them. The playbook prints this reminder when it finishes.
+
+On a **WireGuard** cluster it also tears down the removed node's mesh interface and drops its WG peer from **every surviving mesh member** — controllers, other agents, and login nodes — so it doesn't linger as a ghost peer (in a full mesh every node peered it). An unrelated agent being down doesn't block the removal when `-e spur_ignore_unreachable_agents=true` is set.
 
 A node with a job still running does not finish draining — same job-safety model as `deploy.yml`/`rolling_upgrade.yml`/`teardown.yml`. By default the run aborts before removing anything:
 
@@ -528,7 +532,7 @@ ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e wipe=true  # a
 ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_ignore_unreachable_agents=true  # skip unreachable agents instead of aborting
 ```
 
-Either way it stops and disables the systemd services and reaps any stray daemons. It deliberately leaves PostgreSQL installed and your accounting database intact — so if you want those gone too, drop them by hand on the accounting host.
+Either way it stops and disables the systemd services and reaps any stray daemons. On a **WireGuard** cluster it also brings the mesh interface down and disables its `wg-quick@<iface>` boot unit, so a plain (non-wipe) teardown doesn't silently re-establish the mesh on the next reboot; `-e wipe=true` additionally removes the saved `/etc/wireguard/<iface>.conf`. It deliberately leaves PostgreSQL installed and your accounting database intact — so if you want those gone too, drop them by hand on the accounting host.
 
 An agent with a job still running is drained first; if it doesn't finish draining, that host is left running rather than silently killing the job:
 
