@@ -1,0 +1,12 @@
+---
+# Run-vars for the integration-ha-mesh CI job (paired with ci-ha-mesh.ini).
+#
+# MUST be passed via `-e @inventory/ci-ha-mesh.vars.yml` (extra-vars), NOT left
+# in the inventory's [all:vars]. group_vars/all.yml sets spur_transport=direct
+# and spur_accounting_enabled=true, and group_vars OUTRANKS inventory [all:vars]
+# — so putting these in the .ini silently reverts them (the WireGuard play then
+# matches no hosts and the whole mesh is skipped). Extra-vars are the highest
+# precedence and win. Same trap the d2ha.vars.yml file documents.
+spur_transport: wireguard
+spur_accounting_enabled: false
+spur_k8s_enabled: false

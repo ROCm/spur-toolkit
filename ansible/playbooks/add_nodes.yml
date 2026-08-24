@@ -63,11 +63,14 @@
 # for EVERY agent, so facts for all of them must be present when we template the
 # config below — this is exactly what `--limit` breaks. Gathering facts touches no
 # daemon.
+# Include spur_login: the mesh-join play runs the spur_wireguard role on login
+# nodes too, which reads ansible_os_family/ansible_hostname — so gather their facts.
 - name: Gather facts across the cluster
-  hosts: spur_controllers:spur_agents
+  hosts: spur_controllers:spur_agents:spur_login
   become: true
   gather_facts: yes
   gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   tasks: []
 
 # Join the new node to the mesh BEFORE spurd starts (spurd reaches the controller over the mesh).
@@ -83,10 +86,17 @@
   hosts: "spur_controllers:spur_agents:spur_login:{{ new_nodes | default('') | split(',') | map('trim') | select | join(':') }}"
   become: true
   gather_facts: no
-  any_errors_fatal: true
+  # Not any_errors_fatal: an unrelated unreachable existing member shouldn't abort
+  # the add. Default (false) stays strict; the new node itself always fails loudly.
+  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   roles:
+    # ansible_os_family is defined skips a member that failed fact-gathering
+    # (unreachable under ignore_unreachable) — the role reads facts and would
+    # otherwise throw undefined-var. Reachable members + the new node all have it.
     - role: spur_wireguard
-      when: spur_transport | default('direct') == 'wireguard'
+      when:
+        - spur_transport | default('direct') == 'wireguard'
+        - ansible_os_family is defined
 
 # --- Install + start spurd on the NEW nodes only ---
 # Skip any that are already registered (idempotent re-runs must not restart a

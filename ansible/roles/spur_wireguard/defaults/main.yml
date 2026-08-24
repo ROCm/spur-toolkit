@@ -1,6 +1,7 @@
 ---
-# WireGuard transport is single-controller only: `spur net init` auto-assigns
-# the controller .1, and there is no multi-controller mesh command. The role
-# assigns each agent a unique address (.2, .3, ...) by inventory position, or
-# honors a per-host spur_wg_address set in inventory. Requires the ansible.utils
-# collection on the control node (ansible-galaxy collection install -r requirements.yml).
+# WireGuard transport supports single- and multi-controller (HA) clusters. The
+# bootstrap controller runs `spur net init` (.1); every other node joins, and for
+# HA a `spur net mesh` pass peers all nodes so Raft works over the mesh. The role
+# assigns each joiner a unique address (.2, .3, ...) by position, or honors a
+# per-host spur_wg_address set in inventory. Requires the ansible.utils collection
+# on the control node (ansible-galaxy collection install -r requirements.yml).

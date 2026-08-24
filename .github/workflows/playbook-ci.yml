@@ -1,5 +1,5 @@
 # ============================================================================
-# Playbook integration tests — four parallel jobs, each with its own cluster.
+# Playbook integration tests — five parallel jobs, each with its own cluster.
 #
 # integration-resilience:
 #   initial deploy with one agent unreachable (spur_ignore_unreachable_agents)
@@ -17,13 +17,27 @@
 #   remove_nodes.yml and teardown.yml's shared busy-node job-safety model
 #   (refuse by default, spur_skip_busy_agents=true, spur_force_*=true)
 #
+# integration-ha-mesh:
+#   3-controller HA cluster over a real WireGuard mesh (SPUR-195, PR #23) — the
+#   only job exercising spur_transport=wireguard AND >1 controller. Asserts the
+#   positional mesh addressing (.1 bootstrap / .2/.3 joiners), full controller
+#   <->controller connectivity (not hub-and-spoke), Raft quorum over the mesh,
+#   spur.conf's HA peers/node_id, the remove_nodes.yml / add_nodes.yml
+#   all-controllers WG peer sync (no ghost peer; regenerated key refreshed on
+#   every controller), and identity/reboot persistence (idempotent redeploy does
+#   not rotate keys; wg-quick down/up preserves the key + full peer set). Needs
+#   `spur net mesh`/`remove-peer` from ROCm/spur#719, so it pulls the nightly
+#   binaries (the last tagged release predates that merge). Requires the
+#   wireguard kernel module: modprobe'd on the runner and bind-mounted into the
+#   containers so modinfo/wg-quick see it.
+#
 # techsupport:
 #   deploy, then exercise techsupport/spur-techsupport.sh end-to-end over real
 #   SSH (the only job that installs sshd in the containers) — default run,
 #   skip-flags, and the fail/--partial paths.
 #
-# Full HA/accounting/login-node coverage lives in deploy.yml's own path.
-# add_nodes.yml / manage_accounts.yml / healthcheck.yml are still TODO.
+# Single-controller HA/accounting/login-node coverage lives in deploy.yml's own
+# path. manage_accounts.yml / healthcheck.yml are still TODO.
 # ============================================================================
 name: playbook-ci
 
@@ -1231,7 +1245,468 @@ jobs:
           docker network rm spur-ci || true
 
   # ---------------------------------------------------------------------------
-  # Job 4: techsupport/spur-techsupport.sh end-to-end over real SSH
+  # Job 4: HA (3-controller) cluster over a real WireGuard mesh — SPUR-195 / #23
+  #
+  # Only job exercising spur_transport=wireguard AND >1 controller. Pulls the
+  # nightly binaries because `spur net mesh`/`net remove-peer` (ROCm/spur#719)
+  # postdate the last tagged release. WireGuard runs for real inside the
+  # privileged containers: the module is modprobe'd on the runner and
+  # /lib/modules is bind-mounted in so modinfo/wg-quick can see it.
+  # ---------------------------------------------------------------------------
+  integration-ha-mesh:
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      # 3 controllers (each also an agent) + 2 dedicated workers + 1 login node.
+      # Positional mesh addressing must yield: ctl-0=.1 (bootstrap), ctl-1=.2,
+      # ctl-2=.3, worker-0=.4, worker-1=.5, login-0=.6 (joiners = secondary
+      # controllers, then agents-minus-controllers, then login-only, by order).
+      # 6 nodes → each meshes with the other 5. The 2nd worker + login node exist
+      # so the remove/add tests can prove peer cleanup/join reach agents+login,
+      # not just controllers (the deferred #23 review fast-follows).
+      NODES: "ctl-0 ctl-1 ctl-2 worker-0 worker-1 login-0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load the WireGuard module on the runner
+        # modinfo inside a container reads the container's (empty) /lib/modules,
+        # so the module must be present on the host kernel and the tree mounted
+        # into each container (below). Load it here first.
+        run: |
+          set -euo pipefail
+          sudo modprobe wireguard
+          lsmod | grep -q '^wireguard' || { echo "::error::wireguard module failed to load on the runner"; exit 1; }
+
+      - name: Download + verify Spur nightly binaries (needs #719's net mesh/remove-peer)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl-spur-bin
+          ( cd dl-spur-bin
+            # nightly, NOT a tagged release: `spur net mesh` / `net remove-peer`
+            # landed in ROCm/spur#719 after the last release was cut.
+            gh release download nightly --repo ROCm/spur \
+              --pattern '*-linux-amd64.tar.gz' \
+              --pattern '*-linux-amd64.tar.gz.sha256'
+            tarball=$(ls *-linux-amd64.tar.gz)
+            hash=$(awk '{print $1}' "${tarball}.sha256")
+            echo "${hash}  ${tarball}" | sha256sum -c -
+            tar xzf "$tarball"
+            bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
+            test -n "$bindir" || { echo "spurctld not found in $tarball"; exit 1; }
+            mkdir -p "$GITHUB_WORKSPACE/spur-bin"
+            for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"; done
+            chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
+          )
+          # Fail fast + clearly if this nightly predates #719 (missing the new
+          # net verbs), rather than deep inside the wireguard/remove_nodes play.
+          # Grep the `net --help` subcommand list rather than probing
+          # `net <verb> --help`: this CLI prints per-subcommand help to STDERR
+          # and exits non-zero, so a `<verb> --help` rc check false-negatives even
+          # when the verb exists. `net --help` itself exits 0 and lists commands.
+          net_help="$("$GITHUB_WORKSPACE/spur-bin/spur" net --help 2>&1 || true)"
+          echo "$net_help" | grep -qE '^\s*mesh\b' \
+            || { echo "::error::this nightly has no 'spur net mesh' — it predates ROCm/spur#719; re-run once a newer nightly is published"; exit 1; }
+          echo "$net_help" | grep -qE '^\s*remove-peer\b' \
+            || { echo "::error::this nightly has no 'spur net remove-peer' (ROCm/spur#719) — it predates that merge; re-run once a newer nightly is published"; exit 1; }
+
+      - name: Start systemd containers on a docker network (with /lib/modules for wireguard)
+        env:
+          IMG: jrei/systemd-ubuntu:22.04
+        run: |
+          set -euo pipefail
+          docker network create spur-ci
+          docker pull "$IMG"
+          for n in $NODES; do
+            docker run -d --name "$n" --hostname "$n" \
+              --network spur-ci \
+              --privileged \
+              --cgroupns=host \
+              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              -v /lib/modules:/lib/modules:ro \
+              --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+              "$IMG"
+          done
+
+      - name: Wait for systemd to be ready in every container
+        run: |
+          set -uo pipefail
+          for n in $NODES; do
+            ok=""
+            for i in $(seq 1 30); do
+              st=$(docker exec "$n" systemctl is-system-running 2>/dev/null || true)
+              case "$st" in running|degraded) ok=1; break ;; esac
+              sleep 2
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::systemd never became ready in $n (last: ${st:-none})"
+              exit 1
+            fi
+            echo "$n: systemd ready ($st)"
+          done
+
+      - name: Install in-container preflight deps (curl/tar/iproute2/iputils-ping/python3/sudo + kmod + wireguard-tools)
+        run: |
+          set -euo pipefail
+          # kmod provides modinfo, which the spur_wireguard role's first task
+          # (`modinfo wireguard`) requires — the base jrei/systemd-ubuntu image
+          # ships neither modinfo nor it via wireguard-tools, so without kmod that
+          # task fails rc=127. modinfo then reads the bind-mounted host modules.
+          #
+          # iputils-ping provides `ping`, used by the mesh reachability asserts
+          # (and the role's own verify-mesh ping). iproute2 gives `ip` but NOT
+          # `ping`, so without this the ctl<->ctl ping check fails instantly rc=127
+          # even though the tunnel is up.
+          #
+          # --no-install-recommends is REQUIRED: wireguard-tools recommends the
+          # `wireguard` metapackage, which pulls linux-modules/linux-image .debs.
+          # Unpacking those tries to write /lib/modules/<ver>, which we bind-mount
+          # read-only (the host's modules), so dpkg aborts with "Read-only file
+          # system" and the whole install fails. We only need the wg/wg-quick
+          # userspace tools here; the kernel module comes from the mounted host
+          # tree, not the package.
+          for n in $NODES; do
+            docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends curl tar iproute2 iputils-ping python3 sudo kmod wireguard-tools'
+          done
+
+      - name: Create a non-root job-submission user in every container
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" useradd -m -s /bin/bash ciuser
+          done
+
+      - name: Install ansible + docker connection plugin + wireguard deps (ansible.utils/netaddr)
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ansible-core netaddr
+          ansible-galaxy collection install community.docker ansible.utils
+
+      - name: deploy.yml — 3-controller HA over WireGuard (no accounting/k0s)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/deploy.yml \
+            -e @inventory/ci-ha-mesh.vars.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
+
+      # ===================================================================
+      # Assertion group 1: Mesh + HA core
+      # ===================================================================
+      - name: Assert pinned mesh addressing (.1 bootstrap, .2..6 by inventory pin)
+        run: |
+          set -euo pipefail
+          declare -A want=( [ctl-0]=10.44.0.1 [ctl-1]=10.44.0.2 [ctl-2]=10.44.0.3 [worker-0]=10.44.0.4 [worker-1]=10.44.0.5 [login-0]=10.44.0.6 )
+          for n in "${!want[@]}"; do
+            got=$(docker exec "$n" bash -c "ip -o -4 addr show spur0 | grep -oE '10\.44\.[0-9]+\.[0-9]+' | head -1")
+            [ "$got" = "${want[$n]}" ] \
+              && echo "PASS: $n mesh IP = $got" \
+              || { echo "::error::$n mesh IP is $got, expected ${want[$n]}"; docker exec "$n" wg show spur0 || true; exit 1; }
+          done
+
+      - name: Assert full mesh (each node peers the other 5, not hub-and-spoke)
+        run: |
+          set -euo pipefail
+          # Every node must peer every OTHER node (5 peers each in a 6-node mesh).
+          # Hub-and-spoke would leave the non-bootstrap nodes with just 1 peer
+          # (the bootstrap) — the exact gap `spur net mesh` closes. This now
+          # includes the login node, which must also be fully meshed.
+          for n in $NODES; do
+            peers=$(docker exec "$n" bash -c "wg show spur0 peers | grep -c . || true")
+            [ "$peers" -eq 5 ] \
+              && echo "PASS: $n has $peers mesh peers (full mesh)" \
+              || { echo "::error::$n has $peers WG peers, expected 5 (full mesh) — mesh is hub-and-spoke or incomplete"; docker exec "$n" wg show spur0; exit 1; }
+          done
+
+      - name: Assert controllers reach each other over the mesh (ctl-0 <-> ctl-2 directly)
+        run: |
+          set -euo pipefail
+          # ctl-0 (.1) pings ctl-2 (.3) and vice-versa — direct controller<->
+          # controller reachability, what Raft elections need when the bootstrap
+          # is down.
+          docker exec ctl-0 ping -c2 -W3 10.44.0.3 >/dev/null \
+            && echo "PASS: ctl-0 -> ctl-2 over the mesh" \
+            || { echo "::error::ctl-0 could not reach ctl-2 (10.44.0.3) over the mesh"; exit 1; }
+          docker exec ctl-2 ping -c2 -W3 10.44.0.1 >/dev/null \
+            && echo "PASS: ctl-2 -> ctl-0 over the mesh" \
+            || { echo "::error::ctl-2 could not reach ctl-0 (10.44.0.1) over the mesh"; exit 1; }
+
+      - name: Assert spur.conf carries HA peers[] over mesh IPs and a per-controller node_id
+        run: |
+          set -euo pipefail
+          # peers must list all three controllers' mesh IPs on the raft port.
+          for p in 10.44.0.1:6821 10.44.0.2:6821 10.44.0.3:6821; do
+            docker exec ctl-0 grep -E '^peers *=' /opt/spur/etc/spur.conf | grep -q "$p" \
+              || { echo "::error::spur.conf peers[] on ctl-0 is missing $p"; docker exec ctl-0 grep -E '^peers' /opt/spur/etc/spur.conf; exit 1; }
+          done
+          echo "PASS: spur.conf peers[] lists all three controllers over mesh IPs"
+          # each controller gets a distinct 1-based node_id (its position).
+          declare -A wantid=( [ctl-0]=1 [ctl-1]=2 [ctl-2]=3 )
+          for n in "${!wantid[@]}"; do
+            got=$(docker exec "$n" bash -c "grep -oE '^node_id *= *[0-9]+' /opt/spur/etc/spur.conf | grep -oE '[0-9]+' | head -1")
+            [ "$got" = "${wantid[$n]}" ] \
+              && echo "PASS: $n node_id = $got" \
+              || { echo "::error::$n node_id is '$got', expected ${wantid[$n]}"; exit 1; }
+          done
+
+      - name: Assert Raft quorum formed over the mesh (a leader exists and all agents registered)
+        run: |
+          set -euo pipefail
+          # login-0 runs no spurd (login-only), so it is NOT expected to register
+          # as a node — only the controllers and the two workers.
+          for i in $(seq 1 30); do
+            missing=""
+            for a in ctl-0 ctl-1 ctl-2 worker-0 worker-1; do
+              docker exec ctl-0 /usr/local/bin/spur show node "$a" 2>/dev/null \
+                | grep -qx "NodeName=$a" || missing="$missing $a"
+            done
+            [ -z "$missing" ] && break
+            sleep 2
+          done
+          echo "== spur nodes =="
+          docker exec ctl-0 /usr/local/bin/spur nodes
+          [ -z "$missing" ] || { echo "::error::nodes never registered over the mesh:$missing"; exit 1; }
+          # A scheduled job completing proves the leader is serving writes over
+          # the mesh (registration alone can be stale).
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=ha-mesh-smoke\necho ok on \$(hostname)\n" > /tmp/ha.sh
+            jid=$(/usr/local/bin/spur submit /tmp/ha.sh | grep -oE "[0-9]+" | head -1)
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = COMPLETED ] && { echo "PASS: job $jid COMPLETED — quorum serving over the mesh"; exit 0; }
+              case "$st" in FAILED|CANCELLED|TIMEOUT|NODE_FAIL) echo "job ended $st"; exit 1 ;; esac
+              sleep 2
+            done
+            echo "::error::job never completed — quorum not serving"; exit 1
+          '
+
+      # ===================================================================
+      # Assertion group 2: node lifecycle (remove_nodes.yml / add_nodes.yml)
+      #   Removing worker-1 must drop its WG peer from EVERY surviving mesh
+      #   member — controllers AND the other agent (worker-0) AND the login node,
+      #   not just controllers (the deferred #23 fast-follow: ghost peer on
+      #   agents). Re-adding must refresh its regenerated key on all of them.
+      #   We exercise worker-1 (not worker-0) so worker-0 stays as a surviving
+      #   agent the removed peer must be cleaned from.
+      # ===================================================================
+      - name: Capture worker-1's pre-removal WG key; confirm every other member peers it
+        run: |
+          set -euo pipefail
+          wk=$(docker exec worker-1 wg show spur0 public-key | tr -d '[:space:]')
+          echo "$wk" > /tmp/worker1-key-before.txt
+          echo "worker-1 key before removal: $wk"
+          # Every OTHER mesh member (controllers + worker-0 + login-0) should peer it.
+          for m in ctl-0 ctl-1 ctl-2 worker-0 login-0; do
+            docker exec "$m" bash -c "wg show spur0 peers | grep -qF '$wk'" \
+              && echo "PASS: $m knows worker-1 as a peer (pre-removal)" \
+              || { echo "::error::$m does not have worker-1 as a peer before removal"; docker exec "$m" wg show spur0; exit 1; }
+          done
+
+      - name: remove_nodes.yml worker-1 (must drop its WG peer from ALL surviving members)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/remove_nodes.yml \
+            -e @inventory/ci-ha-mesh.vars.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e nodes_to_remove=worker-1 \
+            -e spur_drain_wait_secs=10
+
+      - name: Assert worker-1's WG peer is gone from EVERY surviving member incl. worker-0 + login-0 (no ghost peer on agents)
+        run: |
+          set -euo pipefail
+          wk=$(cat /tmp/worker1-key-before.txt)
+          # THE regression check for the deferred fast-follow: pre-fix, remove_nodes
+          # only cleaned controllers, so worker-0 and login-0 kept worker-1 as a
+          # ghost peer (persisted via wg-quick save, surviving reboot).
+          for m in ctl-0 ctl-1 ctl-2 worker-0 login-0; do
+            if docker exec "$m" bash -c "wg show spur0 peers | grep -qF '$wk'"; then
+              echo "::error::$m still has worker-1 ($wk) as a WG peer after removal — ghost peer"
+              docker exec "$m" wg show spur0
+              exit 1
+            fi
+            echo "PASS: $m no longer peers worker-1"
+          done
+          docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null | grep -qx "NodeName=worker-1" \
+            && { echo "::error::worker-1 still registered in the cluster after removal"; exit 1; } \
+            || echo "PASS: worker-1 removed from the cluster"
+
+      - name: add_nodes.yml worker-1 (re-add; regenerated key refreshed on all surviving members)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/add_nodes.yml \
+            -e @inventory/ci-ha-mesh.vars.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e new_nodes=worker-1
+
+      - name: Assert worker-1 re-registered and its NEW key is consistent on ALL members incl. worker-0 + login-0
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null \
+              | grep -qx "NodeName=worker-1" && break
+            sleep 2
+          done
+          docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null | grep -qx "NodeName=worker-1" \
+            || { echo "::error::worker-1 did not re-register after add_nodes.yml"; exit 1; }
+          # The re-added worker mints a fresh key (net join on a wiped conf). It
+          # must be refreshed on EVERY surviving member — controllers AND the
+          # pre-existing worker-0 AND login-0 (the add_nodes mesh play now targets
+          # all members + facts for login) — and match worker-1's current key.
+          wk_now=$(docker exec worker-1 wg show spur0 public-key | tr -d '[:space:]')
+          wk_before=$(cat /tmp/worker1-key-before.txt)
+          [ "$wk_now" != "$wk_before" ] \
+            && echo "PASS: worker-1 regenerated its WG key on re-add ($wk_before -> $wk_now)" \
+            || echo "NOTE: worker-1 key unchanged on re-add (still valid — assert consistency below)"
+          for m in ctl-0 ctl-1 ctl-2 worker-0 login-0; do
+            docker exec "$m" bash -c "wg show spur0 peers | grep -qF '$wk_now'" \
+              && echo "PASS: $m has worker-1's current key" \
+              || { echo "::error::$m is missing worker-1's current key $wk_now — stale/ghost after re-add"; docker exec "$m" wg show spur0; exit 1; }
+          done
+
+      # ===================================================================
+      # Assertion group 3: identity + reboot persistence
+      # ===================================================================
+      - name: Snapshot every node's WG key, then run an idempotent redeploy
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" wg show spur0 public-key | tr -d '[:space:]' > "/tmp/key-$n-pre.txt"
+          done
+          ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/deploy.yml \
+            -e @inventory/ci-ha-mesh.vars.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_verify_enabled=false
+
+      - name: Assert the redeploy did NOT rotate any node's WG key (gate on on-disk conf)
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            pre=$(cat "/tmp/key-$n-pre.txt")
+            post=$(docker exec "$n" wg show spur0 public-key | tr -d '[:space:]')
+            [ "$pre" = "$post" ] \
+              && echo "PASS: $n WG key unchanged across redeploy" \
+              || { echo "::error::$n WG key ROTATED on redeploy ($pre -> $post) — net init/join re-ran on an existing conf"; exit 1; }
+          done
+
+      - name: Assert wg-quick down/up preserves both the key and the full peer set (wg-quick save)
+        run: |
+          set -euo pipefail
+          # Simulates a reboot: interface re-created purely from the on-disk conf.
+          # Without `wg-quick save` this would restore a near-empty mesh.
+          key_before=$(docker exec ctl-1 wg show spur0 public-key | tr -d '[:space:]')
+          docker exec ctl-1 wg-quick down spur0
+          docker exec ctl-1 wg-quick up spur0
+          key_after=$(docker exec ctl-1 wg show spur0 public-key | tr -d '[:space:]')
+          [ "$key_before" = "$key_after" ] \
+            && echo "PASS: ctl-1 key survived wg-quick down/up" \
+            || { echo "::error::ctl-1 key changed across down/up ($key_before -> $key_after)"; exit 1; }
+          peers=$(docker exec ctl-1 bash -c "wg show spur0 peers | grep -c . || true")
+          [ "$peers" -eq 5 ] \
+            && echo "PASS: ctl-1 restored all 5 peers from the saved conf" \
+            || { echo "::error::ctl-1 restored $peers peers after down/up, expected 5 — wg-quick save did not persist the full mesh"; docker exec ctl-1 wg show spur0; exit 1; }
+
+      # ===================================================================
+      # Assertion group 4: add-node resilience + teardown mesh cleanup
+      # ===================================================================
+      - name: add_nodes.yml tolerates an unrelated unreachable member (spur_ignore_unreachable_agents)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          set -uo pipefail
+          # Stop an unrelated existing agent, remove the node we re-add, then re-add
+          # it with worker-0 down. Both plays must complete (tolerate the down
+          # member) and the new node must register + mesh. ansible-playbook returns
+          # exit 4 when any host was unreachable EVEN WITH ignore_unreachable (the
+          # play continues, but the run is flagged) — so accept 4, fail on anything
+          # else. The authoritative check is that worker-1 actually re-registers.
+          run_tolerating_unreachable() {
+            "$@"; local rc=$?
+            [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || { echo "::error::playbook failed rc=$rc (not the tolerated unreachable-only rc=4)"; return "$rc"; }
+            return 0
+          }
+          docker stop worker-0
+          run_tolerating_unreachable ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/remove_nodes.yml \
+            -e @inventory/ci-ha-mesh.vars.yml \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
+            -e nodes_to_remove=worker-1 -e spur_drain_wait_secs=10 \
+            -e spur_ignore_unreachable_agents=true || exit 1
+          run_tolerating_unreachable ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/add_nodes.yml \
+            -e @inventory/ci-ha-mesh.vars.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
+            -e new_nodes=worker-1 -e spur_ignore_unreachable_agents=true || exit 1
+          for i in $(seq 1 30); do
+            docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null | grep -qx "NodeName=worker-1" && break
+            sleep 2
+          done
+          docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null | grep -qx "NodeName=worker-1" \
+            && echo "PASS: add_nodes succeeded with an unrelated member (worker-0) down" \
+            || { echo "::error::worker-1 did not register — add_nodes aborted on the unreachable member"; exit 1; }
+
+      - name: teardown.yml over the mesh disables wg-quick@ and stops daemons
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          set -euo pipefail
+          docker start worker-0
+          for i in $(seq 1 15); do
+            docker exec worker-0 systemctl is-system-running >/dev/null 2>&1 && break
+            sleep 2
+          done
+          ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/teardown.yml \
+            -e @inventory/ci-ha-mesh.vars.yml \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur
+          # wg-quick@ must be disabled on every member, else the mesh silently
+          # returns on the next reboot.
+          for n in $NODES; do
+            en=$(docker exec "$n" systemctl is-enabled wg-quick@spur0 2>/dev/null || true)
+            [ "$en" != "enabled" ] \
+              && echo "PASS: $n wg-quick@spur0 not enabled ($en)" \
+              || { echo "::error::$n still has wg-quick@spur0 ENABLED after teardown — mesh would return on reboot"; exit 1; }
+          done
+          docker exec ctl-0 systemctl is-active spurctld 2>&1 | grep -qx active \
+            && { echo "::error::spurctld still active on ctl-0 after teardown"; exit 1; } \
+            || echo "PASS: daemons stopped after teardown"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          for n in $NODES; do
+            echo "===== $n wg show ====="
+            docker exec "$n" wg show 2>/dev/null || true
+            echo "===== $n journal (spur*) ====="
+            docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -50' || true
+          done
+
+      - name: Teardown containers
+        if: always()
+        run: |
+          for n in $NODES; do docker rm -f "$n" || true; done
+          docker network rm spur-ci || true
+
+  # ---------------------------------------------------------------------------
+  # Job 5: techsupport/spur-techsupport.sh end-to-end over real SSH
   # ---------------------------------------------------------------------------
   techsupport:
     runs-on: ubuntu-latest

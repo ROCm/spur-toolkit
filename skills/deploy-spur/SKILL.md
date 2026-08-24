@@ -220,7 +220,7 @@ Optional: prepend `${SPUR_INSTALL_DIR}` to `/etc/environment` so non-interactive
 
 ### Step 2b: WireGuard mesh (only when `TRANSPORT=wireguard`)
 
-Skip entirely for `direct`. WireGuard uses the built-in `spur net` CLI and is **single-controller only** — `spur net init` auto-assigns the controller `.1` and there is no multi-controller mesh command, so HA must use `direct`. Steps, using the real CLI (all `spur net` commands log to stderr):
+Skip entirely for `direct`. WireGuard uses the built-in `spur net` CLI. **These steps cover the single-controller (hub-and-spoke) case only.** Multi-controller HA over WireGuard is possible — `spur net mesh` programs a full node↔node mesh so Raft works across controllers — but it's not wired into this standalone skill; use the Ansible `spur_wireguard` role (see `ansible/README.md`) for HA-over-mesh. Steps here, using the real CLI (all `spur net` commands log to stderr):
 
 1. `apt install wireguard-tools` on every host.
 2. On the controller: `spur net init --cidr 10.44.0.0/16 --port 51820 --interface spur0` (auto-assigns `.1`). Read its pubkey with `wg show spur0 public-key` (there is **no** `spur net pubkey`).
