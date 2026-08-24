@@ -90,8 +90,13 @@
   # the add. Default (false) stays strict; the new node itself always fails loudly.
   ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   roles:
+    # ansible_os_family is defined skips a member that failed fact-gathering
+    # (unreachable under ignore_unreachable) — the role reads facts and would
+    # otherwise throw undefined-var. Reachable members + the new node all have it.
     - role: spur_wireguard
-      when: spur_transport | default('direct') == 'wireguard'
+      when:
+        - spur_transport | default('direct') == 'wireguard'
+        - ansible_os_family is defined
 
 # --- Install + start spurd on the NEW nodes only ---
 # Skip any that are already registered (idempotent re-runs must not restart a
