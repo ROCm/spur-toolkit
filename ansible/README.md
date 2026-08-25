@@ -232,6 +232,52 @@ worker-1 ansible_host=10.0.0.21 ansible_user=root spur_wg_address=10.44.0.2
 
 A full HA inventory template lives at `inventory/hosts.ha.example.ini`.
 
+### HA — WireGuard mesh + SPUR-managed k0s (k8s)
+
+Layer a SPUR-managed k0s cluster on top of the HA mesh. The key thing to understand: **there is no `[k8s_controllers]`/`[k8s_workers]` inventory group.** Every k8s node is first a registered SPUR agent in `[spur_agents]`; the k0s control-plane-vs-worker split is a **runtime CSV** passed to `spur k8s up` via `spur_k8s_control_plane_nodes` / `spur_k8s_nodes`. The k0s control plane is a separate quorum from the SPUR (`spurctld`) controllers — they can be different hosts, as in the template below.
+
+The tracked templates `inventory/hosts.k8sha.example.ini` + `inventory/k8sha.vars.yml` lay out a 20-node cluster (+1 login): 3 SPUR controllers, an HA k0s control plane (3 nodes), 5 k0s workers, 9 plain compute agents, and 1 login node. Every `spur_wg_address` is pinned per host (per-role IP blocks) — the positional auto-assign is not stable once you add/remove nodes, so pinning is recommended for any cluster you'll grow over time.
+
+```ini
+[spur_controllers]
+ctl-0 ansible_host=10.0.0.10 ansible_user=root spur_wg_address=10.44.0.1
+ctl-1 ansible_host=10.0.0.11 ansible_user=root spur_wg_address=10.44.0.2
+ctl-2 ansible_host=10.0.0.12 ansible_user=root spur_wg_address=10.44.0.3
+
+[spur_agents]
+ctl-0    ansible_host=10.0.0.10 ansible_user=root spur_wg_address=10.44.0.1   ; controllers also run agents
+ctl-1    ansible_host=10.0.0.11 ansible_user=root spur_wg_address=10.44.0.2
+ctl-2    ansible_host=10.0.0.12 ansible_user=root spur_wg_address=10.44.0.3
+k8s-cp-0 ansible_host=10.0.0.20 ansible_user=root spur_wg_address=10.44.0.11  ; k0s HA control plane
+k8s-cp-1 ansible_host=10.0.0.21 ansible_user=root spur_wg_address=10.44.0.12
+k8s-cp-2 ansible_host=10.0.0.22 ansible_user=root spur_wg_address=10.44.0.13
+k8s-w-0  ansible_host=10.0.0.30 ansible_user=root spur_wg_address=10.44.0.21  ; k0s workers
+k8s-w-1  ansible_host=10.0.0.31 ansible_user=root spur_wg_address=10.44.0.22
+; … k8s-w-2..4, then plain compute gpu-0..8 …
+
+[spur_login]
+login-0  ansible_host=10.0.0.50 ansible_user=root spur_wg_address=10.44.0.41
+```
+
+The paired `k8sha.vars.yml` turns on the mesh and k8s, and defines the control-plane/worker split:
+
+```yaml
+spur_transport: wireguard
+spur_k8s_enabled: true          # must be true at deploy.yml time (writes the [cluster] section)
+spur_k8s_cni: calico            # native routing so pod traffic rides the mesh
+spur_k8s_control_plane_nodes: "k8s-cp-0,k8s-cp-1,k8s-cp-2"                        # HA k0s CP (3 → tolerates 1 etcd failure)
+spur_k8s_nodes: "k8s-cp-0,k8s-cp-1,k8s-cp-2,k8s-w-0,k8s-w-1,k8s-w-2,k8s-w-3,k8s-w-4"   # scope k0s to CP + workers only
+```
+
+Deploy, then bring up k0s (both take the same `-e @…vars.yml`):
+
+```bash
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.k8sha.ini -e @inventory/k8sha.vars.yml
+ansible-playbook playbooks/k8s_up.yml -i inventory/hosts.k8sha.ini -e @inventory/k8sha.vars.yml
+```
+
+> `spur_k8s_enabled` must be `true` at `deploy.yml` time so `spur.conf` gets the `[cluster]` section — `k8s_up.yml` asserts this and fails fast otherwise. The 9 `gpu-*` compute agents and `login-0` are in the mesh and the SPUR scheduler but deliberately excluded from `spur_k8s_nodes`, so they never run k0s.
+
 ---
 
 ## Login (submission) nodes
