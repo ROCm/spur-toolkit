@@ -1,0 +1,39 @@
+---
+# Run-vars for the 20-node HA Spur cluster + HA k0s over a WireGuard mesh
+# (hosts.k8sha.ini). Pass with -e @inventory/k8sha.vars.yml so these win over
+# group_vars/all.yml (inventory [all:vars] is shadowed by group_vars and would
+# revert spur_transport to direct — a silent no-mesh trap).
+
+# --- Transport: encrypted WireGuard mesh ---
+spur_transport: wireguard
+spur_wg_cidr: 10.44.0.0/16
+spur_wg_port: 51820
+spur_wg_persist: true
+
+# --- SPUR-managed k0s cluster ---
+# Must be true at deploy.yml time so spur.conf gets the [cluster] section; then
+# playbooks/k8s_up.yml drives the actual k0s bring-up.
+spur_k8s_enabled: true
+# Calico native-routing so pod traffic rides the WireGuard mesh (required with
+# spur_transport=wireguard).
+spur_k8s_cni: calico
+
+# k0s HA control plane: 3 node names (registered node names = ansible_hostname).
+# First entry (k8s-cp-0) is the etcd bootstrap. 3 => tolerates 1 etcd failure.
+# NOTE: these are k0s control-plane nodes, independent of the 3 spurctld
+# controllers (ctl-0/1/2) — different quorums on different hosts here.
+spur_k8s_control_plane_nodes: "k8s-cp-0,k8s-cp-1,k8s-cp-2"
+
+# Scope the k0s cluster to the 3 control-plane + 5 worker nodes only. The
+# spurctld controllers, the 9 gpu-* compute agents, and login-0 are in the mesh
+# and the SPUR scheduler but are deliberately NOT part of the k8s cluster.
+spur_k8s_nodes: "k8s-cp-0,k8s-cp-1,k8s-cp-2,k8s-w-0,k8s-w-1,k8s-w-2,k8s-w-3,k8s-w-4"
+
+# Pure-scheduler accounting off by default; flip on if you want the Postgres
+# accounting DB.
+spur_accounting_enabled: false
+
+# Optional: point at a local dir of pre-built spur/spurctld/spurd binaries.
+# Leave unset to have install.sh download a release. Do NOT commit a
+# machine-specific path here.
+# spur_binary_src: /path/to/spur/target/release
