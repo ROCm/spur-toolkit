@@ -897,6 +897,57 @@ jobs:
               || echo "PASS: spur.conf re-rendered on $h (sentinel gone)"
           done
 
+      # --- deploy.yml must preserve spur.conf too, same as rolling_upgrade.yml ---
+      - name: Re-stamp a sentinel line into spur.conf on ctl-0 and gpu-1 for the deploy.yml test
+        run: |
+          for h in ctl-0 gpu-1; do
+            docker exec "$h" bash -c 'echo "# CI-SENTINEL-DEPLOY" >> /opt/spur/etc/spur.conf'
+            docker exec "$h" grep -q "CI-SENTINEL-DEPLOY" /opt/spur/etc/spur.conf \
+              || { echo "sentinel not written on $h"; exit 1; }
+          done
+          echo "sentinel written to spur.conf on ctl-0 and gpu-1"
+
+      - name: deploy.yml (default — spur.conf must be preserved on controller and agent)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_drain_wait_secs=10 \
+            -e spur_verify_enabled=false
+
+      - name: Assert deploy.yml did NOT overwrite spur.conf on ctl-0 or gpu-1 (sentinel must still be present)
+        run: |
+          for h in ctl-0 gpu-1; do
+            docker exec "$h" grep -q "CI-SENTINEL-DEPLOY" /opt/spur/etc/spur.conf \
+              && echo "PASS: spur.conf preserved on $h (sentinel intact)" \
+              || { echo "FAIL: deploy.yml overwrote spur.conf on $h — sentinel gone"; exit 1; }
+          done
+
+      - name: deploy.yml --overwrite-conf (spur.conf must be re-rendered on controller and agent)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_drain_wait_secs=10 \
+            -e spur_overwrite_conf=true \
+            -e spur_verify_enabled=false
+
+      - name: Assert deploy.yml --overwrite-conf re-rendered spur.conf on ctl-0 and gpu-1 (sentinel must be gone)
+        run: |
+          for h in ctl-0 gpu-1; do
+            docker exec "$h" grep -q "CI-SENTINEL-DEPLOY" /opt/spur/etc/spur.conf \
+              && { echo "FAIL: deploy.yml -e spur_overwrite_conf=true did not overwrite spur.conf on $h"; exit 1; } \
+              || echo "PASS: spur.conf re-rendered on $h (sentinel gone)"
+          done
+
       # TODO(next): add_nodes.yml / manage_accounts.yml / healthcheck.yml
 
       - name: Dump logs on failure

@@ -24,9 +24,9 @@
 # rest of the fleet:
 #   ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true
 #
-# Agents get spur.conf too now (spurd reads it best-effort for [cluster]/k0s
-# and [devices]/GRES settings). A missing spur.conf is always written; an
-# existing one is left alone unless you pass -e spur_overwrite_conf=true.
+# Controllers and agents both get spur.conf (spurd reads it best-effort for
+# [cluster]/k0s and [devices]/GRES settings). A missing spur.conf is always
+# written; an existing one is left alone unless you pass -e spur_overwrite_conf=true.
 
 - name: Preflight + install Spur on all hosts
   # Accounting is embedded in spurctld now — a dedicated (non-controller/non-agent)

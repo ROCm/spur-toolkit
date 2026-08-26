@@ -54,7 +54,7 @@ A few things to know:
 | HA — multi-controller Raft | **≥ 3 hosts** in `spur_controllers` (any number in `spur_agents`); auto-enabled | direct or wireguard |
 | HA — separate compute | `spur_controllers` and `spur_agents` are **disjoint** host sets | direct or wireguard |
 
-`deploy.yml` is idempotent — re-running it on a healthy cluster re-applies controller config and restarts daemons. Agent `spur.conf` is preserved instead of re-applied (see [below](#variables-defaults-in-inventorygroup_varsallyml)), unless you pass `-e spur_overwrite_conf=true`.
+`deploy.yml` is idempotent — re-running it on a healthy cluster restarts daemons but preserves each host's existing `spur.conf` (see [below](#variables-defaults-in-inventorygroup_varsallyml)), unless you pass `-e spur_overwrite_conf=true`.
 
 **Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Login nodes](#login-submission-nodes) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Admin operations](#admin-operations) · [Tear down](#tear-down) · [Troubleshooting](#troubleshooting)
 
@@ -390,7 +390,7 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 | `spur_verify_enabled` | `false` | Submit and wait for a real test job at the end of `deploy.yml` / `rolling_upgrade.yml` (`spur_verify` role). Off by default to avoid job noise on routine runs; CI enables it as a smoke test. |
 | `spur_verify_submit_user` | *(unset — submits as the play's own user)* | Submit the verify role's test job as this user instead. Needed if the cluster's `spurd` rejects uid-0 job submission (`[auth] allow_root_jobs=false`), which newer builds default to. |
 | `spur_gather_subset` | `['!all', network, hardware, distribution]` | Facts subset gathered by every `gather_facts: yes` play. Restricts Ansible's default full gather (every mount/PCI device/interface) to just what the roles use. Set `-e spur_gather_subset=all` to fall back to full gathering. |
-| `spur_overwrite_conf` | `false` | Overwrite an agent's existing `spur.conf` instead of leaving it alone. Controllers always re-render theirs regardless. |
+| `spur_overwrite_conf` | `false` | Overwrite an existing `spur.conf` (controller or agent) instead of leaving it alone. `add_nodes.yml` always re-renders the controller's regardless, so a newly added node appears in it. |
 | `spur_drain_wait_secs` | `120` | How long to wait for a node to reach `DRAINED`/`DOWN` before treating it as busy — used by `deploy.yml`, `teardown.yml`, `rolling_upgrade.yml`, and `remove_nodes.yml` via the shared drain guard. |
 | `spur_skip_busy_agents` | `false` | Leave a still-busy node untouched and continue with the rest of the fleet, instead of the playbook's default (refuse, or force for `deploy.yml`). Shared by `deploy.yml`, `teardown.yml`, `rolling_upgrade.yml`, `remove_nodes.yml`. |
 | `spur_force_teardown_busy_agents` | `false` | `teardown.yml`-specific: kill a busy node's running job and tear it down anyway. |
@@ -428,7 +428,7 @@ An already-registered agent with a job still running is drained first; if it's s
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true   # leave busy agents untouched, deploy the rest
 ```
 
-Agents get `spur.conf` too (the same file controllers get — `spurd` reads it best-effort for `[cluster]`/k0s and `[devices]`/GRES settings). A missing one is always written; an existing one is left alone unless you pass `-e spur_overwrite_conf=true`.
+Agents get `spur.conf` too (the same file controllers get — `spurd` reads it best-effort for `[cluster]`/k0s and `[devices]`/GRES settings). On both controllers and agents, a missing `spur.conf` is always written; an existing one is left alone unless you pass `-e spur_overwrite_conf=true`.
 
 ```bash
 cargo build --release -p spur-cli -p spurctld -p spurd   # rebuild all three together, see caveat below

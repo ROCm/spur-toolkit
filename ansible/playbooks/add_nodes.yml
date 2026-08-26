@@ -148,6 +148,9 @@
     - role: spur_controller
       vars:
         spur_controller_skip_restart: true
+        # A newly added node must appear in spur.conf's [[nodes]] block
+        # regardless of spur_overwrite_conf, unlike deploy.yml's default.
+        spur_controller_force_conf: true
 
 # --- Verify the new nodes registered ---
 - name: Verify new nodes are registered

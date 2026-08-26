@@ -142,11 +142,16 @@
     regexp: '^SPUR_ACCOUNTING_ADDR='
     state: absent
 
+# Same write-if-missing opt-in as the spur_agent role's spur.conf render —
+# force: no leaves an existing file alone unless spur_overwrite_conf=true.
+# add_nodes.yml overrides via spur_controller_force_conf=true so a newly
+# added node always appears in the rendered [[nodes]] block.
 - name: Write spur.conf
   ansible.builtin.template:
     src: spur.conf.j2
     dest: "{{ spur_home }}/etc/spur.conf"
     mode: "0644"
+    force: "{{ spur_controller_force_conf | default(spur_overwrite_conf | default(false) | bool) | bool }}"
   register: spur_conf
   when: not (spur_controller_skip_conf | default(false) | bool)
 
