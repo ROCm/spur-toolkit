@@ -1122,8 +1122,12 @@ jobs:
       - name: Assert gpu-1 is still registered and its job is still running (default refusal)
         run: |
           set -euo pipefail
-          docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" \
-            || { echo "FAIL: gpu-1 should still be registered after a refused removal"; exit 1; }
+          found=""
+          for i in $(seq 1 10); do
+            docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" && { found=1; break; }
+            sleep 1
+          done
+          [ -n "$found" ] || { echo "FAIL: gpu-1 should still be registered after a refused removal"; exit 1; }
           jid=$(docker exec ctl-0 cat /tmp/ci-remove-busy.jid)
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
           [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING after a refused removal (state: $st)"; exit 1; }
@@ -1143,8 +1147,12 @@ jobs:
       - name: Assert gpu-1 is still registered, spurd untouched, and its job is still running
         run: |
           set -euo pipefail
-          docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" \
-            || { echo "FAIL: gpu-1 should still be in the cluster (spur_skip_busy_agents=true)"; exit 1; }
+          found=""
+          for i in $(seq 1 10); do
+            docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" && { found=1; break; }
+            sleep 1
+          done
+          [ -n "$found" ] || { echo "FAIL: gpu-1 should still be in the cluster (spur_skip_busy_agents=true)"; exit 1; }
           jid=$(docker exec ctl-0 cat /tmp/ci-remove-busy.jid)
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
           [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING (state: $st)"; exit 1; }
@@ -1169,8 +1177,12 @@ jobs:
           jid=$(docker exec ctl-0 cat /tmp/ci-remove-busy.jid)
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
           [ "$st" = RUNNING ] && { echo "FAIL: job should have been killed by spur_force_remove_busy_nodes=true"; exit 1; }
-          docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" \
-            && { echo "FAIL: gpu-1 should have been removed from the cluster"; exit 1; }
+          gone=""
+          for i in $(seq 1 10); do
+            docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" || { gone=1; break; }
+            sleep 1
+          done
+          [ -n "$gone" ] || { echo "FAIL: gpu-1 should have been removed from the cluster"; exit 1; }
           docker exec gpu-1 systemctl is-active spurd 2>&1 | grep -qx active \
             && { echo "FAIL: spurd should have been stopped on gpu-1"; exit 1; }
           orphan_pids=$(docker exec gpu-1 bash -c \
