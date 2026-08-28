@@ -390,7 +390,7 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 | `spur_verify_enabled` | `false` | Submit and wait for a real test job at the end of `deploy.yml` / `rolling_upgrade.yml` (`spur_verify` role). Off by default to avoid job noise on routine runs; CI enables it as a smoke test. |
 | `spur_verify_submit_user` | *(unset — submits as the play's own user)* | Submit the verify role's test job as this user instead. Needed if the cluster's `spurd` rejects uid-0 job submission (`[auth] allow_root_jobs=false`), which newer builds default to. |
 | `spur_gather_subset` | `['!all', network, hardware, distribution]` | Facts subset gathered by every `gather_facts: yes` play. Restricts Ansible's default full gather (every mount/PCI device/interface) to just what the roles use. Set `-e spur_gather_subset=all` to fall back to full gathering. |
-| `spur_overwrite_conf` | `false` | Overwrite an existing `spur.conf` (controller or agent) instead of leaving it alone. `add_nodes.yml` always re-renders the controller's regardless, so a newly added node appears in it. |
+| `spur_overwrite_conf` | `false` | Overwrite an existing `spur.conf` (controller or agent) instead of leaving it alone. Same default across every playbook, including `add_nodes.yml` — a newly added node registers live either way, but only appears in the rendered `[[nodes]]` block on a run (this one or a later `deploy.yml`/`rolling_upgrade.yml`) that passes this flag. |
 | `spur_drain_wait_secs` | `120` | How long to wait for a node to reach `DRAINED`/`DOWN` before treating it as busy — used by `deploy.yml`, `teardown.yml`, `rolling_upgrade.yml`, and `remove_nodes.yml` via the shared drain guard. |
 | `spur_skip_busy_agents` | `false` | Leave a still-busy node untouched and continue with the rest of the fleet, instead of the playbook's default (refuse, or force for `deploy.yml`). Shared by `deploy.yml`, `teardown.yml`, `rolling_upgrade.yml`, `remove_nodes.yml`. |
 | `spur_force_teardown_busy_agents` | `false` | `teardown.yml`-specific: kill a busy node's running job and tear it down anyway. |
@@ -532,7 +532,13 @@ First add the host(s) to `[spur_agents]` in your inventory (the source of truth)
 ansible-playbook playbooks/add_nodes.yml -i inventory/hosts.ini -e new_nodes=gpu-3,gpu-4
 ```
 
-What it does: gathers facts across the cluster so the regenerated `spur.conf` has cpu/memory for every node, installs and starts `spurd` on the new hosts only, refreshes `spur.conf` on the controllers **without restarting them**, and verifies that each new node registered. It's idempotent — a node that's already registered is skipped, so re-runs never bounce a healthy agent. Adding a **controller** is out of scope, because that's a Raft membership change; use `deploy.yml` for that. `add_nodes.yml` refuses controller names.
+What it does: installs and starts `spurd` on the new hosts only, and verifies that each new node registered. It's idempotent — a node that's already registered is skipped, so re-runs never bounce a healthy agent. Adding a **controller** is out of scope, because that's a Raft membership change; use `deploy.yml` for that. `add_nodes.yml` refuses controller names.
+
+Like every other playbook, an existing `spur.conf` on the controllers is left alone by default — the new node is already live-registered (schedulable immediately) regardless of the file. Facts (cpu/memory) are gathered across the cluster on every run regardless of this flag, since the WireGuard mesh-join play needs them too; pass `-e spur_overwrite_conf=true` to also refresh `spur.conf` with the new node's entry, still **without restarting** the controller:
+
+```bash
+ansible-playbook playbooks/add_nodes.yml -i inventory/hosts.ini -e new_nodes=gpu-3,gpu-4 -e spur_overwrite_conf=true
+```
 
 On a **WireGuard** cluster it joins the new node to the mesh before starting `spurd`, and meshes it with every existing member (controllers, agents, and login nodes) so it's fully peered — not just to the controllers. An unrelated existing member being down doesn't abort the add when `-e spur_ignore_unreachable_agents=true` is set. The new node must have a `spur_wg_address` (pinned in inventory, or auto-assigned by position).
 
