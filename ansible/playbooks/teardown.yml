@@ -9,6 +9,9 @@
 #
 # Disruptive by default, no drain: teardown means the whole cluster is coming
 # down, so there's no "rest of the fleet" left to protect by draining first.
+# It still kills any job processes/containers left on a disrupted agent (same
+# cgroup sweep rolling_upgrade.yml --force uses) — only the wait-for-drain
+# part is skipped, not the cleanup.
 # Passing -e spur_skip_busy_agents=true or -e spur_force_teardown_busy_agents=true
 # opts back into draining each agent first (same job-safety model as
 # deploy.yml/rolling_upgrade.yml/remove_nodes.yml) before it's disrupted:
@@ -56,6 +59,15 @@
              (inventory_hostname not in groups['spur_agents']) or
              not (spur_node_busy | default(false)) or
              dckj_force_busy }}
+
+    # Runs BEFORE stopping spurd, not after: a job's cgroup (bare processes and
+    # any Docker/Podman container it launched) is independent of spurd's own
+    # process tree, so `systemctl stop spurd` won't reliably reap it and can
+    # block for its full stop-timeout waiting on a job that ignores SIGTERM.
+    # Clearing the cgroup first keeps the stop below fast (no-op if empty).
+    - name: Kill any leftover job processes and containers in spur cgroups
+      ansible.builtin.include_tasks: tasks/kill_workload_processes.yml
+      when: spur_ok_to_disrupt
 
     - name: Stop and disable Spur systemd services
       ansible.builtin.systemd:

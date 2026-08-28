@@ -588,7 +588,7 @@ Either way it stops and disables the systemd services and reaps any stray daemon
 
 Disruptive by default, with no drain step: teardown means the whole cluster is coming down, so there's no surviving fleet left to protect by draining agents first. To take a node out of a cluster that keeps running (draining it first so its job finishes), use `remove_nodes.yml` instead.
 
-An agent with a job still running is stopped immediately by default. Pass either busy-agent flag to opt back into draining it first — if it doesn't finish draining, that host is left running rather than silently killing the job:
+An agent with a job still running is stopped immediately by default — including any Docker/Podman container the job launched, via the same cgroup sweep `rolling_upgrade.yml --force` uses; only the wait-for-drain step is skipped, not cleanup. Pass either busy-agent flag to opt back into draining it first — if it doesn't finish draining, that host is left running rather than silently killing the job:
 
 ```bash
 ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true            # drain first; leave busy agents running, tear down the rest

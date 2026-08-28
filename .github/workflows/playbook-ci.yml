@@ -17,8 +17,9 @@
 #   remove_nodes.yml's busy-node job-safety model (refuse by default,
 #   spur_skip_busy_agents=true, spur_force_remove_busy_nodes=true), plus
 #   teardown.yml's disruptive-by-default/opt-in-drain behavior (no flags:
-#   stops a busy agent immediately; spur_skip_busy_agents=true or
-#   spur_force_teardown_busy_agents=true opts back into draining first)
+#   stops a busy agent immediately and sweeps its job cgroup clean, no wait;
+#   spur_skip_busy_agents=true or spur_force_teardown_busy_agents=true opts
+#   back into draining first)
 #
 # integration-ha-mesh:
 #   3-controller HA cluster over a real WireGuard mesh (SPUR-195, PR #23) — the
@@ -1260,12 +1261,15 @@ jobs:
             -e spur_home=/opt/spur \
             --limit gpu-2
 
-      - name: Assert gpu-2's spurd was stopped immediately, with no drain
+      - name: Assert gpu-2's spurd was stopped immediately, with no drain, and its job cgroup is clean
         run: |
           set -euo pipefail
           docker exec gpu-2 systemctl is-active spurd 2>&1 | grep -qx active \
             && { echo "FAIL: spurd should have been stopped on gpu-2 despite the busy job"; exit 1; }
-          echo "PASS: teardown.yml stopped gpu-2's spurd immediately, no drain/refuse"
+          orphan_pids=$(docker exec gpu-2 bash -c \
+            "find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null | xargs cat 2>/dev/null | sort -u" || true)
+          [ -z "$orphan_pids" ] || { echo "FAIL: orphan job PIDs still in spur cgroups on gpu-2: $orphan_pids"; exit 1; }
+          echo "PASS: teardown.yml stopped gpu-2's spurd immediately, no drain/refuse, no orphaned job processes"
 
       # --- teardown.yml: spur_skip_busy_agents/spur_force_teardown_busy_agents opt back into draining first ---
       - name: Submit a busy job on gpu-3 for the teardown.yml opt-in-drain test
