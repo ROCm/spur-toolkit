@@ -7,23 +7,22 @@
 # Skip agents unreachable over SSH (default false = strict):
 #   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_ignore_unreachable_agents=true
 #
-# An agent with a job still running is drained first; if it doesn't finish
-# draining, teardown aborts for that host by default rather than silently
-# killing the job. Re-run with -e spur_skip_busy_agents=true to leave busy
-# agents running and tear down the rest of the fleet, or with
-# -e spur_force_teardown_busy_agents=true to kill the running job and tear
-# it down anyway:
-#   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_force_teardown_busy_agents=true
+# Disruptive by default, no drain: teardown means the whole cluster is coming
+# down, so there's no "rest of the fleet" left to protect by draining first.
+# Passing -e spur_skip_busy_agents=true or -e spur_force_teardown_busy_agents=true
+# opts back into draining each agent first (same job-safety model as
+# deploy.yml/rolling_upgrade.yml/remove_nodes.yml) before it's disrupted:
+#   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true            # drain first; leave a still-busy agent running, tear down the rest
+#   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_force_teardown_busy_agents=true  # drain first; kill a still-busy agent's job and tear it down anyway
 
 - name: Stop Spur daemons — agents
-  # Agents are drained first, while the controller is still up — the drain
-  # guard needs a live controller to query/update node state. This MUST run
-  # before the controllers play below, which stops spurctld; draining after
-  # the controller is already dead would just fail to connect.
+  # Kept as its own play (rather than merged with the one below) so
+  # ignore_unreachable applies to agents alone — the controller/accounting
+  # host always stays strict — and so the opt-in drain below only ever runs
+  # once per host, here, even for a host that's both controller and agent.
   hosts: spur_agents
   become: true
-  gather_facts: yes
-  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  gather_facts: no
   ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   vars:
     <<: &spur_teardown_vars
@@ -31,20 +30,30 @@
       dckj_skip_busy: "{{ spur_skip_busy_agents | default(false) | bool }}"
       dckj_force_busy: "{{ spur_force_teardown_busy_agents | default(false) | bool }}"
       dckj_force_flag: spur_force_teardown_busy_agents
+      # Passing either busy-agent flag is the opt-in signal for draining —
+      # there's no separate "please drain" switch.
+      spur_teardown_drain_requested: >-
+        {{ (spur_skip_busy_agents | default(false) | bool) or
+           (spur_force_teardown_busy_agents | default(false) | bool) }}
     spur_teardown_is_agent_play: true
   tasks: &spur_teardown_tasks
+    - name: Gather facts for node-name resolution (only needed when draining)
+      ansible.builtin.setup:
+        gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+      when: spur_teardown_is_agent_play and (inventory_hostname in groups['spur_agents']) and spur_teardown_drain_requested
+
     # Only in THIS play, and only for hosts that are actually agents — a host
     # that's both a controller and an agent (spur_controller_runs_agent) would
-    # otherwise get drain-guarded twice (once per play), and the second
-    # attempt would try to drain a node already deregistered by the first.
-    - name: Drain + guard the agent daemon against job loss before tearing it down
+    # otherwise get drain-guarded twice (once per play).
+    - name: Drain + guard the agent daemon against job loss before tearing it down (opt-in)
       ansible.builtin.include_tasks: tasks/drain_and_guard_agent.yml
-      when: spur_teardown_is_agent_play and (inventory_hostname in groups['spur_agents'])
+      when: spur_teardown_is_agent_play and (inventory_hostname in groups['spur_agents']) and spur_teardown_drain_requested
 
     - name: Determine whether it's safe to disrupt this host
       ansible.builtin.set_fact:
         spur_ok_to_disrupt: >-
-          {{ (inventory_hostname not in groups['spur_agents']) or
+          {{ (not spur_teardown_drain_requested) or
+             (inventory_hostname not in groups['spur_agents']) or
              not (spur_node_busy | default(false)) or
              dckj_force_busy }}
 
@@ -109,9 +118,7 @@
 
     - name: Note SPUR_CONTROLLER_ADDR is left in place on a non-wipe teardown
       # A plain teardown stops the daemons but keeps SPUR_CONTROLLER_ADDR, which now points at a
-      # stopped controller — the CLI on this host will fail until the next deploy re-sets it. Flag
-      # it (matching the "still has a running job" note) so it isn't a silent surprise. Re-run with
-      # -e wipe=true to clear it.
+      # stopped controller — the CLI on this host will fail until the next deploy re-sets it.
       ansible.builtin.debug:
         msg: >-
           {{ inventory_hostname }}: SPUR_CONTROLLER_ADDR left in /etc/environment but the
@@ -132,15 +139,10 @@
   # group — this also cleans up a standalone spurdbd left over from a pre-merge
   # deployment (accounting is embedded in spurctld now, no separate daemon).
   # Login nodes are included so their WireGuard interface is torn down too (they
-  # run no daemon, so the systemd/pkill steps are harmless no-ops there). Runs
-  # after the agents play above, which needs the controller alive to drain.
+  # run no daemon, so the systemd/pkill steps are harmless no-ops there).
   hosts: "spur_controllers:spur_login:{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
   become: true
-  # Needed for ansible_hostname — the drain guard below resolves spur_node_name
-  # from it (same as deploy.yml/rolling_upgrade.yml) so `spur node drain` gets
-  # the actual registered name, not the inventory alias.
-  gather_facts: yes
-  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  gather_facts: no
   vars:
     <<: *spur_teardown_vars
     spur_teardown_is_agent_play: false

@@ -14,8 +14,11 @@
 #   preserve, opt-in: overwrite), and the two paths render an identical file
 #
 # integration-day2:
-#   remove_nodes.yml and teardown.yml's shared busy-node job-safety model
-#   (refuse by default, spur_skip_busy_agents=true, spur_force_*=true)
+#   remove_nodes.yml's busy-node job-safety model (refuse by default,
+#   spur_skip_busy_agents=true, spur_force_remove_busy_nodes=true), plus
+#   teardown.yml's disruptive-by-default/opt-in-drain behavior (no flags:
+#   stops a busy agent immediately; spur_skip_busy_agents=true or
+#   spur_force_teardown_busy_agents=true opts back into draining first)
 #
 # integration-ha-mesh:
 #   3-controller HA cluster over a real WireGuard mesh (SPUR-195, PR #23) — the
@@ -1013,9 +1016,8 @@ jobs:
     needs: lint
     env:
       # ci.ini hardcodes [spur_agents] = gpu-1/gpu-2/gpu-3, so all three must
-      # exist as containers even though this job only actively uses gpu-1
-      # (remove_nodes.yml) and gpu-2 (teardown.yml) — gpu-3 is just a healthy
-      # bystander so deploy.yml's strict (non-ignore_unreachable) run succeeds.
+      # exist as containers: gpu-1 (remove_nodes.yml), gpu-2 (teardown.yml
+      # default disruptive path), gpu-3 (teardown.yml opt-in drain path).
       NODES: "ctl-0 gpu-1 gpu-2 gpu-3"
     steps:
       - uses: actions/checkout@v4
@@ -1231,8 +1233,8 @@ jobs:
           [ -z "$orphan_pids" ] || { echo "FAIL: orphan PIDs still in spur cgroups on gpu-1: $orphan_pids"; exit 1; }
           echo "PASS: gpu-1's job was killed, spurd stopped, and it was removed from the cluster"
 
-      # --- teardown.yml: refuse / force on a busy node ----------------------
-      - name: Submit a busy job on gpu-2 for the teardown.yml tests
+      # --- teardown.yml: disruptive by design, no drain ---------------------
+      - name: Submit a busy job on gpu-2 for the teardown.yml test
         run: |
           set -euo pipefail
           docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
@@ -1248,32 +1250,41 @@ jobs:
             echo "busy job $jid never reached RUNNING"; exit 1
           '
 
-      - name: teardown.yml default (must refuse to touch busy gpu-2)
+      - name: teardown.yml default (must NOT refuse or wait — stops gpu-2 immediately despite the busy job)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          if ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
-              -e spur_install_dir=/usr/local/bin \
-              -e spur_home=/opt/spur \
-              -e spur_drain_wait_secs=10 \
-              --limit gpu-2; then
-            echo "FAIL: teardown.yml should have refused on a busy node"; exit 1
-          else
-            echo "PASS: teardown.yml refused by default on a busy node"
-          fi
+          ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            --limit gpu-2
 
-      - name: Assert gpu-2's job is still running and spurd is untouched
+      - name: Assert gpu-2's spurd was stopped immediately, with no drain
         run: |
           set -euo pipefail
-          jid=$(docker exec ctl-0 cat /tmp/ci-teardown-busy.jid)
-          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
-          [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING after a refused teardown (state: $st)"; exit 1; }
-          docker exec gpu-2 systemctl is-active spurd | grep -qx active \
-            || { echo "FAIL: spurd should not have been touched"; exit 1; }
-          echo "PASS: gpu-2 untouched after the refused teardown"
+          docker exec gpu-2 systemctl is-active spurd 2>&1 | grep -qx active \
+            && { echo "FAIL: spurd should have been stopped on gpu-2 despite the busy job"; exit 1; }
+          echo "PASS: teardown.yml stopped gpu-2's spurd immediately, no drain/refuse"
 
-      - name: teardown.yml spur_skip_busy_agents=true (must leave gpu-2 and its job untouched)
+      # --- teardown.yml: spur_skip_busy_agents/spur_force_teardown_busy_agents opt back into draining first ---
+      - name: Submit a busy job on gpu-3 for the teardown.yml opt-in-drain test
+        run: |
+          set -euo pipefail
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=teardown-drain-busy\nsleep 600\n" > /tmp/ci-teardown-drain-busy.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-teardown-drain-busy.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-teardown-drain-busy.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "busy job $jid RUNNING on gpu-3"; exit 0; }
+              sleep 1
+            done
+            echo "busy job $jid never reached RUNNING"; exit 1
+          '
+
+      - name: teardown.yml spur_skip_busy_agents=true (must drain first, then leave gpu-3 and its job untouched)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
@@ -1283,19 +1294,19 @@ jobs:
             -e spur_home=/opt/spur \
             -e spur_drain_wait_secs=10 \
             -e spur_skip_busy_agents=true \
-            --limit gpu-2
+            --limit gpu-3
 
-      - name: Assert spur_skip_busy_agents=true left gpu-2's job and spurd untouched
+      - name: Assert spur_skip_busy_agents=true left gpu-3's job and spurd untouched
         run: |
           set -euo pipefail
-          jid=$(docker exec ctl-0 cat /tmp/ci-teardown-busy.jid)
+          jid=$(docker exec ctl-0 cat /tmp/ci-teardown-drain-busy.jid)
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
           [ "$st" = RUNNING ] || { echo "FAIL: job should still be RUNNING (spur_skip_busy_agents=true)"; exit 1; }
-          docker exec gpu-2 systemctl is-active spurd | grep -qx active \
+          docker exec gpu-3 systemctl is-active spurd | grep -qx active \
             || { echo "FAIL: spurd should not have been touched by spur_skip_busy_agents=true"; exit 1; }
-          echo "PASS: spur_skip_busy_agents=true left gpu-2's job and spurd untouched"
+          echo "PASS: spur_skip_busy_agents=true drained first, then left gpu-3's job and spurd untouched"
 
-      - name: teardown.yml spur_force_teardown_busy_agents=true (must kill the job and tear down gpu-2)
+      - name: teardown.yml spur_force_teardown_busy_agents=true (must drain first, then kill the job and tear down gpu-3)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
@@ -1305,17 +1316,17 @@ jobs:
             -e spur_home=/opt/spur \
             -e spur_drain_wait_secs=10 \
             -e spur_force_teardown_busy_agents=true \
-            --limit gpu-2
+            --limit gpu-3
 
-      - name: Assert gpu-2's job was killed and spurd was stopped
+      - name: Assert gpu-3's job was killed and spurd was stopped
         run: |
           set -euo pipefail
-          jid=$(docker exec ctl-0 cat /tmp/ci-teardown-busy.jid)
+          jid=$(docker exec ctl-0 cat /tmp/ci-teardown-drain-busy.jid)
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
           [ "$st" = RUNNING ] && { echo "FAIL: job should have been killed by spur_force_teardown_busy_agents=true"; exit 1; }
-          docker exec gpu-2 systemctl is-active spurd 2>&1 | grep -qx active \
-            && { echo "FAIL: spurd should have been stopped on gpu-2"; exit 1; }
-          echo "PASS: gpu-2's job was killed and spurd stopped by teardown.yml --force"
+          docker exec gpu-3 systemctl is-active spurd 2>&1 | grep -qx active \
+            && { echo "FAIL: spurd should have been stopped on gpu-3"; exit 1; }
+          echo "PASS: gpu-3's job was killed and spurd stopped by teardown.yml --force"
 
       # --- teardown.yml basic smoke: full teardown stops every daemon ------
       - name: teardown.yml (full cluster — basic smoke)
