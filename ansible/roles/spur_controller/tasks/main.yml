@@ -1,101 +1,13 @@
 ---
-- name: Resolve every controller's listen IP (needed for the peers list on all hosts)
-  ansible.builtin.set_fact:
-    spur_controller_listen_ip: >-
-      {{ hostvars[item].spur_wg_address if spur_transport == 'wireguard'
-         else (hostvars[item].ansible_host | default(hostvars[item].ansible_default_ipv4.address)) }}
-  delegate_to: "{{ item }}"
-  delegate_facts: true
-  loop: "{{ groups['spur_controllers'] }}"
-  run_once: true
-
-- name: Assign 1-based node_id to each controller (position in inventory)
-  ansible.builtin.set_fact:
-    spur_controller_node_id: "{{ groups['spur_controllers'].index(item) + 1 }}"
-  delegate_to: "{{ item }}"
-  delegate_facts: true
-  loop: "{{ groups['spur_controllers'] }}"
-  run_once: true
-
-# Accounting host resolution, highest precedence first:
-#   1. explicit spur_accounting_host (-e or inventory var) — user intent wins
-#   2. the database_url already in the LIVE spur.conf — preserves an existing
-#      cluster's DB target on re-render/upgrade even if this run's inventory
-#      doesn't declare the accounting node (rolling_upgrade against an unknown
-#      customer inventory must NOT silently repoint Postgres at a controller)
-#   3. the [spur_accounting_node] inventory group (fresh deploy of a dedicated DB)
-#   4. the first controller (co-located default)
-- name: Resolve accounting IP from explicit spur_accounting_host
-  vars:
-    acct_host: "{{ spur_accounting_host }}"
-  ansible.builtin.set_fact:
-    spur_accounting_listen_ip: >-
-      {{ hostvars[acct_host].spur_wg_address if spur_transport == 'wireguard'
-         else (hostvars[acct_host].ansible_host
-               | default(hostvars[acct_host].ansible_default_ipv4.address)) }}
-  # delegate_facts (not a plain set_fact) so this is a real hostvar on every
-  # controller, readable via hostvars[] from ANY host/play — including the
-  # spur_agent role's spur.conf render, which runs in a later, separate play.
-  delegate_to: "{{ item }}"
-  delegate_facts: true
-  loop: "{{ groups['spur_controllers'] }}"
-  run_once: true
-  when:
-    - spur_accounting_enabled | bool
-    - spur_accounting_host is defined
-
-- name: Read accounting IP from live spur.conf (no explicit spur_accounting_host)
-  ansible.builtin.shell: |
-    grep -oP '(?<=@)[^:/@]+(?=:[0-9]+/)' {{ spur_home }}/etc/spur.conf 2>/dev/null | head -1
-  args:
-    executable: /bin/bash
-  register: spur_conf_acct_ip
-  changed_when: false
-  failed_when: false
-  run_once: true
-  when:
-    - spur_accounting_enabled | bool
-    - spur_accounting_host is not defined
-
-- name: Preserve accounting IP from live spur.conf
-  ansible.builtin.set_fact:
-    spur_accounting_listen_ip: "{{ spur_conf_acct_ip.stdout | trim }}"
-  delegate_to: "{{ item }}"
-  delegate_facts: true
-  loop: "{{ groups['spur_controllers'] }}"
-  run_once: true
-  when:
-    - spur_accounting_enabled | bool
-    - spur_accounting_host is not defined
-    - spur_conf_acct_ip.stdout | default('') | trim | length > 0
-
-- name: Derive accounting IP from group/controllers (no explicit var, no live spur.conf)
-  vars:
-    acct_host: "{{ groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0] }}"
-  ansible.builtin.set_fact:
-    spur_accounting_listen_ip: >-
-      {{ hostvars[acct_host].spur_wg_address if spur_transport == 'wireguard'
-         else (hostvars[acct_host].ansible_host
-               | default(hostvars[acct_host].ansible_default_ipv4.address)) }}
-  delegate_to: "{{ item }}"
-  delegate_facts: true
-  loop: "{{ groups['spur_controllers'] }}"
-  run_once: true
-  when:
-    - spur_accounting_enabled | bool
-    - spur_accounting_host is not defined
-    - spur_conf_acct_ip.stdout | default('') | trim | length == 0
-
-# spur.conf's [[nodes]] block needs ansible_processor_vcpus, ansible_memtotal_mb,
-# and ansible_hostname for every agent. These are only available after fact-gathering.
-# Playbooks that target agents before the controller role (deploy.yml, rolling_upgrade.yml)
-# gather facts on all hosts up front, so this is a no-op there. add_nodes.yml only
-# gathers facts for the new nodes by the time the controller role runs, so any
-# pre-existing agents may be missing facts — this task fills the gap.
-# ignore_unreachable/ignore_errors: a temporarily down agent (e.g. during a rolling
-# upgrade) must not abort the controller upgrade. The template uses | default() so
-# spur.conf is still rendered with the last-known or 0-fallback values for that node.
-- name: Gather facts for any agent missing them (needed for spur.conf [[nodes]] block)
+# spur.conf is the single source of truth (the file passed as -i, read here via
+# Ansible's `inventory_file` magic var) — controllers/agents/accounting/network/
+# k8s settings all come from it verbatim. Ansible only auto-fills two things the
+# operator would otherwise have to hand-compute, and ONLY when the file leaves
+# them absent: [[nodes]] cpus/memory_mb (from live gathered facts) and
+# [controller] peers/node_id (mechanical from [controller].hosts + the raft
+# port). Everything else — accounting DB URL, k8s CIDRs, cluster_name, wg
+# settings — is taken exactly as written, no fallback chains.
+- name: Gather facts for any agent missing them (needed for cpus/memory_mb auto-fill)
   ansible.builtin.setup:
     gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   delegate_to: "{{ item }}"
@@ -106,27 +18,16 @@
   ignore_unreachable: true
   ignore_errors: true
 
-- name: Resolve short node name for each agent (used by spur.conf and --hostname)
-  ansible.builtin.set_fact:
-    spur_node_name: >-
-      {{ hostvars[item].ansible_hostname
-         | default(hostvars[item].inventory_hostname) }}
-  delegate_to: "{{ item }}"
-  delegate_facts: true
-  loop: "{{ groups['spur_agents'] }}"
-  run_once: true
-  when: hostvars[item].spur_node_name is not defined
-
-# Client env so the CLI (squeue/sinfo/scontrol and sacct/sacctmgr/sreport/sshare —
-# accounting is served on the same port as the controller API, no separate flag/env
-# needed anymore) works on controllers without per-command flags. Controller-nodes
-# only. Lists every controller (comma-separated) so the CLI's built-in endpoint
-# rotation keeps working from this host even if this particular controller is down.
+# Client env so the CLI works on controllers without per-command flags.
+# spur_wg_address is the plugin-provided hostvar (from [[nodes]]/
+# [[ansible_controllers]] ansible_wg_address) when spur_transport == wireguard,
+# else ansible_host is already the listen IP straight from [controller].hosts.
 - name: Set SPUR_CONTROLLER_ADDR in /etc/environment (controllers)
   vars:
+    spur_controller_addr_attr: "{{ 'spur_wg_address' if spur_transport == 'wireguard' else 'ansible_host' }}"
     all_controller_endpoints: >-
       {{ groups['spur_controllers']
-         | map('extract', hostvars, 'spur_controller_listen_ip')
+         | map('extract', hostvars, spur_controller_addr_attr)
          | map('regex_replace', '^(.*)$', 'http://\1:' ~ spur_controller_port)
          | join(',') }}
   ansible.builtin.lineinfile:
@@ -142,16 +43,43 @@
     regexp: '^SPUR_ACCOUNTING_ADDR='
     state: absent
 
-# Same write-if-missing opt-in as the spur_agent role's spur.conf render —
-# force: no leaves an existing file alone unless spur_overwrite_conf=true.
+- name: Read the master spur.conf and compute what to push to this host
+  vars:
+    spur_controller_addr_attr: "{{ 'spur_wg_address' if spur_transport == 'wireguard' else 'ansible_host' }}"
+    master_conf_text: "{{ lookup('file', inventory_file) }}"
+    exclude_sections: "{{ lookup('file', inventory_file) | spur_conf_exclude_sections }}"
+    node_fact_fallbacks: "{{ groups['spur_agents'] | spur_conf_node_facts(hostvars) }}"
+    controller_ha_fallback:
+      peers: >-
+        {{ groups['spur_controllers']
+           | map('extract', hostvars, spur_controller_addr_attr)
+           | map('regex_replace', '$', ':' ~ spur_raft_port)
+           | list }}
+      node_id: "{{ groups['spur_controllers'].index(inventory_hostname) + 1 }}"
+  ansible.builtin.set_fact:
+    desired_conf: >-
+      {{ master_conf_text | spur_conf_for_push(exclude_sections, node_fact_fallbacks, controller_ha_fallback) }}
+    spur_conf_exclude_sections_list: "{{ exclude_sections }}"
+
+- name: Slurp the live spur.conf on this controller, if any
+  ansible.builtin.slurp:
+    path: "{{ spur_home }}/etc/spur.conf"
+  register: existing_conf_b64
+  failed_when: false
+
+- name: Splice back any excluded sections from the currently-live file
+  ansible.builtin.set_fact:
+    final_conf: >-
+      {{ desired_conf | spur_conf_splice_excluded(
+           (existing_conf_b64.content | b64decode) if (existing_conf_b64.content is defined) else '',
+           spur_conf_exclude_sections_list) }}
+
 - name: Write spur.conf
-  ansible.builtin.template:
-    src: spur.conf.j2
+  ansible.builtin.copy:
+    content: "{{ final_conf }}"
     dest: "{{ spur_home }}/etc/spur.conf"
     mode: "0644"
-    force: "{{ spur_overwrite_conf | default(false) | bool }}"
   register: spur_conf
-  when: not (spur_controller_skip_conf | default(false) | bool)
 
 - name: Install spurctld systemd unit
   ansible.builtin.template:
@@ -179,16 +107,20 @@
     - not (spur_wipe_state | bool)
 
 - name: Fail if the controller (Raft) set changed without a state wipe
+  vars:
+    spur_controller_addr_attr: "{{ 'spur_wg_address' if spur_transport == 'wireguard' else 'ansible_host' }}"
+    desired_peers: >-
+      {{ groups['spur_controllers']
+         | map('extract', hostvars, spur_controller_addr_attr)
+         | map('regex_replace', '$', ':' ~ spur_raft_port)
+         | sort }}
   ansible.builtin.fail:
     msg: >-
       Persisted Raft membership {{ raft_peers.stdout_lines | sort }} does not
-      match the inventory controllers
-      {{ groups['spur_controllers'] | map('extract', hostvars, 'spur_controller_listen_ip') | map('regex_replace', '$', ':' ~ spur_raft_port) | sort }}.
+      match the inventory controllers {{ desired_peers }}.
       Spur 0.3.0 has no online membership change, so adding/removing/reordering a
       controller needs a Raft reinit: re-run with -e spur_wipe_state=true.
       Adding/removing compute agents does not require this.
-  vars:
-    desired_peers: "{{ groups['spur_controllers'] | map('extract', hostvars, 'spur_controller_listen_ip') | map('regex_replace', '$', ':' ~ spur_raft_port) | sort }}"
   when:
     - spur_ha_enabled | bool
     - not (spur_wipe_state | bool)

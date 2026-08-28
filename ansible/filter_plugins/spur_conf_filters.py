@@ -18,25 +18,55 @@ def spur_conf_exclude_sections(master_text):
     return list(doc.get("ansible", {}).get("exclude_sections", []))
 
 
-def spur_conf_for_push(master_text, exclude_sections=None):
+def spur_conf_for_push(master_text, exclude_sections=None, node_fact_fallbacks=None,
+                        controller_ha_fallback=None):
     """Return the spur.conf content that should be pushed to a node: the
-    master file with the ansible-only [ansible] table and any ansible_*
-    keys on [[nodes]] entries stripped, and any section named in
+    master file with all ansible-only content stripped ([ansible] table,
+    [[ansible_controllers]], [[ansible_login_nodes]], and any ansible_* keys
+    on [[nodes]]/[[ansible_controllers]] entries), and any section named in
     exclude_sections removed entirely (the caller splices back whatever
     already exists on the node for those, this filter only computes what
     ansible itself would contribute).
+
+    node_fact_fallbacks: optional {node_name: {"cpus": int, "memory_mb": int}}
+    used to fill a [[nodes]] entry's cpus/memory_mb ONLY when the master file
+    itself leaves them absent — an explicit value in the file always wins.
+
+    controller_ha_fallback: optional {"peers": [...], "node_id": int} used to
+    fill [controller].peers/node_id ONLY when the master's [controller]
+    section omits them. node_id is inherently per-target-host (each
+    controller has its own), so this must be computed by the caller once per
+    host being pushed to, not once for the whole run.
     """
     if tomlkit is None:
         raise AnsibleFilterError("spur_conf_for_push requires the 'tomlkit' Python package")
 
     exclude_sections = set(exclude_sections or [])
+    node_fact_fallbacks = node_fact_fallbacks or {}
     doc = tomlkit.parse(master_text)
 
     doc.pop("ansible", None)
+    doc.pop("ansible_controllers", None)
+    doc.pop("ansible_login_nodes", None)
 
     for node in doc.get("nodes", []):
         for key in [k for k in node.keys() if k.startswith("ansible_")]:
             node.pop(key)
+        fallback = node_fact_fallbacks.get(node.get("names"), {})
+        if "cpus" not in node and "cpus" in fallback:
+            node["cpus"] = int(fallback["cpus"])
+        if "memory_mb" not in node and "memory_mb" in fallback:
+            node["memory_mb"] = int(fallback["memory_mb"])
+
+    # Ansible/Jinja templating of nested vars: dict values can round-trip a
+    # native int as a string (e.g. node_id="1") — TOML integers must not be
+    # quoted, so coerce explicitly rather than trust the caller's type.
+    if controller_ha_fallback and "controller" in doc:
+        ctrl = doc["controller"]
+        if "peers" not in ctrl and controller_ha_fallback.get("peers"):
+            ctrl["peers"] = list(controller_ha_fallback["peers"])
+        if "node_id" not in ctrl and controller_ha_fallback.get("node_id") is not None:
+            ctrl["node_id"] = int(controller_ha_fallback["node_id"])
 
     for section in exclude_sections:
         doc.pop(section, None)
@@ -67,10 +97,53 @@ def spur_conf_splice_excluded(desired_text, existing_text, exclude_sections=None
     return tomlkit.dumps(desired)
 
 
+def spur_conf_node_facts(agent_names, hostvars):
+    """Build the node_fact_fallbacks dict spur_conf_for_push expects, from
+    live gathered facts on each agent host (Ansible's hostvars). Missing
+    facts default to 0 rather than raising, matching the old template's
+    `| default(0)` behavior.
+    """
+    facts = {}
+    for name in agent_names:
+        hv = hostvars.get(name, {})
+        facts[name] = {
+            "cpus": hv.get("ansible_processor_vcpus", 0),
+            "memory_mb": int((hv.get("ansible_memtotal_mb", 0) or 0) * 0.9),
+        }
+    return facts
+
+
+def spur_conf_remove_node(master_text, node_names):
+    """Return the master file with the given node name(s) dropped entirely:
+    their [[nodes]] entry, and pruned out of any [[partitions]].nodes
+    membership string. Used only by remove_nodes.yml's write-back to the
+    master file itself, after the node is confirmed removed live.
+    """
+    if tomlkit is None:
+        raise AnsibleFilterError("spur_conf_remove_node requires the 'tomlkit' Python package")
+
+    to_remove = set(node_names) if not isinstance(node_names, str) else {node_names}
+    doc = tomlkit.parse(master_text)
+
+    if "nodes" in doc:
+        kept = [n for n in doc["nodes"] if n.get("names") not in to_remove]
+        doc["nodes"] = kept
+
+    for partition in doc.get("partitions", []):
+        members = [m.strip() for m in partition.get("nodes", "").split(",") if m.strip()]
+        remaining = [m for m in members if m not in to_remove]
+        if remaining != members:
+            partition["nodes"] = ",".join(remaining)
+
+    return tomlkit.dumps(doc)
+
+
 class FilterModule(object):
     def filters(self):
         return {
             "spur_conf_exclude_sections": spur_conf_exclude_sections,
             "spur_conf_for_push": spur_conf_for_push,
             "spur_conf_splice_excluded": spur_conf_splice_excluded,
+            "spur_conf_node_facts": spur_conf_node_facts,
+            "spur_conf_remove_node": spur_conf_remove_node,
         }

@@ -1,11 +1,11 @@
 ---
 # Stop all Spur daemons. Leaves binaries and state in place.
-#   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini
+#   ansible-playbook playbooks/teardown.yml -i spur.conf
 #
 # Add -e wipe=true to also wipe ~/spur and /etc/wireguard/spur0.conf (destructive).
 #
 # Skip agents unreachable over SSH (default false = strict):
-#   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_ignore_unreachable_agents=true
+#   ansible-playbook playbooks/teardown.yml -i spur.conf -e spur_ignore_unreachable_agents=true
 #
 # Disruptive by default, no drain: teardown means the whole cluster is coming
 # down, so there's no "rest of the fleet" left to protect by draining first.
@@ -15,8 +15,8 @@
 # Passing -e spur_skip_busy_agents=true or -e spur_force_teardown_busy_agents=true
 # opts back into draining each agent first (same job-safety model as
 # deploy.yml/rolling_upgrade.yml/remove_nodes.yml) before it's disrupted:
-#   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true            # drain first; leave a still-busy agent running, tear down the rest
-#   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_force_teardown_busy_agents=true  # drain first; kill a still-busy agent's job and tear it down anyway
+#   ansible-playbook playbooks/teardown.yml -i spur.conf -e spur_skip_busy_agents=true            # drain first; leave a still-busy agent running, tear down the rest
+#   ansible-playbook playbooks/teardown.yml -i spur.conf -e spur_force_teardown_busy_agents=true  # drain first; kill a still-busy agent's job and tear it down anyway
 
 - name: Stop Spur daemons — agents
   # Kept as its own play (rather than merged with the one below) so

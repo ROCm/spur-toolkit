@@ -10,16 +10,15 @@
 # -e spur_overwrite_conf=true to also refresh it with the new node, still
 # without bouncing the running controller.
 #
-# The node(s) MUST already be in the [spur_agents] inventory group (single source
-# of truth, same as deploy.yml). This playbook just brings the named new ones
-# online now, disruption-free. To ADD A CONTROLLER, use deploy.yml — that's a Raft
-# membership change and needs the guarded wipe/restart path.
+# The node(s) MUST already have a [[nodes]] entry (with ansible_host/ansible_user)
+# in the master spur.conf BEFORE running this — spur.conf IS the inventory (see
+# inventory_plugins/spur_conf.py), so ansible can't target a host it doesn't know
+# about yet. Add the entry by hand first, then run this to bring it online.
+# To ADD A CONTROLLER, use deploy.yml — that's a Raft membership change and
+# needs the guarded wipe/restart path.
 #
 # Run:
-#   ansible-playbook playbooks/add_nodes.yml -i inventory/hosts.ini -e new_nodes=gpu-3,gpu-4
-#
-# Also refresh spur.conf on the controllers with the new node (still no restart):
-#   ansible-playbook playbooks/add_nodes.yml -i inventory/hosts.ini -e new_nodes=gpu-3,gpu-4 -e spur_overwrite_conf=true
+#   ansible-playbook playbooks/add_nodes.yml -i spur.conf -e new_nodes=gpu-3,gpu-4
 
 # --- Guard rails (on the first controller) ---
 - name: Validate request
@@ -37,13 +36,14 @@
         fail_msg: "Pass the node(s) to add, e.g. -e new_nodes=gpu-3,gpu-4"
         quiet: true
 
-    - name: Every new node must be in the [spur_agents] inventory group
+    - name: Every new node must already have a [[nodes]] entry in the master spur.conf
       ansible.builtin.assert:
         that:
           - item in groups['spur_agents']
         fail_msg: >-
-          '{{ item }}' is not in [spur_agents]. Add it to the inventory first —
-          that group is the source of truth for cluster membership.
+          '{{ item }}' has no [[nodes]] entry in spur.conf. Add one by hand
+          first (names/ansible_host/ansible_user) — that file is the source of
+          truth for cluster membership.
         quiet: true
       loop: "{{ add_list }}"
 
@@ -86,7 +86,8 @@
 # non-bootstrap members, and (b) exclude pre-existing WORKERS from the membership doc, so the new
 # node would peer the controllers but not the other workers (full mesh only on a fresh deploy.yml).
 # Existing members whose conf already exists just restore it (A1 guard) — no re-key. The new node
-# MUST have spur_wg_address in inventory. Single-controller clusters collapse to controller + node.
+# MUST have ansible_wg_address set on its [[nodes]] entry in spur.conf. Single-controller
+# clusters collapse to controller + node.
 - name: Join new node(s) to the WireGuard mesh
   hosts: "spur_controllers:spur_agents:spur_login:{{ new_nodes | default('') | split(',') | map('trim') | select | join(':') }}"
   become: true
@@ -144,12 +145,10 @@
       when: an_registered.rc != 0
 
 # --- Refresh spur.conf on the controllers WITHOUT restarting them ---
-# Same preserve-by-default behavior as deploy.yml/rolling_upgrade.yml: an
-# existing spur.conf is left alone unless -e spur_overwrite_conf=true is
-# passed to THIS run (deploy.yml/rolling_upgrade.yml need the same flag on
-# their own runs too — none of them refresh it for free). The new node is
-# already live-registered regardless, since spurd self-registers at runtime
-# independent of the config file.
+# spur_controller always pushes the master file's current content (see
+# deploy.yml) — the newly added node's [[nodes]] entry is already in that
+# file (the precondition this playbook enforces above), so it lands here with
+# no special-case flag needed.
 - name: Refresh controller config (no restart)
   hosts: spur_controllers
   become: true

@@ -7,7 +7,7 @@
 # MUST already be registered spur agents (run add_nodes.yml or deploy.yml first).
 #
 # Run:
-#   ansible-playbook playbooks/k8s_add_nodes.yml -i inventory/hosts.ini -e k8s_new_nodes=gpu-3,gpu-4
+#   ansible-playbook playbooks/k8s_add_nodes.yml -i spur.conf -e k8s_new_nodes=gpu-3,gpu-4
 
 - name: Add worker nodes to the k0s cluster
   hosts: "{{ groups['spur_controllers'][0] }}"
@@ -15,7 +15,7 @@
   gather_facts: no
   any_errors_fatal: true
   vars:
-    ctrl_addr: "http://{{ hostvars[groups['spur_controllers'][0]]['spur_controller_listen_ip'] | default('127.0.0.1') }}:{{ spur_controller_port }}"
+    ctrl_addr: "http://{{ hostvars[groups['spur_controllers'][0]]['ansible_host'] | default('127.0.0.1') }}:{{ spur_controller_port }}"
     add_list: "{{ k8s_new_nodes | default('') | split(',') | map('trim') | select | list }}"
     k8s_ready_retries: 40
     k8s_ready_delay: 15

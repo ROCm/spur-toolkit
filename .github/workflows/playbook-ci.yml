@@ -1,6 +1,13 @@
 # ============================================================================
 # Playbook integration tests — five parallel jobs, each with its own cluster.
 #
+# spur.conf IS the Ansible inventory for every job (see
+# ansible/inventory_plugins/spur_conf.py) — no more hosts.ini/ci.ini. Each job
+# generates its own spur.conf fixture from the running containers (real
+# docker-network IPs in [controller].hosts, container names via
+# [[ansible_controllers]]/[[nodes]].ansible_host for the docker connection —
+# see the "Generate the CI spur.conf fixture" step in each job).
+#
 # integration-resilience:
 #   initial deploy with one agent unreachable (spur_ignore_unreachable_agents)
 #   + deploy.yml's default busy-agent behavior (drain-then-force-kill, and the
@@ -10,29 +17,39 @@
 #   (bare process AND Docker container)
 #
 # integration-conf:
-#   deploy + spur.conf preservation on BOTH controller and agent (default:
-#   preserve, opt-in: overwrite), and the two paths render an identical file
+#   deploy + [ansible].exclude_sections on BOTH controller and agent — a
+#   hand-edit inside an excluded section survives every playbook run
+#   untouched, while a non-excluded field change in the master fixture
+#   propagates every time, no flags needed (replaces the old
+#   spur_overwrite_conf-flag-based preserve/overwrite test)
 #
 # integration-day2:
 #   remove_nodes.yml's busy-node job-safety model (refuse by default,
-#   spur_skip_busy_agents=true, spur_force_remove_busy_nodes=true), plus
-#   teardown.yml's disruptive-by-default/opt-in-drain behavior (no flags:
-#   stops a busy agent immediately and sweeps its job cgroup clean, no wait;
-#   spur_skip_busy_agents=true or spur_force_teardown_busy_agents=true opts
-#   back into draining first)
+#   spur_skip_busy_agents=true, spur_force_remove_busy_nodes=true), plus its
+#   write-back (pruning the master spur.conf fixture itself, exercised by the
+#   force-remove case). Also teardown.yml's disruptive-by-default/opt-in-drain
+#   behavior (no flags: stops a busy agent immediately and sweeps its job
+#   cgroup clean, no wait; spur_skip_busy_agents=true or
+#   spur_force_teardown_busy_agents=true opts back into draining first)
 #
 # integration-ha-mesh:
 #   3-controller HA cluster over a real WireGuard mesh (SPUR-195, PR #23) — the
-#   only job exercising spur_transport=wireguard AND >1 controller. Asserts the
-#   positional mesh addressing (.1 bootstrap / .2/.3 joiners), full controller
-#   <->controller connectivity (not hub-and-spoke), Raft quorum over the mesh,
-#   spur.conf's HA peers/node_id, the remove_nodes.yml / add_nodes.yml
-#   all-controllers WG peer sync (no ghost peer; regenerated key refreshed on
-#   every controller), and identity/reboot persistence (idempotent redeploy does
-#   not rotate keys; wg-quick down/up preserves the key + full peer set). Needs
-#   `spur net mesh`/`remove-peer` from ROCm/spur#719, so it pulls the nightly
-#   binaries (the last tagged release predates that merge). Requires the
-#   wireguard kernel module: modprobe'd on the runner and bind-mounted into the
+#   only job exercising spur_transport=wireguard AND >1 controller, and each
+#   controller doubles as an agent (co-located, via a [[nodes]] entry whose
+#   names matches the controller's ctl-N inventory name — see
+#   inventory_plugins/spur_conf.py). Asserts the positional mesh addressing
+#   (pinned .1-.6, matching the fixture's ansible_wg_address values), full
+#   controller<->controller connectivity (not hub-and-spoke), Raft quorum over
+#   the mesh, spur.conf's HA peers/node_id (auto-filled since the fixture
+#   leaves them absent), the remove_nodes.yml / add_nodes.yml all-controllers
+#   WG peer sync (no ghost peer; regenerated key refreshed on every
+#   controller — re-adding a node requires re-inserting its [[nodes]] entry
+#   into the fixture first, add_nodes.yml's usual precondition), and
+#   identity/reboot persistence (idempotent redeploy does not rotate keys;
+#   wg-quick down/up preserves the key + full peer set). Needs `spur net
+#   mesh`/`remove-peer` from ROCm/spur#719, so it pulls the nightly binaries
+#   (the last tagged release predates that merge). Requires the wireguard
+#   kernel module: modprobe'd on the runner and bind-mounted into the
 #   containers so modinfo/wg-quick see it.
 #
 # techsupport:
@@ -72,11 +89,13 @@ jobs:
       - name: Install ansible + lint
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install ansible-core ansible-lint
+          python3 -m pip install ansible-core ansible-lint tomlkit
           ansible-galaxy collection install community.docker
       - name: Syntax check all playbooks
         working-directory: ansible
         run: |
+          # spur.conf IS the inventory (spur_conf inventory plugin) — the checked-in
+          # example is enough for a pure --syntax-check, no live containers needed.
           # Some playbooks template their `hosts:` from a runtime -e var (e.g.
           # add_nodes.yml/remove_nodes.yml need new_nodes/... ) and --syntax-check
           # errors on an empty hosts pattern. Pass harmless dummy values so the
@@ -84,7 +103,7 @@ jobs:
           DUMMY="-e new_nodes=ctl-0 -e remove_nodes=ctl-0"
           for pb in playbooks/*.yml; do
             echo "== syntax-check $pb =="
-            ansible-playbook --syntax-check -i inventory/ci.ini $DUMMY "$pb" || exit 1
+            ansible-playbook --syntax-check -i inventory/examples/spur.conf.master.example $DUMMY "$pb" || exit 1
           done
 
   # ---------------------------------------------------------------------------
@@ -230,8 +249,70 @@ jobs:
       - name: Install ansible + docker connection plugin
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install ansible-core
+          python3 -m pip install ansible-core tomlkit
           ansible-galaxy collection install community.docker
+
+      # spur.conf IS the inventory now (spur_conf plugin) — [controller].hosts
+      # needs the container's REAL docker-network IP (it's what spurctld
+      # advertises/listens on and what lands in the accounting database_url),
+      # while Ansible's own connection target needs the CONTAINER NAME (docker
+      # connection execs by name, not IP). [[ansible_controllers]] carries that
+      # split; [[nodes]] entries just use the container name directly since
+      # they have no separate "advertised address" concept to diverge from.
+      - name: Generate the CI spur.conf fixture
+        run: |
+          set -euo pipefail
+          ctl0_ip=$(docker inspect -f '{{.NetworkSettings.Networks.spur-ci.IPAddress}}' ctl-0)
+          cat > "$GITHUB_WORKSPACE/ci-spur.conf" <<EOF
+          cluster_name = "ci-cluster"
+
+          [ansible]
+          default_user = "root"
+          default_connection = "docker"
+          exclude_sections = []
+
+          [controller]
+          listen_addr = "[::]:6817"
+          hosts = ["$ctl0_ip"]
+          state_dir = "/opt/spur/state"
+          raft_listen_addr = "[::]:6821"
+
+          [[ansible_controllers]]
+          host = "$ctl0_ip"
+          ansible_host = "ctl-0"
+
+          [scheduler]
+          plugin = "backfill"
+          interval_secs = 1
+
+          [accounting]
+          database_url = "postgresql://spur:spur@$ctl0_ip:5432/spur"
+          fairshare_refresh_secs = 30
+
+          [network]
+          wg_enabled = false
+          agent_port = 6818
+
+          [[nodes]]
+          names = "gpu-1"
+          ansible_host = "gpu-1"
+
+          [[nodes]]
+          names = "gpu-2"
+          ansible_host = "gpu-2"
+
+          [[nodes]]
+          names = "gpu-3"
+          ansible_host = "gpu-3"
+
+          [[partitions]]
+          name = "default"
+          default = true
+          nodes = "gpu-1,gpu-2,gpu-3"
+          max_time = "INFINITE"
+          EOF
+          echo "== ci-spur.conf =="
+          cat "$GITHUB_WORKSPACE/ci-spur.conf"
 
       - name: Simulate gpu-3 unreachable before the initial deploy
         run: docker stop gpu-3
@@ -241,7 +322,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -285,7 +366,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -361,7 +442,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -405,7 +486,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -439,7 +520,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          if ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+          if ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/rolling_upgrade.yml \
               -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
               -e spur_install_dir=/usr/local/bin \
               -e spur_home=/opt/spur \
@@ -472,7 +553,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          if ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+          if ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/rolling_upgrade.yml \
               -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
               -e spur_install_dir=/usr/local/bin \
               -e spur_home=/opt/spur \
@@ -496,7 +577,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/rolling_upgrade.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -601,7 +682,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/rolling_upgrade.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -784,15 +865,77 @@ jobs:
       - name: Install ansible + docker connection plugin
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install ansible-core
+          python3 -m pip install ansible-core tomlkit
           ansible-galaxy collection install community.docker
+
+      # spur.conf IS the inventory now (spur_conf plugin) — [controller].hosts
+      # needs the container's REAL docker-network IP (it's what spurctld
+      # advertises/listens on and what lands in the accounting database_url),
+      # while Ansible's own connection target needs the CONTAINER NAME (docker
+      # connection execs by name, not IP). [[ansible_controllers]] carries that
+      # split; [[nodes]] entries just use the container name directly since
+      # they have no separate "advertised address" concept to diverge from.
+      - name: Generate the CI spur.conf fixture
+        run: |
+          set -euo pipefail
+          ctl0_ip=$(docker inspect -f '{{.NetworkSettings.Networks.spur-ci.IPAddress}}' ctl-0)
+          cat > "$GITHUB_WORKSPACE/ci-spur.conf" <<EOF
+          cluster_name = "ci-cluster"
+
+          [ansible]
+          default_user = "root"
+          default_connection = "docker"
+          exclude_sections = ["accounting"]
+
+          [controller]
+          listen_addr = "[::]:6817"
+          hosts = ["$ctl0_ip"]
+          state_dir = "/opt/spur/state"
+          raft_listen_addr = "[::]:6821"
+
+          [[ansible_controllers]]
+          host = "$ctl0_ip"
+          ansible_host = "ctl-0"
+
+          [scheduler]
+          plugin = "backfill"
+          interval_secs = 1
+
+          [accounting]
+          database_url = "postgresql://spur:spur@$ctl0_ip:5432/spur"
+          fairshare_refresh_secs = 30
+
+          [network]
+          wg_enabled = false
+          agent_port = 6818
+
+          [[nodes]]
+          names = "gpu-1"
+          ansible_host = "gpu-1"
+
+          [[nodes]]
+          names = "gpu-2"
+          ansible_host = "gpu-2"
+
+          [[nodes]]
+          names = "gpu-3"
+          ansible_host = "gpu-3"
+
+          [[partitions]]
+          name = "default"
+          default = true
+          nodes = "gpu-1,gpu-2,gpu-3"
+          max_time = "INFINITE"
+          EOF
+          echo "== ci-spur.conf =="
+          cat "$GITHUB_WORKSPACE/ci-spur.conf"
 
       - name: deploy.yml (1 ctl + 3 agents)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -821,8 +964,8 @@ jobs:
           done
           echo "MPI plugin present on all agents"
 
-      # --- Agents get their own minimal spur.conf, at the same path as controllers ---
-      - name: Assert agents get a minimal spur.conf (not the controller's full file), and spurd loaded it
+      # --- Agents get spur.conf too, at the same path as controllers -------
+      - name: Assert spur.conf path is identical on controller and agents, and spurd loaded it
         run: |
           set -euo pipefail
           docker exec ctl-0 test -f /opt/spur/etc/spur.conf
@@ -832,70 +975,43 @@ jobs:
           done
           echo "PASS: spur.conf present at the same path (/opt/spur/etc/spur.conf) on ctl-0 and every agent"
 
-          # The agent's copy must be the minimal per-agent template, not the
-          # controller's fleet-wide one — it should carry no accounting/node/
-          # partition content, which only the controller needs.
-          for a in gpu-1 gpu-2 gpu-3; do
-            docker exec "$a" grep -q '^database_url' /opt/spur/etc/spur.conf \
-              && { echo "FAIL: $a's spur.conf has database_url — should only be on the controller"; exit 1; }
-            docker exec "$a" grep -q '^\[\[nodes\]\]' /opt/spur/etc/spur.conf \
-              && { echo "FAIL: $a's spur.conf has a [[nodes]] block — should only be on the controller"; exit 1; }
-          done
-          echo "PASS: agents' spur.conf is minimal (no controller/accounting/nodes/partitions content)"
+          # database_url must match verbatim between controller and an agent —
+          # both push the same master file, filtered the same way.
+          ctl_url=$(docker exec ctl-0 grep '^database_url' /opt/spur/etc/spur.conf)
+          agent_url=$(docker exec gpu-1 grep '^database_url' /opt/spur/etc/spur.conf)
+          [ "$ctl_url" = "$agent_url" ] \
+            && echo "PASS: accounting database_url matches between ctl-0 and gpu-1" \
+            || { echo "FAIL: database_url differs — ctl-0=[$ctl_url] gpu-1=[$agent_url]"; exit 1; }
 
           docker exec gpu-1 journalctl -u spurd --no-pager | grep -q "loaded spur.conf" \
             && echo "PASS: spurd log confirms it loaded spur.conf" \
             || { echo "FAIL: spurd never logged loading spur.conf"; docker exec gpu-1 journalctl -u spurd --no-pager | tail -20; exit 1; }
 
-      # --- Agent template's k8s-enabled branch: render-only, no real k0s install ---
-      - name: Assert the agent template's [cluster]/k8s block renders correctly when enabled
-        working-directory: ansible
-        run: |
-          set -euo pipefail
-          cat > ./.ci-render-agent-k8s-conf.yml <<'EOF'
-          - hosts: localhost
-            gather_facts: no
-            vars:
-              spur_cluster_name: ci-cluster
-              spur_k8s_enabled: true
-              spur_k8s_control_plane_nodes: "k8s-cp-0,k8s-cp-1,k8s-cp-2"
-              spur_k8s_pod_cidr: "10.244.0.0/16"
-              spur_k8s_service_cidr: "10.96.0.0/12"
-              spur_k8s_cni: kuberouter
-              spur_k8s_cni_mtu: 1450
-              spur_k8s_version: v1.36.2+k0s.0
-            tasks:
-              - ansible.builtin.template:
-                  src: roles/spur_agent/templates/spur.conf.j2
-                  dest: /tmp/rendered-agent-k8s.conf
-          EOF
-          ansible-playbook ./.ci-render-agent-k8s-conf.yml
-          rm -f ./.ci-render-agent-k8s-conf.yml
-          conf=$(cat /tmp/rendered-agent-k8s.conf)
-          echo "$conf" | grep -q '^\[cluster\]' || { echo "FAIL: no [cluster] section rendered"; echo "$conf"; exit 1; }
-          echo "$conf" | grep -q 'pod_cidr = "10.244.0.0/16"' || { echo "FAIL: pod_cidr missing/wrong"; echo "$conf"; exit 1; }
-          echo "$conf" | grep -q 'service_cidr = "10.96.0.0/12"' || { echo "FAIL: service_cidr missing/wrong"; echo "$conf"; exit 1; }
-          echo "$conf" | grep -q 'control_plane_node = "k8s-cp-0"' || { echo "FAIL: control_plane_node missing/wrong"; echo "$conf"; exit 1; }
-          echo "$conf" | grep -q 'control_plane_replicas = 3' || { echo "FAIL: control_plane_replicas missing/wrong"; echo "$conf"; exit 1; }
-          echo "$conf" | grep -q 'k0s_version = "v1.36.2+k0s.0"' || { echo "FAIL: k0s_version missing/wrong"; echo "$conf"; exit 1; }
-          echo "PASS: agent template renders [cluster]/k8s block correctly when spur_k8s_enabled=true"
-
-      # --- spur.conf preservation test (controller AND agent) ---------------
-      - name: Stamp a sentinel line into spur.conf on ctl-0 and gpu-1 to detect overwrites
+      # --- exclude_sections test (controller AND agent) ----------------------
+      # [accounting] is listed in the fixture's [ansible].exclude_sections
+      # (see the fixture step above) — the old spur_overwrite_conf flag is
+      # gone entirely; this declarative per-section opt-out is what replaces
+      # it. Hand-edit the excluded section, bump a NON-excluded field in the
+      # master fixture, then confirm: the hand-edit survives untouched while
+      # the non-excluded change propagates — on every playbook, no flags.
+      - name: Hand-edit the excluded [accounting] section on ctl-0 and gpu-1
         run: |
           for h in ctl-0 gpu-1; do
-            docker exec "$h" bash -c 'echo "# CI-SENTINEL" >> /opt/spur/etc/spur.conf'
-            docker exec "$h" grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
+            docker exec "$h" sed -i 's/^fairshare_refresh_secs = .*/fairshare_refresh_secs = 999  # CI-SENTINEL/' /opt/spur/etc/spur.conf
+            docker exec "$h" grep -q 'CI-SENTINEL' /opt/spur/etc/spur.conf \
               || { echo "sentinel not written on $h"; exit 1; }
           done
-          echo "sentinel written to spur.conf on ctl-0 and gpu-1"
+          echo "hand-edit stamped into the excluded [accounting] section on ctl-0 and gpu-1"
 
-      - name: rolling_upgrade.yml (default — spur.conf must be preserved)
+      - name: Bump a non-excluded field in the master fixture (scheduler.interval_secs)
+        run: sed -i 's/^interval_secs = 1$/interval_secs = 2/' "$GITHUB_WORKSPACE/ci-spur.conf"
+
+      - name: rolling_upgrade.yml (must resync scheduler, leave accounting alone)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/rolling_upgrade.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -905,87 +1021,42 @@ jobs:
             -e spur_verify_enabled=true \
             -e spur_verify_submit_user=ciuser
 
-      - name: Assert spur.conf was NOT overwritten on ctl-0 or gpu-1 (sentinel must still be present)
+      - name: Assert accounting hand-edit survived AND scheduler change propagated
         run: |
           for h in ctl-0 gpu-1; do
-            docker exec "$h" grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
-              && echo "PASS: spur.conf preserved on $h (sentinel intact)" \
-              || { echo "FAIL: spur.conf was overwritten on $h — sentinel gone"; exit 1; }
+            docker exec "$h" grep -q 'CI-SENTINEL' /opt/spur/etc/spur.conf \
+              && echo "PASS: excluded [accounting] section preserved on $h" \
+              || { echo "FAIL: excluded [accounting] section was overwritten on $h"; exit 1; }
+            docker exec "$h" grep -qx 'interval_secs = 2' /opt/spur/etc/spur.conf \
+              && echo "PASS: non-excluded scheduler.interval_secs synced on $h" \
+              || { echo "FAIL: scheduler.interval_secs did not sync on $h"; exit 1; }
           done
 
-      - name: rolling_upgrade.yml --overwrite-conf (spur.conf must be re-rendered)
+      # --- Same two guarantees hold for deploy.yml too, not just rolling_upgrade ---
+      - name: Bump scheduler.interval_secs again for the deploy.yml pass
+        run: sed -i 's/^interval_secs = 2$/interval_secs = 3/' "$GITHUB_WORKSPACE/ci-spur.conf"
+
+      - name: deploy.yml (must resync scheduler, leave accounting alone)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
-            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
-            -e spur_install_dir=/usr/local/bin \
-            -e spur_home=/opt/spur \
-            -e spur_ignore_unreachable_agents=true \
-            -e spur_skip_busy_agents=true \
-            -e spur_drain_wait_secs=10 \
-            -e spur_overwrite_conf=true \
-            -e spur_verify_enabled=true \
-            -e spur_verify_submit_user=ciuser
-
-      - name: Assert spur.conf WAS overwritten on ctl-0 and gpu-1 (sentinel must be gone)
-        run: |
-          for h in ctl-0 gpu-1; do
-            docker exec "$h" grep -q "CI-SENTINEL" /opt/spur/etc/spur.conf \
-              && { echo "FAIL: spur.conf was not overwritten on $h — sentinel still present"; exit 1; } \
-              || echo "PASS: spur.conf re-rendered on $h (sentinel gone)"
-          done
-
-      # --- deploy.yml must preserve spur.conf too, same as rolling_upgrade.yml ---
-      - name: Re-stamp a sentinel line into spur.conf on ctl-0 and gpu-1 for the deploy.yml test
-        run: |
-          for h in ctl-0 gpu-1; do
-            docker exec "$h" bash -c 'echo "# CI-SENTINEL-DEPLOY" >> /opt/spur/etc/spur.conf'
-            docker exec "$h" grep -q "CI-SENTINEL-DEPLOY" /opt/spur/etc/spur.conf \
-              || { echo "sentinel not written on $h"; exit 1; }
-          done
-          echo "sentinel written to spur.conf on ctl-0 and gpu-1"
-
-      - name: deploy.yml (default — spur.conf must be preserved on controller and agent)
-        working-directory: ansible
-        env:
-          ANSIBLE_HOST_KEY_CHECKING: "False"
-        run: |
-          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
             -e spur_drain_wait_secs=10 \
             -e spur_verify_enabled=false
 
-      - name: Assert deploy.yml did NOT overwrite spur.conf on ctl-0 or gpu-1 (sentinel must still be present)
+      - name: Assert accounting hand-edit still survived AND scheduler change propagated again
         run: |
           for h in ctl-0 gpu-1; do
-            docker exec "$h" grep -q "CI-SENTINEL-DEPLOY" /opt/spur/etc/spur.conf \
-              && echo "PASS: spur.conf preserved on $h (sentinel intact)" \
-              || { echo "FAIL: deploy.yml overwrote spur.conf on $h — sentinel gone"; exit 1; }
-          done
-
-      - name: deploy.yml --overwrite-conf (spur.conf must be re-rendered on controller and agent)
-        working-directory: ansible
-        env:
-          ANSIBLE_HOST_KEY_CHECKING: "False"
-        run: |
-          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
-            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
-            -e spur_install_dir=/usr/local/bin \
-            -e spur_home=/opt/spur \
-            -e spur_drain_wait_secs=10 \
-            -e spur_overwrite_conf=true \
-            -e spur_verify_enabled=false
-
-      - name: Assert deploy.yml --overwrite-conf re-rendered spur.conf on ctl-0 and gpu-1 (sentinel must be gone)
-        run: |
-          for h in ctl-0 gpu-1; do
-            docker exec "$h" grep -q "CI-SENTINEL-DEPLOY" /opt/spur/etc/spur.conf \
-              && { echo "FAIL: deploy.yml -e spur_overwrite_conf=true did not overwrite spur.conf on $h"; exit 1; } \
-              || echo "PASS: spur.conf re-rendered on $h (sentinel gone)"
+            docker exec "$h" grep -q 'CI-SENTINEL' /opt/spur/etc/spur.conf \
+              && echo "PASS: excluded [accounting] section still preserved on $h" \
+              || { echo "FAIL: excluded [accounting] section was overwritten on $h"; exit 1; }
+            docker exec "$h" grep -qx 'interval_secs = 3' /opt/spur/etc/spur.conf \
+              && echo "PASS: non-excluded scheduler.interval_secs synced on $h" \
+              || { echo "FAIL: scheduler.interval_secs did not sync on $h"; exit 1; }
           done
 
       # --- add_nodes.yml must preserve spur.conf too, same default as above ---
@@ -1139,15 +1210,77 @@ jobs:
       - name: Install ansible + docker connection plugin
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install ansible-core
+          python3 -m pip install ansible-core tomlkit
           ansible-galaxy collection install community.docker
+
+      # spur.conf IS the inventory now (spur_conf plugin) — [controller].hosts
+      # needs the container's REAL docker-network IP (it's what spurctld
+      # advertises/listens on and what lands in the accounting database_url),
+      # while Ansible's own connection target needs the CONTAINER NAME (docker
+      # connection execs by name, not IP). [[ansible_controllers]] carries that
+      # split; [[nodes]] entries just use the container name directly since
+      # they have no separate "advertised address" concept to diverge from.
+      - name: Generate the CI spur.conf fixture
+        run: |
+          set -euo pipefail
+          ctl0_ip=$(docker inspect -f '{{.NetworkSettings.Networks.spur-ci.IPAddress}}' ctl-0)
+          cat > "$GITHUB_WORKSPACE/ci-spur.conf" <<EOF
+          cluster_name = "ci-cluster"
+
+          [ansible]
+          default_user = "root"
+          default_connection = "docker"
+          exclude_sections = []
+
+          [controller]
+          listen_addr = "[::]:6817"
+          hosts = ["$ctl0_ip"]
+          state_dir = "/opt/spur/state"
+          raft_listen_addr = "[::]:6821"
+
+          [[ansible_controllers]]
+          host = "$ctl0_ip"
+          ansible_host = "ctl-0"
+
+          [scheduler]
+          plugin = "backfill"
+          interval_secs = 1
+
+          [accounting]
+          database_url = "postgresql://spur:spur@$ctl0_ip:5432/spur"
+          fairshare_refresh_secs = 30
+
+          [network]
+          wg_enabled = false
+          agent_port = 6818
+
+          [[nodes]]
+          names = "gpu-1"
+          ansible_host = "gpu-1"
+
+          [[nodes]]
+          names = "gpu-2"
+          ansible_host = "gpu-2"
+
+          [[nodes]]
+          names = "gpu-3"
+          ansible_host = "gpu-3"
+
+          [[partitions]]
+          name = "default"
+          default = true
+          nodes = "gpu-1,gpu-2,gpu-3"
+          max_time = "INFINITE"
+          EOF
+          echo "== ci-spur.conf =="
+          cat "$GITHUB_WORKSPACE/ci-spur.conf"
 
       - name: deploy.yml (1 ctl + 3 agents)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -1190,7 +1323,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          if ansible-playbook -i inventory/ci.ini playbooks/remove_nodes.yml \
+          if ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/remove_nodes.yml \
               -e spur_install_dir=/usr/local/bin \
               -e nodes_to_remove=gpu-1 \
               -e spur_drain_wait_secs=10; then
@@ -1218,7 +1351,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/remove_nodes.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/remove_nodes.yml \
             -e spur_install_dir=/usr/local/bin \
             -e nodes_to_remove=gpu-1 \
             -e spur_drain_wait_secs=10 \
@@ -1245,7 +1378,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/remove_nodes.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/remove_nodes.yml \
             -e spur_install_dir=/usr/local/bin \
             -e nodes_to_remove=gpu-1 \
             -e spur_drain_wait_secs=10 \
@@ -1292,7 +1425,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/teardown.yml \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
             --limit gpu-2
@@ -1329,7 +1462,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/teardown.yml \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
             -e spur_drain_wait_secs=10 \
@@ -1351,7 +1484,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/teardown.yml \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
             -e spur_drain_wait_secs=10 \
@@ -1374,7 +1507,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/teardown.yml \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur
 
@@ -1535,15 +1668,89 @@ jobs:
       - name: Install ansible + docker connection plugin + wireguard deps (ansible.utils/netaddr)
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install ansible-core netaddr
+          python3 -m pip install ansible-core netaddr tomlkit
           ansible-galaxy collection install community.docker ansible.utils
+
+      # Unlike the direct-transport jobs, [controller].hosts here are the
+      # WG MESH addresses (pinned, exactly like ci-ha-mesh.ini's positional
+      # spur_wg_address pins), known upfront — no docker-inspect IP discovery
+      # needed. Each ctl-N doubles as an agent (co-location: matching [[nodes]]
+      # names = "ctl-N" — see inventory_plugins/spur_conf.py), same physical
+      # container filling both roles in the mesh, just like a real HA
+      # cluster where a controller is also a compute node.
+      - name: Generate the CI spur.conf fixture
+        run: |
+          set -euo pipefail
+          cat > "$GITHUB_WORKSPACE/ci-ha-spur.conf" <<'EOF'
+          cluster_name = "ci-ha-cluster"
+
+          [ansible]
+          default_user = "root"
+          default_connection = "docker"
+          exclude_sections = []
+
+          [controller]
+          listen_addr = "[::]:6817"
+          hosts = ["10.44.0.1", "10.44.0.2", "10.44.0.3"]
+          state_dir = "/opt/spur/state"
+          raft_listen_addr = "[::]:6821"
+
+          [scheduler]
+          plugin = "backfill"
+          interval_secs = 1
+
+          [network]
+          wg_enabled = true
+          wg_interface = "spur0"
+          wg_cidr = "10.44.0.0/16"
+          wg_port = 51820
+          agent_port = 6818
+
+          [[nodes]]
+          names = "ctl-0"
+          ansible_host = "ctl-0"
+          ansible_wg_address = "10.44.0.1"
+
+          [[nodes]]
+          names = "ctl-1"
+          ansible_host = "ctl-1"
+          ansible_wg_address = "10.44.0.2"
+
+          [[nodes]]
+          names = "ctl-2"
+          ansible_host = "ctl-2"
+          ansible_wg_address = "10.44.0.3"
+
+          [[nodes]]
+          names = "worker-0"
+          ansible_host = "worker-0"
+          ansible_wg_address = "10.44.0.4"
+
+          [[nodes]]
+          names = "worker-1"
+          ansible_host = "worker-1"
+          ansible_wg_address = "10.44.0.5"
+
+          [[ansible_login_nodes]]
+          name = "login-0"
+          ansible_host = "login-0"
+          ansible_wg_address = "10.44.0.6"
+
+          [[partitions]]
+          name = "default"
+          default = true
+          nodes = "ctl-0,ctl-1,ctl-2,worker-0,worker-1"
+          max_time = "INFINITE"
+          EOF
+          echo "== ci-ha-spur.conf =="
+          cat "$GITHUB_WORKSPACE/ci-ha-spur.conf"
 
       - name: deploy.yml — 3-controller HA over WireGuard (no accounting/k0s)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/deploy.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-ha-spur.conf" playbooks/deploy.yml \
             -e @inventory/ci-ha-mesh.vars.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
@@ -1669,7 +1876,7 @@ jobs:
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/remove_nodes.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-ha-spur.conf" playbooks/remove_nodes.yml \
             -e @inventory/ci-ha-mesh.vars.yml \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -1695,12 +1902,33 @@ jobs:
             && { echo "::error::worker-1 still registered in the cluster after removal"; exit 1; } \
             || echo "PASS: worker-1 removed from the cluster"
 
+      - name: Re-add worker-1's entry to the spur.conf fixture (add_nodes.yml's precondition)
+        # remove_nodes.yml just pruned worker-1 out of the master file itself
+        # (its write-back mechanic) — add_nodes.yml requires the node to
+        # already have a [[nodes]] entry before it will target it, same as a
+        # real operator hand-adding it back.
+        env:
+          CI_CONF: ${{ github.workspace }}/ci-ha-spur.conf
+        run: |
+          python3 - <<'PYEOF'
+          import os, tomlkit
+          path = os.environ["CI_CONF"]
+          doc = tomlkit.parse(open(path).read())
+          doc["nodes"].append({"names": "worker-1", "ansible_host": "worker-1", "ansible_wg_address": "10.44.0.5"})
+          part = doc["partitions"][0]
+          members = [m for m in part["nodes"].split(",") if m]
+          if "worker-1" not in members:
+              members.append("worker-1")
+          part["nodes"] = ",".join(members)
+          open(path, "w").write(tomlkit.dumps(doc))
+          PYEOF
+
       - name: add_nodes.yml worker-1 (re-add; regenerated key refreshed on all surviving members)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/add_nodes.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-ha-spur.conf" playbooks/add_nodes.yml \
             -e @inventory/ci-ha-mesh.vars.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
@@ -1744,7 +1972,7 @@ jobs:
           for n in $NODES; do
             docker exec "$n" wg show spur0 public-key | tr -d '[:space:]' > "/tmp/key-$n-pre.txt"
           done
-          ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/deploy.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-ha-spur.conf" playbooks/deploy.yml \
             -e @inventory/ci-ha-mesh.vars.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
@@ -1786,6 +2014,7 @@ jobs:
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
+          CI_CONF: ${{ github.workspace }}/ci-ha-spur.conf
         run: |
           set -uo pipefail
           # Stop an unrelated existing agent, remove the node we re-add, then re-add
@@ -1800,12 +2029,24 @@ jobs:
             return 0
           }
           docker stop worker-0
-          run_tolerating_unreachable ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/remove_nodes.yml \
+          run_tolerating_unreachable ansible-playbook -i "$GITHUB_WORKSPACE/ci-ha-spur.conf" playbooks/remove_nodes.yml \
             -e @inventory/ci-ha-mesh.vars.yml \
             -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
             -e nodes_to_remove=worker-1 -e spur_drain_wait_secs=10 \
             -e spur_ignore_unreachable_agents=true || exit 1
-          run_tolerating_unreachable ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/add_nodes.yml \
+          python3 - <<'PYEOF'
+          import os, tomlkit
+          path = os.environ["CI_CONF"]
+          doc = tomlkit.parse(open(path).read())
+          doc["nodes"].append({"names": "worker-1", "ansible_host": "worker-1", "ansible_wg_address": "10.44.0.5"})
+          part = doc["partitions"][0]
+          members = [m for m in part["nodes"].split(",") if m]
+          if "worker-1" not in members:
+              members.append("worker-1")
+          part["nodes"] = ",".join(members)
+          open(path, "w").write(tomlkit.dumps(doc))
+          PYEOF
+          run_tolerating_unreachable ansible-playbook -i "$GITHUB_WORKSPACE/ci-ha-spur.conf" playbooks/add_nodes.yml \
             -e @inventory/ci-ha-mesh.vars.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
@@ -1829,7 +2070,7 @@ jobs:
             docker exec worker-0 systemctl is-system-running >/dev/null 2>&1 && break
             sleep 2
           done
-          ansible-playbook -i inventory/ci-ha-mesh.ini playbooks/teardown.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-ha-spur.conf" playbooks/teardown.yml \
             -e @inventory/ci-ha-mesh.vars.yml \
             -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur
           # wg-quick@ must be disabled on every member, else the mesh silently
@@ -1937,22 +2178,66 @@ jobs:
       - name: Install ansible + docker connection plugin
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install ansible-core
+          python3 -m pip install ansible-core tomlkit
           ansible-galaxy collection install community.docker
+
+      # See the resilience/conf/day2 jobs' identical fixture step for why
+      # [controller].hosts needs the real docker-network IP while Ansible's
+      # own connection target ([[ansible_controllers]].ansible_host) needs the
+      # container name. Password contains "@" and "#" on purpose — exercises
+      # the redaction regex against more than the plain default (see the
+      # password-leak assertion below).
+      - name: Generate the CI spur.conf fixture
+        run: |
+          set -euo pipefail
+          ctl0_ip=$(docker inspect -f '{{.NetworkSettings.Networks.spur-ci-ts.IPAddress}}' ctl-0)
+          cat > "$GITHUB_WORKSPACE/ci-ts-spur.conf" <<EOF
+          cluster_name = "ci-ts-cluster"
+
+          [ansible]
+          default_user = "root"
+          default_connection = "docker"
+          exclude_sections = []
+
+          [controller]
+          listen_addr = "[::]:6817"
+          hosts = ["$ctl0_ip"]
+          state_dir = "/opt/spur/state"
+          raft_listen_addr = "[::]:6821"
+
+          [[ansible_controllers]]
+          host = "$ctl0_ip"
+          ansible_host = "ctl-0"
+
+          [scheduler]
+          plugin = "backfill"
+          interval_secs = 1
+
+          [accounting]
+          database_url = "postgresql://spur:p@ss#word@$ctl0_ip:5432/spur"
+          fairshare_refresh_secs = 30
+
+          [network]
+          wg_enabled = false
+          agent_port = 6818
+
+          [[nodes]]
+          names = "gpu-1"
+          ansible_host = "gpu-1"
+
+          [[partitions]]
+          name = "default"
+          default = true
+          nodes = "gpu-1"
+          max_time = "INFINITE"
+          EOF
 
       - name: deploy.yml (1 ctl + 1 agent, accounting on)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          # group_vars/ only auto-loads next to the inventory file or the playbook
-          # dir; ci-techsupport.ini lives in .github/workflows/ (kept out of
-          # inventory/ on purpose), so load the same defaults explicitly.
-          # Password contains "@" and "#" on purpose — exercises the redaction
-          # regex against more than the plain default (see the password-leak
-          # assertion below).
-          ansible-playbook -i ../.github/workflows/ci-techsupport.ini playbooks/deploy.yml \
-            -e @inventory/group_vars/all.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-ts-spur.conf" playbooks/deploy.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \

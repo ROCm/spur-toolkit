@@ -5,9 +5,9 @@
 # The ansible.utils ipaddr/ipmath filters also require the Python `netaddr`
 # library on the control node:  python3 -m pip install netaddr
 #
-# EXPERIMENTAL (spur_conf inventory plugin + spur_conf_for_push filters, see
-# inventory_plugins/spur_conf.py) also requires `tomlkit` on the control node
-# only, never on remote hosts:  python3 -m pip install tomlkit
+# The spur_conf inventory plugin + spur_conf_for_push filters (spur.conf IS
+# the inventory — see inventory_plugins/spur_conf.py) require `tomlkit` on the
+# control node only, never on remote hosts:  python3 -m pip install tomlkit
 collections:
   # Provides ansible.utils.ipaddr / ipmath used by the spur_wireguard role.
   - name: ansible.utils

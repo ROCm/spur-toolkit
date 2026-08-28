@@ -1,19 +1,23 @@
 ---
 # Spur deployment — works for single-node, multi-node-direct, multi-node-wireguard.
 #
+# spur.conf IS the inventory (see inventory_plugins/spur_conf.py) — there's no
+# separate hosts.ini. First time on a cluster with no spur.conf yet? Run
+# playbooks/bootstrap_conf.yml once to generate a starter file, then use it here.
+#
 # Run:
 #   cd ansible
-#   ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini
+#   ansible-playbook playbooks/deploy.yml -i spur.conf
 #
 # Subset to specific hosts:
-#   ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini --limit gpu-1
+#   ansible-playbook playbooks/deploy.yml -i spur.conf --limit gpu-1
 #
 # Tear down (keeps installed binaries):
-#   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini
+#   ansible-playbook playbooks/teardown.yml -i spur.conf
 #
 # Submit a real test job at the end to verify scheduling works (default false
 # — off for routine deploys, on in CI):
-#   ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_verify_enabled=true
+#   ansible-playbook playbooks/deploy.yml -i spur.conf -e spur_verify_enabled=true
 #
 # Re-running against an already-running cluster restarts spurd on every agent —
 # full convergence is the whole point of deploy.yml, so this is disruptive by
@@ -22,11 +26,14 @@
 # restart proceeds anyway, by default. Pass -e spur_skip_busy_agents=true to
 # opt OUT of that and leave busy nodes untouched instead, continuing with the
 # rest of the fleet:
-#   ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true
+#   ansible-playbook playbooks/deploy.yml -i spur.conf -e spur_skip_busy_agents=true
 #
-# Controllers and agents both get spur.conf (spurd reads it best-effort for
-# [cluster]/k0s and [devices]/GRES settings). A missing spur.conf is always
-# written; an existing one is left alone unless you pass -e spur_overwrite_conf=true.
+# Controllers and agents both get spur.conf, pushed verbatim from the master
+# file (minus its ansible-only [ansible]/ansible_* metadata) — every run keeps
+# every node's copy in sync with whatever's in spur.conf right now. To keep a
+# section fully hands-off (never pushed by ansible, e.g. a per-node accounting
+# override), list it in the master file's [ansible].exclude_sections — that
+# replaces the old -e spur_overwrite_conf flag entirely.
 
 - name: Preflight + install Spur on all hosts
   # Accounting is embedded in spurctld now — a dedicated (non-controller/non-agent)
@@ -79,8 +86,8 @@
   # across ALL matching hosts (role N finishes on every host before role N+1
   # starts), so per-role `when:` gating on this union of hosts preserves the
   # original ordering (accounting up before controllers connect to it; login
-  # reads each controller's spur_controller_listen_ip, set via delegate_facts
-  # inside the controller role, which has already run by then).
+  # reads each controller's ansible_host, known upfront from spur.conf's
+  # [controller].hosts — no ordering dependency on the controller role at all).
   hosts: >-
     {{ (groups['spur_controllers'] + groups.get('spur_login', []) +
         [spur_accounting_host | default(groups['spur_accounting_node'][0]

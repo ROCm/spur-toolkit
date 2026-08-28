@@ -1,15 +1,22 @@
+{#
+  Day-0 bootstrap template ONLY — invoked once by playbooks/bootstrap_conf.yml
+  to hand a first-time operator a starter spur.conf. Every other playbook
+  reads/pushes an existing spur.conf via the spur_conf inventory plugin +
+  spur_conf_for_push filter instead of rendering this on every run.
+#}
 cluster_name = "{{ spur_cluster_name }}"
+
+[ansible]
+default_user = "{{ spur_bootstrap_ansible_user }}"
+exclude_sections = []
 
 [controller]
 listen_addr = "[::]:{{ spur_controller_port }}"
-hosts = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['spur_controller_listen_ip'] }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+hosts = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['ansible_host'] | default(hostvars[h]['ansible_default_ipv4']['address']) }}"{% if not loop.last %}, {% endif %}{% endfor %}]
 state_dir = "{{ spur_home }}/state"
 raft_listen_addr = "[::]:{{ spur_raft_port }}"
 {% if spur_ha_enabled %}
-{% if inventory_hostname in groups['spur_controllers'] %}
-node_id = {{ spur_controller_node_id }}
-{% endif %}
-peers = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['spur_controller_listen_ip'] }}:{{ spur_raft_port }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+peers = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['ansible_host'] | default(hostvars[h]['ansible_default_ipv4']['address']) }}:{{ spur_raft_port }}"{% if not loop.last %}, {% endif %}{% endfor %}]
 {% endif %}
 
 [scheduler]
@@ -18,12 +25,9 @@ interval_secs = 1
 
 {% if spur_accounting_enabled | default(true) | bool %}
 [accounting]
-# Accounting runs in-process inside spurctld (served on the same port as the
-# controller API) and reaches Postgres over the network — the accounting IP
-# is the Postgres host, which may or may not be this controller. Read via
-# hostvars off a controller (not a bare var) so this template also renders
-# correctly on agents, which never compute this fact themselves.
-database_url = "postgresql://{{ spur_accounting_db_user | default('spur') }}:{{ spur_accounting_db_password | default('spur') }}@{{ hostvars[groups['spur_controllers'][0]].spur_accounting_listen_ip }}:{{ spur_accounting_db_port | default(5432) }}/{{ spur_accounting_db_name | default('spur') }}"
+# Fill in the real Postgres host/creds before using this file for real —
+# bootstrap defaults to the first controller, co-located.
+database_url = "postgresql://{{ spur_accounting_db_user | default('spur') }}:{{ spur_accounting_db_password | default('spur') }}@{{ hostvars[groups['spur_controllers'][0]]['ansible_host'] | default(hostvars[groups['spur_controllers'][0]]['ansible_default_ipv4']['address']) }}:{{ spur_accounting_db_port | default(5432) }}/{{ spur_accounting_db_name | default('spur') }}"
 fairshare_refresh_secs = 30
 {% endif %}
 
@@ -55,13 +59,18 @@ k0s_version = "{{ spur_k8s_version }}"
 
 {% for h in groups['spur_agents'] %}
 [[nodes]]
-names = "{{ hostvars[h]['spur_node_name'] }}"
+names = "{{ hostvars[h]['spur_node_name'] | default(h) }}"
 cpus = {{ hostvars[h]['ansible_processor_vcpus'] | default(0) }}
 memory_mb = {{ ((hostvars[h]['ansible_memtotal_mb'] | default(0)) * 0.9) | int }}
+ansible_host = "{{ hostvars[h]['ansible_host'] | default(h) }}"
 
+{% endfor %}
+{% set _node_names = [] %}
+{% for h in groups['spur_agents'] %}
+{% set _ = _node_names.append(hostvars[h]['spur_node_name'] | default(h)) %}
 {% endfor %}
 [[partitions]]
 name = "default"
 default = true
-nodes = "{{ groups['spur_agents'] | map('extract', hostvars, 'spur_node_name') | join(',') }}"
+nodes = "{{ _node_names | join(',') }}"
 max_time = "INFINITE"
