@@ -18,15 +18,17 @@ def spur_conf_exclude_sections(master_text):
     return list(doc.get("ansible", {}).get("exclude_sections", []))
 
 
-def spur_conf_for_push(master_text, exclude_sections=None, node_fact_fallbacks=None,
-                        controller_ha_fallback=None):
+def spur_conf_for_push(master_text, node_fact_fallbacks=None, controller_ha_fallback=None):
     """Return the spur.conf content that should be pushed to a node: the
     master file with all ansible-only content stripped ([ansible] table,
     [[ansible_controllers]], [[ansible_login_nodes]], and any ansible_* keys
-    on [[nodes]]/[[ansible_controllers]] entries), and any section named in
-    exclude_sections removed entirely (the caller splices back whatever
-    already exists on the node for those, this filter only computes what
-    ansible itself would contribute).
+    on [[nodes]]/[[ansible_controllers]] entries).
+
+    Every section — including ones later excluded by spur_conf_splice_excluded
+    — is kept here. exclude_sections is handled entirely in that second step
+    by deciding whether to keep this (master's) version or the node's current
+    one; dropping the section here would mean a section that's never existed
+    on the node yet (first-ever push) never gets created at all.
 
     node_fact_fallbacks: optional {node_name: {"cpus": int, "memory_mb": int}}
     used to fill a [[nodes]] entry's cpus/memory_mb ONLY when the master file
@@ -41,7 +43,6 @@ def spur_conf_for_push(master_text, exclude_sections=None, node_fact_fallbacks=N
     if tomlkit is None:
         raise AnsibleFilterError("spur_conf_for_push requires the 'tomlkit' Python package")
 
-    exclude_sections = set(exclude_sections or [])
     node_fact_fallbacks = node_fact_fallbacks or {}
     doc = tomlkit.parse(master_text)
 
@@ -68,17 +69,16 @@ def spur_conf_for_push(master_text, exclude_sections=None, node_fact_fallbacks=N
         if "node_id" not in ctrl and controller_ha_fallback.get("node_id") is not None:
             ctrl["node_id"] = int(controller_ha_fallback["node_id"])
 
-    for section in exclude_sections:
-        doc.pop(section, None)
-
     return tomlkit.dumps(doc)
 
 
 def spur_conf_splice_excluded(desired_text, existing_text, exclude_sections=None):
-    """Given the freshly-computed desired push content and whatever's already
-    on the node (may be empty on first push), copy each excluded section's
-    CURRENT on-node content into the desired output verbatim, so excluded
-    sections survive untouched across repeated pushes.
+    """Decide, per excluded section, whether to keep the freshly-computed
+    desired content (master's version — used when the node has no prior copy
+    of that section, i.e. write-if-missing) or the node's CURRENT on-disk
+    version (used whenever that section already exists there, preserving any
+    hand edit indefinitely). Non-excluded sections always take the desired
+    (master) version — this is the only place exclude_sections is enforced.
     """
     if tomlkit is None:
         raise AnsibleFilterError("spur_conf_splice_excluded requires the 'tomlkit' Python package")

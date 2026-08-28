@@ -58,7 +58,7 @@
       node_id: "{{ groups['spur_controllers'].index(inventory_hostname) + 1 }}"
   ansible.builtin.set_fact:
     desired_conf: >-
-      {{ master_conf_text | spur_conf_for_push(exclude_sections, node_fact_fallbacks, controller_ha_fallback) }}
+      {{ master_conf_text | spur_conf_for_push(node_fact_fallbacks, controller_ha_fallback) }}
     spur_conf_exclude_sections_list: "{{ exclude_sections }}"
 
 - name: Slurp the live spur.conf on this controller, if any

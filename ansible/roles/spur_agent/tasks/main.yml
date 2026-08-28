@@ -118,11 +118,27 @@
 # computed via delegate_facts. A `--limit <agent-only>` run works too.
 - name: Read the master spur.conf and compute what to push to this agent
   vars:
+    spur_controller_addr_attr: "{{ 'spur_wg_address' if spur_transport == 'wireguard' else 'ansible_host' }}"
     master_conf_text: "{{ lookup('file', inventory_file) }}"
     exclude_sections: "{{ lookup('file', inventory_file) | spur_conf_exclude_sections }}"
     node_fact_fallbacks: "{{ groups['spur_agents'] | spur_conf_node_facts(hostvars) }}"
+    # A co-located controller+agent host (see inventory_plugins/spur_conf.py's
+    # co-location rule) gets its spur.conf written twice — once by
+    # spur_controller, again here by spur_agent, since both roles run on it.
+    # Without this, the agent role's push (which has no reason to know about
+    # HA) would clobber the controller role's carefully-filled peers/node_id
+    # with nothing, since the master file itself leaves them absent by
+    # design. Only compute/pass it when this host actually is a controller.
+    controller_ha_fallback: >-
+      {{ ({
+           'peers': (groups['spur_controllers']
+                     | map('extract', hostvars, spur_controller_addr_attr)
+                     | map('regex_replace', '$', ':' ~ spur_raft_port)
+                     | list),
+           'node_id': (groups['spur_controllers'].index(inventory_hostname) + 1),
+         }) if inventory_hostname in groups['spur_controllers'] else None }}
   ansible.builtin.set_fact:
-    desired_conf: "{{ master_conf_text | spur_conf_for_push(exclude_sections, node_fact_fallbacks) }}"
+    desired_conf: "{{ master_conf_text | spur_conf_for_push(node_fact_fallbacks, controller_ha_fallback) }}"
     spur_conf_exclude_sections_list: "{{ exclude_sections }}"
 
 - name: Slurp the live spur.conf on this agent, if any

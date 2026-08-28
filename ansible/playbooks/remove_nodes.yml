@@ -287,16 +287,22 @@
 # the only ordering that works. Runs on the control node, not a managed host.
 - name: Write the removed node(s) out of the master spur.conf
   hosts: "{{ groups['spur_controllers'][0] }}"
-  connection: local
   become: false
   gather_facts: no
   vars:
     rn_actual_remove_list: "{{ hostvars[groups['spur_controllers'][0]].rn_actual_remove_list | default([]) }}"
   tasks:
+    # delegate_to: localhost, not a play-level `connection: local` — a host's
+    # own ansible_connection (e.g. docker, set via spur.conf's [ansible]
+    # table) takes precedence over a play-level connection keyword, so
+    # `connection: local` alone would silently run this INSIDE the target
+    # container instead of on the control node.
     - name: Prune removed node(s) from the master file and write it back
       ansible.builtin.copy:
         content: "{{ lookup('file', inventory_file) | spur_conf_remove_node(rn_actual_remove_list) }}"
         dest: "{{ inventory_file }}"
+      delegate_to: localhost
+      become: false
       when: rn_actual_remove_list | length > 0
 
 # Surviving controllers' pushed spur.conf must drop the removed node too —
