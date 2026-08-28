@@ -131,10 +131,9 @@ spur_ha_enabled: "{{ (groups.get('spur_controllers', []) | length) > 1 }}"
 # Auto: true if a host is in BOTH controller and agent groups.
 spur_controller_runs_agent: "{{ inventory_hostname in groups.get('spur_agents', []) and inventory_hostname in groups.get('spur_controllers', []) }}"
 
-# Job-safety: drain/skip/force behavior shared by deploy.yml, rolling_upgrade.yml,
-# and remove_nodes.yml (see playbooks/tasks/drain_and_guard_agent.yml). teardown.yml
-# is disruptive with no drain by default (whole-cluster) — setting either busy-agent
-# flag below on teardown.yml opts back into draining first.
+# Job-safety: drain/skip/force variables. deploy.yml/rolling_upgrade.yml/teardown.yml
+# (opt-in only) share the drain task at playbooks/tasks/drain_and_guard_agent.yml;
+# remove_nodes.yml reads these same variables in its own separate inline logic.
 # Leave a still-busy node untouched instead of the playbook's own default
 # (refuse for rolling_upgrade/remove_nodes, force for deploy.yml).
 spur_skip_busy_agents: false
