@@ -262,7 +262,7 @@ jobs:
       - name: Generate the CI spur.conf fixture
         run: |
           set -euo pipefail
-          ctl0_ip=$(docker inspect -f '{{.NetworkSettings.Networks.spur-ci.IPAddress}}' ctl-0)
+          ctl0_ip=$(docker inspect -f '{{(index .NetworkSettings.Networks "spur-ci").IPAddress}}' ctl-0)
           cat > "$GITHUB_WORKSPACE/ci-spur.conf" <<EOF
           cluster_name = "ci-cluster"
 
@@ -878,7 +878,7 @@ jobs:
       - name: Generate the CI spur.conf fixture
         run: |
           set -euo pipefail
-          ctl0_ip=$(docker inspect -f '{{.NetworkSettings.Networks.spur-ci.IPAddress}}' ctl-0)
+          ctl0_ip=$(docker inspect -f '{{(index .NetworkSettings.Networks "spur-ci").IPAddress}}' ctl-0)
           cat > "$GITHUB_WORKSPACE/ci-spur.conf" <<EOF
           cluster_name = "ci-cluster"
 
@@ -1210,7 +1210,7 @@ jobs:
       - name: Generate the CI spur.conf fixture
         run: |
           set -euo pipefail
-          ctl0_ip=$(docker inspect -f '{{.NetworkSettings.Networks.spur-ci.IPAddress}}' ctl-0)
+          ctl0_ip=$(docker inspect -f '{{(index .NetworkSettings.Networks "spur-ci").IPAddress}}' ctl-0)
           cat > "$GITHUB_WORKSPACE/ci-spur.conf" <<EOF
           cluster_name = "ci-cluster"
 
@@ -2177,7 +2177,7 @@ jobs:
       - name: Generate the CI spur.conf fixture
         run: |
           set -euo pipefail
-          ctl0_ip=$(docker inspect -f '{{.NetworkSettings.Networks.spur-ci-ts.IPAddress}}' ctl-0)
+          ctl0_ip=$(docker inspect -f '{{(index .NetworkSettings.Networks "spur-ci-ts").IPAddress}}' ctl-0)
           cat > "$GITHUB_WORKSPACE/ci-ts-spur.conf" <<EOF
           cluster_name = "ci-ts-cluster"
 
