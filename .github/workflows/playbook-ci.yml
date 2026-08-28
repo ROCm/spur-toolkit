@@ -948,7 +948,48 @@ jobs:
               || echo "PASS: spur.conf re-rendered on $h (sentinel gone)"
           done
 
-      # TODO(next): add_nodes.yml / manage_accounts.yml / healthcheck.yml
+      # --- add_nodes.yml must preserve spur.conf too, same default as above ---
+      - name: Stamp a sentinel line into spur.conf on ctl-0 for the add_nodes.yml test
+        run: |
+          docker exec ctl-0 bash -c 'echo "# CI-SENTINEL-ADDNODES" >> /opt/spur/etc/spur.conf'
+          docker exec ctl-0 grep -q "CI-SENTINEL-ADDNODES" /opt/spur/etc/spur.conf \
+            || { echo "sentinel not written on ctl-0"; exit 1; }
+          echo "sentinel written to spur.conf on ctl-0"
+
+      - name: add_nodes.yml (default — spur.conf must be preserved)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/add_nodes.yml \
+            -e new_nodes=gpu-1 \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur
+
+      - name: Assert add_nodes.yml did NOT overwrite spur.conf on ctl-0 (sentinel must still be present)
+        run: |
+          docker exec ctl-0 grep -q "CI-SENTINEL-ADDNODES" /opt/spur/etc/spur.conf \
+            && echo "PASS: spur.conf preserved on ctl-0 (sentinel intact)" \
+            || { echo "FAIL: add_nodes.yml overwrote spur.conf on ctl-0 — sentinel gone"; exit 1; }
+
+      - name: add_nodes.yml --overwrite-conf (spur.conf must be re-rendered)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/add_nodes.yml \
+            -e new_nodes=gpu-1 \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_overwrite_conf=true
+
+      - name: Assert add_nodes.yml --overwrite-conf re-rendered spur.conf on ctl-0 (sentinel must be gone)
+        run: |
+          docker exec ctl-0 grep -q "CI-SENTINEL-ADDNODES" /opt/spur/etc/spur.conf \
+            && { echo "FAIL: add_nodes.yml -e spur_overwrite_conf=true did not overwrite spur.conf on ctl-0"; exit 1; } \
+            || echo "PASS: spur.conf re-rendered on ctl-0 (sentinel gone)"
+
+      # TODO(next): manage_accounts.yml / healthcheck.yml
 
       - name: Dump logs on failure
         if: failure()
