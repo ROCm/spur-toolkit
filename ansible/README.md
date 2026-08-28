@@ -391,9 +391,9 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 | `spur_verify_submit_user` | *(unset — submits as the play's own user)* | Submit the verify role's test job as this user instead. Needed if the cluster's `spurd` rejects uid-0 job submission (`[auth] allow_root_jobs=false`), which newer builds default to. |
 | `spur_gather_subset` | `['!all', network, hardware, distribution]` | Facts subset gathered by every `gather_facts: yes` play. Restricts Ansible's default full gather (every mount/PCI device/interface) to just what the roles use. Set `-e spur_gather_subset=all` to fall back to full gathering. |
 | `spur_overwrite_conf` | `false` | Overwrite an existing `spur.conf` (controller or agent) instead of leaving it alone. Same default across every playbook, including `add_nodes.yml` — a newly added node registers live either way, but only appears in the rendered `[[nodes]]` block on a run (this one or a later `deploy.yml`/`rolling_upgrade.yml`) that passes this flag. |
-| `spur_drain_wait_secs` | `120` | How long to wait for a node to reach `DRAINED`/`DOWN` before treating it as busy — used by `deploy.yml`, `teardown.yml`, `rolling_upgrade.yml`, and `remove_nodes.yml` via the shared drain guard. |
-| `spur_skip_busy_agents` | `false` | Leave a still-busy node untouched and continue with the rest of the fleet, instead of the playbook's default (refuse, or force for `deploy.yml`). Shared by `deploy.yml`, `teardown.yml`, `rolling_upgrade.yml`, `remove_nodes.yml`. |
-| `spur_force_teardown_busy_agents` | `false` | `teardown.yml`-specific: kill a busy node's running job and tear it down anyway. |
+| `spur_drain_wait_secs` | `120` | How long to wait for a node to reach `DRAINED`/`DOWN` before treating it as busy — used by `deploy.yml`, `rolling_upgrade.yml`, and (only if draining was requested) `teardown.yml` via the shared drain task, plus `remove_nodes.yml`'s own separate inline drain-wait logic. |
+| `spur_skip_busy_agents` | `false` | Leave a still-busy node untouched and continue with the rest of the fleet, instead of the playbook's default (refuse, or force for `deploy.yml`). Shared task in `deploy.yml`/`rolling_upgrade.yml`; `remove_nodes.yml` reads the same variable in its own inline logic. On `teardown.yml` (disruptive/no-drain by default), setting this is also what opts back into draining first. |
+| `spur_force_teardown_busy_agents` | `false` | `teardown.yml`-specific: opts into draining first (like `spur_skip_busy_agents` above), then kills a busy node's running job and tears it down anyway. |
 | `spur_force_upgrade_busy_agents` | `false` | `rolling_upgrade.yml`-specific: kill a busy node's running job and upgrade it anyway. |
 | `spur_force_remove_busy_nodes` | `false` | `remove_nodes.yml`-specific: kill a busy node's running job and remove it anyway. |
 
@@ -554,7 +554,7 @@ Use the names as they appear in `spur nodes`. Afterward, **delete those hosts fr
 
 On a **WireGuard** cluster it also tears down the removed node's mesh interface and drops its WG peer from **every surviving mesh member** — controllers, other agents, and login nodes — so it doesn't linger as a ghost peer (in a full mesh every node peered it). An unrelated agent being down doesn't block the removal when `-e spur_ignore_unreachable_agents=true` is set.
 
-A node with a job still running does not finish draining — same job-safety model as `deploy.yml`/`rolling_upgrade.yml`/`teardown.yml`. By default the run aborts before removing anything:
+A node with a job still running does not finish draining — same job-safety model as `deploy.yml`/`rolling_upgrade.yml`. By default the run aborts before removing anything:
 
 ```bash
 ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4 -e spur_skip_busy_agents=true         # remove only the nodes that drained cleanly, leave busy ones in the cluster
@@ -586,11 +586,13 @@ ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_ignore_un
 
 Either way it stops and disables the systemd services and reaps any stray daemons. On a **WireGuard** cluster it also brings the mesh interface down and disables its `wg-quick@<iface>` boot unit, so a plain (non-wipe) teardown doesn't silently re-establish the mesh on the next reboot; `-e wipe=true` additionally removes the saved `/etc/wireguard/<iface>.conf`. It deliberately leaves PostgreSQL installed and your accounting database intact — so if you want those gone too, drop them by hand on the accounting host.
 
-An agent with a job still running is drained first; if it doesn't finish draining, that host is left running rather than silently killing the job:
+Disruptive by default, with no drain step: teardown means the whole cluster is coming down, so there's no surviving fleet left to protect by draining agents first. To take a node out of a cluster that keeps running (draining it first so its job finishes), use `remove_nodes.yml` instead.
+
+An agent with a job still running is stopped immediately by default — including any Docker/Podman container the job launched, via the same cgroup sweep `rolling_upgrade.yml --force` uses; only the wait-for-drain step is skipped, not cleanup. Pass either busy-agent flag to opt back into draining it first — if it doesn't finish draining, that host is left running rather than silently killing the job:
 
 ```bash
-ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true            # leave busy agents running, tear down the rest
-ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_force_teardown_busy_agents=true  # kill the running job and tear it down anyway
+ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true            # drain first; leave busy agents running, tear down the rest
+ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_force_teardown_busy_agents=true   # drain first; kill the running job and tear it down anyway
 ```
 
 ```bash

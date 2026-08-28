@@ -1,11 +1,11 @@
 ---
-# Shared by rolling_upgrade.yml, deploy.yml, and teardown.yml: drains an agent,
-# waits for its running job (if any) to finish, and refuses to disrupt a still-
-# busy node unless the including play opted into skip or force. Sets
-# `spur_node_busy` for the caller's own role/task gating.
+# Shared by rolling_upgrade.yml, deploy.yml, and (opt-in only, via
+# spur_skip_busy_agents/spur_force_teardown_busy_agents) teardown.yml — drains
+# an agent and refuses to disrupt it while busy unless skip/force is set.
+# remove_nodes.yml has its own inline version of this logic, not this file.
 #
 # Include with these vars already set by the caller:
-#   dckj_action      short verb for messages, e.g. "restart" / "teardown" / "upgrade"
+#   dckj_action      short verb for messages, e.g. "restart" / "upgrade" / "teardown"
 #   dckj_skip_busy   bool — leave a busy node untouched, continue with the rest
 #   dckj_force_busy  bool — kill running jobs on a busy node and proceed (may be
 #                    the caller's unconditional default, not necessarily an
