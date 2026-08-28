@@ -1,5 +1,9 @@
-# Real inventories contain host IPs and credentials — never commit them.
-# Only the *.example.ini templates (placeholder addresses) are tracked.
+# Real spur.conf files contain host IPs and credentials — never commit them.
+# Only the inventory/examples/*.example templates (placeholder addresses) are
+# tracked. A real spur.conf is typically kept outside this repo entirely
+# (it's now the -i inventory source, not something that lives under
+# inventory/), but ignore it here too in case it's dropped in this tree.
+spur.conf
 inventory/*.ini
 !inventory/*.example.ini
 

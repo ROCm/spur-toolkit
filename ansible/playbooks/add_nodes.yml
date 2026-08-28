@@ -5,10 +5,8 @@
 # this only starts spurd on the NEW nodes — existing daemons and running jobs are
 # left untouched. It works because a spurd registers itself at runtime: a new
 # agent appears in `spur nodes` the moment its spurd registers, with no controller
-# restart or config re-render needed. spur.conf on the controllers is left alone
-# by default (same as deploy.yml/rolling_upgrade.yml) — pass
-# -e spur_overwrite_conf=true to also refresh it with the new node, still
-# without bouncing the running controller.
+# restart needed. spur.conf on the controllers is unconditionally refreshed with
+# the new node's entry, still without bouncing the running controller.
 #
 # The node(s) MUST already have a [[nodes]] entry (with ansible_host/ansible_user)
 # in the master spur.conf BEFORE running this — spur.conf IS the inventory (see

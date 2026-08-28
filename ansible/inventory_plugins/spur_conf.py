@@ -58,7 +58,11 @@ class InventoryModule(BaseInventoryPlugin):
             )
 
         with open(path, "r") as f:
-            doc = tomlkit.parse(f.read())
+            # .unwrap() converts tomlkit's String/Integer/Bool wrapper types
+            # (subclasses, not plain str/int/bool) to native Python types —
+            # newer ansible-core strictly type-checks inventory.set_variable()
+            # values and rejects the wrapper types outright.
+            doc = tomlkit.parse(f.read()).unwrap()
 
         ansible_meta = doc.get("ansible", {})
         default_user = ansible_meta.get("default_user")

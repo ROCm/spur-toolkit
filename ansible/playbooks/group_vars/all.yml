@@ -144,9 +144,6 @@ spur_force_teardown_busy_agents: false
 spur_force_upgrade_busy_agents: false
 spur_force_remove_busy_nodes: false
 
-# Re-render spur.conf from the Ansible template instead of preserving an
-# existing one (rolling_upgrade.yml controllers, and agents everywhere).
-spur_overwrite_conf: false
 
 # Agents upgraded per batch in rolling_upgrade.yml (serial). Controllers
 # always upgrade one at a time regardless.

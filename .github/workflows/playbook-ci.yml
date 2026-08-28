@@ -1059,46 +1059,33 @@ jobs:
               || { echo "FAIL: scheduler.interval_secs did not sync on $h"; exit 1; }
           done
 
-      # --- add_nodes.yml must preserve spur.conf too, same default as above ---
-      - name: Stamp a sentinel line into spur.conf on ctl-0 for the add_nodes.yml test
+      # --- add_nodes.yml pushes spur.conf unconditionally, without restarting spurctld ---
+      - name: Stamp a sentinel line into spur.conf on ctl-0, and note spurctld's current PID
         run: |
           docker exec ctl-0 bash -c 'echo "# CI-SENTINEL-ADDNODES" >> /opt/spur/etc/spur.conf'
           docker exec ctl-0 grep -q "CI-SENTINEL-ADDNODES" /opt/spur/etc/spur.conf \
             || { echo "sentinel not written on ctl-0"; exit 1; }
-          echo "sentinel written to spur.conf on ctl-0"
+          docker exec ctl-0 systemctl show -p MainPID spurctld | cut -d= -f2 > /tmp/ctl0-pid-before-addnodes
 
-      - name: add_nodes.yml (default — spur.conf must be preserved)
+      - name: add_nodes.yml (already-registered node — must refresh spur.conf, no restart)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-playbook -i inventory/ci.ini playbooks/add_nodes.yml \
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/add_nodes.yml \
             -e new_nodes=gpu-1 \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur
 
-      - name: Assert add_nodes.yml did NOT overwrite spur.conf on ctl-0 (sentinel must still be present)
+      - name: Assert add_nodes.yml refreshed spur.conf on ctl-0 (sentinel gone) without restarting spurctld
         run: |
           docker exec ctl-0 grep -q "CI-SENTINEL-ADDNODES" /opt/spur/etc/spur.conf \
-            && echo "PASS: spur.conf preserved on ctl-0 (sentinel intact)" \
-            || { echo "FAIL: add_nodes.yml overwrote spur.conf on ctl-0 — sentinel gone"; exit 1; }
-
-      - name: add_nodes.yml --overwrite-conf (spur.conf must be re-rendered)
-        working-directory: ansible
-        env:
-          ANSIBLE_HOST_KEY_CHECKING: "False"
-        run: |
-          ansible-playbook -i inventory/ci.ini playbooks/add_nodes.yml \
-            -e new_nodes=gpu-1 \
-            -e spur_install_dir=/usr/local/bin \
-            -e spur_home=/opt/spur \
-            -e spur_overwrite_conf=true
-
-      - name: Assert add_nodes.yml --overwrite-conf re-rendered spur.conf on ctl-0 (sentinel must be gone)
-        run: |
-          docker exec ctl-0 grep -q "CI-SENTINEL-ADDNODES" /opt/spur/etc/spur.conf \
-            && { echo "FAIL: add_nodes.yml -e spur_overwrite_conf=true did not overwrite spur.conf on ctl-0"; exit 1; } \
-            || echo "PASS: spur.conf re-rendered on ctl-0 (sentinel gone)"
+            && { echo "FAIL: add_nodes.yml did not refresh spur.conf on ctl-0 — sentinel still present"; exit 1; } \
+            || echo "PASS: spur.conf refreshed on ctl-0 (sentinel gone)"
+          docker exec ctl-0 systemctl show -p MainPID spurctld | cut -d= -f2 > /tmp/ctl0-pid-after-addnodes
+          diff /tmp/ctl0-pid-before-addnodes /tmp/ctl0-pid-after-addnodes \
+            && echo "PASS: spurctld was not restarted by add_nodes.yml" \
+            || { echo "FAIL: spurctld's PID changed — add_nodes.yml restarted the controller"; exit 1; }
 
       # TODO(next): manage_accounts.yml / healthcheck.yml
 
@@ -1123,9 +1110,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     env:
-      # ci.ini hardcodes [spur_agents] = gpu-1/gpu-2/gpu-3, so all three must
-      # exist as containers: gpu-1 (remove_nodes.yml), gpu-2 (teardown.yml
-      # default disruptive path), gpu-3 (teardown.yml opt-in drain path).
+      # The fixture's [[nodes]] = gpu-1/gpu-2/gpu-3, so all three must exist
+      # as containers: gpu-1 (remove_nodes.yml), gpu-2 (teardown.yml default
+      # disruptive path), gpu-3 (teardown.yml opt-in drain path).
       NODES: "ctl-0 gpu-1 gpu-2 gpu-3"
     steps:
       - uses: actions/checkout@v4
@@ -1672,9 +1659,9 @@ jobs:
           ansible-galaxy collection install community.docker ansible.utils
 
       # Unlike the direct-transport jobs, [controller].hosts here are the
-      # WG MESH addresses (pinned, exactly like ci-ha-mesh.ini's positional
-      # spur_wg_address pins), known upfront — no docker-inspect IP discovery
-      # needed. Each ctl-N doubles as an agent (co-location: matching [[nodes]]
+      # WG MESH addresses (pinned ansible_wg_address values), known upfront —
+      # no docker-inspect IP discovery needed. Each ctl-N doubles as an agent
+      # (co-location: matching [[nodes]]
       # names = "ctl-N" — see inventory_plugins/spur_conf.py), same physical
       # container filling both roles in the mesh, just like a real HA
       # cluster where a controller is also a compute node.
