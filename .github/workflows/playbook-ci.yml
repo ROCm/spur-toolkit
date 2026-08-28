@@ -1312,6 +1312,7 @@ jobs:
         run: |
           if ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/remove_nodes.yml \
               -e spur_install_dir=/usr/local/bin \
+              -e spur_home=/opt/spur \
               -e nodes_to_remove=gpu-1 \
               -e spur_drain_wait_secs=10; then
             echo "FAIL: remove_nodes.yml should have refused on a busy node"; exit 1
@@ -1340,6 +1341,7 @@ jobs:
         run: |
           ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/remove_nodes.yml \
             -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
             -e nodes_to_remove=gpu-1 \
             -e spur_drain_wait_secs=10 \
             -e spur_skip_busy_agents=true
@@ -1367,6 +1369,7 @@ jobs:
         run: |
           ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/remove_nodes.yml \
             -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
             -e nodes_to_remove=gpu-1 \
             -e spur_drain_wait_secs=10 \
             -e spur_force_remove_busy_nodes=true
