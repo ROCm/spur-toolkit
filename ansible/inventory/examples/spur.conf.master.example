@@ -1,0 +1,47 @@
+# Example master spur.conf, used directly as the Ansible inventory source:
+#   ansible-playbook -i spur.conf.master.example playbooks/experimental_conf_push.yml \
+#     -e spur_conf_file=spur.conf.master.example
+#
+# Everything below [ansible] is the real spur.conf schema (see
+# ansible/roles/spur_controller/templates/spur.conf.j2). The [ansible] table and
+# any ansible_* keys on [[nodes]] entries are ansible-only metadata, stripped
+# before this file is pushed to any node.
+
+cluster_name = "experiment-cluster"
+
+[ansible]
+default_user = "vm"
+# Sections listed here are never pushed by ansible; whatever's already on the
+# node for these sections is left exactly as-is.
+exclude_sections = ["accounting"]
+
+[controller]
+listen_addr = "[::]:6817"
+hosts = ["10.11.98.147"]
+state_dir = "/home/vm/spur-conf-experiment/state"
+raft_listen_addr = "[::]:6821"
+
+[scheduler]
+plugin = "backfill"
+interval_secs = 1
+
+[accounting]
+database_url = "postgresql://spur:spur@10.11.98.147:5432/spur"
+fairshare_refresh_secs = 30
+
+[network]
+wg_enabled = false
+agent_port = 6818
+
+[[nodes]]
+names = "gpu-1"
+cpus = 8
+memory_mb = 16000
+ansible_host = "10.11.71.210"
+ansible_user = "vm"
+
+[[partitions]]
+name = "default"
+default = true
+nodes = "gpu-1"
+max_time = "INFINITE"

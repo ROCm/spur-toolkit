@@ -1,0 +1,62 @@
+---
+# EXPERIMENTAL — proof of concept for SPUR-236 Approach D (spur.conf as inventory).
+# Not wired into deploy.yml/spur_controller/spur_agent. Writes to an isolated
+# path only (spur_conf_push_dir), never spur_home or a production install.
+#
+# Run:
+#   ansible-playbook -i /path/to/spur.conf playbooks/experimental_conf_push.yml \
+#     -e spur_conf_file=/path/to/spur.conf \
+#     -e spur_conf_push_dir=/home/vm/spur-conf-experiment
+
+- name: Push spur.conf (minus ansible-only metadata) to every node it describes
+  hosts: spur_controllers:spur_agents
+  become: false
+  gather_facts: no
+  vars:
+    spur_conf_push_dir: "/home/vm/spur-conf-experiment"
+  tasks:
+    - name: Require spur_conf_file
+      ansible.builtin.assert:
+        that:
+          - spur_conf_file is defined
+        fail_msg: "Pass -e spur_conf_file=/path/to/the/same/spur.conf used for -i"
+        quiet: true
+
+    - name: Read the master spur.conf
+      ansible.builtin.set_fact:
+        master_conf_text: "{{ lookup('file', spur_conf_file) }}"
+        exclude_sections: "{{ lookup('file', spur_conf_file) | spur_conf_exclude_sections }}"
+
+    - name: Compute what ansible wants to push (master minus ansible-only metadata + excluded sections)
+      ansible.builtin.set_fact:
+        desired_conf: "{{ master_conf_text | spur_conf_for_push(exclude_sections) }}"
+
+    - name: Ensure the isolated test directory exists
+      ansible.builtin.file:
+        path: "{{ spur_conf_push_dir }}/etc"
+        state: directory
+        mode: "0755"
+
+    - name: Slurp any existing pushed spur.conf on this node
+      ansible.builtin.slurp:
+        path: "{{ spur_conf_push_dir }}/etc/spur.conf"
+      register: existing_conf_b64
+      failed_when: false
+
+    - name: Splice back excluded sections from the node's current file, if any
+      ansible.builtin.set_fact:
+        final_conf: >-
+          {{ desired_conf | spur_conf_splice_excluded(
+               (existing_conf_b64.content | b64decode) if (existing_conf_b64.content is defined) else '',
+               exclude_sections) }}
+
+    - name: Write the final spur.conf to the isolated test path
+      ansible.builtin.copy:
+        content: "{{ final_conf }}"
+        dest: "{{ spur_conf_push_dir }}/etc/spur.conf"
+        mode: "0644"
+      register: push_result
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: spur.conf pushed to {{ spur_conf_push_dir }}/etc/spur.conf (changed={{ push_result.changed }})"
