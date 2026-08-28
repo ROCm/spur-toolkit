@@ -5,8 +5,10 @@
 # this only starts spurd on the NEW nodes — existing daemons and running jobs are
 # left untouched. It works because a spurd registers itself at runtime: a new
 # agent appears in `spur nodes` the moment its spurd registers, with no controller
-# restart. spur.conf on the controllers is refreshed (so the config file stays
-# accurate for any future restart) but the running controller is NOT bounced.
+# restart or config re-render needed. spur.conf on the controllers is left alone
+# by default (same as deploy.yml/rolling_upgrade.yml) — pass
+# -e spur_overwrite_conf=true to also refresh it with the new node, still
+# without bouncing the running controller.
 #
 # The node(s) MUST already be in the [spur_agents] inventory group (single source
 # of truth, same as deploy.yml). This playbook just brings the named new ones
@@ -15,6 +17,9 @@
 #
 # Run:
 #   ansible-playbook playbooks/add_nodes.yml -i inventory/hosts.ini -e new_nodes=gpu-3,gpu-4
+#
+# Also refresh spur.conf on the controllers with the new node (still no restart):
+#   ansible-playbook playbooks/add_nodes.yml -i inventory/hosts.ini -e new_nodes=gpu-3,gpu-4 -e spur_overwrite_conf=true
 
 # --- Guard rails (on the first controller) ---
 - name: Validate request
@@ -139,6 +144,12 @@
       when: an_registered.rc != 0
 
 # --- Refresh spur.conf on the controllers WITHOUT restarting them ---
+# Same preserve-by-default behavior as deploy.yml/rolling_upgrade.yml: an
+# existing spur.conf is left alone unless -e spur_overwrite_conf=true is
+# passed to THIS run (deploy.yml/rolling_upgrade.yml need the same flag on
+# their own runs too — none of them refresh it for free). The new node is
+# already live-registered regardless, since spurd self-registers at runtime
+# independent of the config file.
 - name: Refresh controller config (no restart)
   hosts: spur_controllers
   become: true
@@ -148,9 +159,6 @@
     - role: spur_controller
       vars:
         spur_controller_skip_restart: true
-        # A newly added node must appear in spur.conf's [[nodes]] block
-        # regardless of spur_overwrite_conf, unlike deploy.yml's default.
-        spur_controller_force_conf: true
 
 # --- Verify the new nodes registered ---
 - name: Verify new nodes are registered

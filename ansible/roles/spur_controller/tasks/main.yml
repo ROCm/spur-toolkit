@@ -144,14 +144,12 @@
 
 # Same write-if-missing opt-in as the spur_agent role's spur.conf render —
 # force: no leaves an existing file alone unless spur_overwrite_conf=true.
-# add_nodes.yml overrides via spur_controller_force_conf=true so a newly
-# added node always appears in the rendered [[nodes]] block.
 - name: Write spur.conf
   ansible.builtin.template:
     src: spur.conf.j2
     dest: "{{ spur_home }}/etc/spur.conf"
     mode: "0644"
-    force: "{{ spur_controller_force_conf | default(spur_overwrite_conf | default(false) | bool) | bool }}"
+    force: "{{ spur_overwrite_conf | default(false) | bool }}"
   register: spur_conf
   when: not (spur_controller_skip_conf | default(false) | bool)
 
@@ -222,12 +220,10 @@
     mode: "0755"
   when: spur_wipe_state | bool
 
-# spur_controller_skip_restart: set by add_nodes.yml so spur.conf is regenerated
-# (to include a newly added agent) WITHOUT bouncing the running controller — a new
-# spurd registers itself at runtime, so no controller restart is needed to see it.
-# deploy.yml / rolling_upgrade.yml leave this false and restart as usual. When the
-# controller isn't restarted, ensure it's at least enabled + running (first-ever
-# run still needs it started; an already-running one is left untouched).
+# spur_controller_skip_restart (set by add_nodes.yml): a new spurd self-registers
+# at runtime, so no restart is needed to see it. When not restarted, still ensure
+# spurctld is enabled + running (first-ever run needs it started; already-running
+# is left untouched).
 - name: Enable and (re)start spurctld
   ansible.builtin.systemd:
     name: spurctld
