@@ -71,24 +71,28 @@
     - spur_mpi_plugin_enabled | default(true) | bool
     - spur_mpi_plugin_src | default('') | length > 0
 
-- name: Stat MPI plugin left by install.sh on agent
-  ansible.builtin.stat:
-    path: "{{ spur_install_dir | regex_replace('/[^/]+$', '') }}/lib/spur/spur_mpi_pmix.so"
-  register: spur_mpi_install_sh_stat
+# Stat-then-copy merged into one shell (agent-local, no delegate_to) to cut a
+# round-trip — copy has no "only if source exists" guard of its own.
+- name: Install MPI plugin from install.sh layout to {{ spur_mpi_plugin_dir }} (if present)
+  ansible.builtin.shell: |
+    set -e
+    src="{{ spur_install_dir | regex_replace('/[^/]+$', '') }}/lib/spur/spur_mpi_pmix.so"
+    dest="{{ spur_mpi_plugin_dir }}/spur_mpi_pmix.so"
+    if [ ! -f "$src" ]; then
+      echo "RESULT=NOT_FOUND"
+    elif cmp -s "$src" "$dest" 2>/dev/null; then
+      echo "RESULT=UNCHANGED"
+    else
+      install -m 0755 "$src" "$dest"
+      echo "RESULT=INSTALLED"
+    fi
+  args:
+    executable: /bin/bash
+  register: spur_mpi_install_sh_copy
+  changed_when: "'RESULT=INSTALLED' in spur_mpi_install_sh_copy.stdout"
   when:
     - spur_mpi_plugin_enabled | default(true) | bool
     - spur_binary_src | default('') | length == 0
-
-- name: Install MPI plugin from install.sh layout to {{ spur_mpi_plugin_dir }}
-  ansible.builtin.copy:
-    src: "{{ spur_install_dir | regex_replace('/[^/]+$', '') }}/lib/spur/spur_mpi_pmix.so"
-    dest: "{{ spur_mpi_plugin_dir }}/spur_mpi_pmix.so"
-    remote_src: true
-    mode: "0755"
-  when:
-    - spur_mpi_plugin_enabled | default(true) | bool
-    - spur_binary_src | default('') | length == 0
-    - spur_mpi_install_sh_stat.stat.exists | default(false)
 
 - name: Note MPI plugin not found (PMIx jobs will fail until installed)
   ansible.builtin.debug:
@@ -102,43 +106,26 @@
       (spur_binary_src | default('') | length > 0)
       or (
         spur_binary_src | default('') | length == 0
-        and not (
-          spur_mpi_install_sh_stat.stat is defined
-          and spur_mpi_install_sh_stat.stat.exists | default(false)
-        )
+        and 'RESULT=NOT_FOUND' in (spur_mpi_install_sh_copy.stdout | default(''))
       )
 
-# spurd loads spur.conf best-effort at startup (missing file is fine) for the
-# [cluster] (SPUR-managed k0s) and [devices] (GPU/GRES) sections — everything
-# else in the file (controller/accounting/nodes/partitions) it simply ignores,
-# same shared format spurctld uses. Rendering is only possible once the
-# spur_controller role has resolved every controller's listen IP (set via
-# delegate_facts) — deploy.yml/rolling_upgrade.yml already run that role
-# before this one, but add_nodes.yml refreshes controller config in a LATER
-# play, so this is a no-op there until the next deploy/rolling_upgrade run.
-# Same reason a `--limit <agent-only>` run (deploy.yml's own --limit example)
-# is a no-op here too: the controller play that sets this fact never runs.
-- name: Determine whether controller config is resolved yet in this run
-  ansible.builtin.set_fact:
-    spur_agent_conf_can_render: >-
-      {{ (groups['spur_controllers']
-          | map('extract', hostvars)
-          | selectattr('spur_controller_listen_ip', 'defined')
-          | list | length == (groups['spur_controllers'] | length))
-         and ((not (spur_accounting_enabled | default(true) | bool))
-              or (hostvars[groups['spur_controllers'][0]].spur_accounting_listen_ip is defined)) }}
-
+# spurd loads spur.conf best-effort at startup (missing file is fine) — of
+# what it reads (cluster identity, [cluster]/k0s, [devices]/GRES), this
+# role's own template only renders cluster identity + [cluster], not the
+# controller's full fleet-wide file. Rendering N agents' worth of the
+# [[nodes]]/[[partitions]] loop, once per agent, doesn't scale (O(N^2) across
+# a large fleet) and the content would be dead weight on an agent anyway.
+#
 # Respect an existing file unless the operator asks to re-render it — same
 # opt-in as rolling_upgrade.yml's spur_overwrite_conf for the controller.
 # force: no is template's own write-if-missing primitive, so this needs no
 # separate stat call (and no unreachable-result guard to hand-write for one).
 - name: Write spur.conf on the agent
   ansible.builtin.template:
-    src: "{{ role_path }}/../spur_controller/templates/spur.conf.j2"
+    src: spur.conf.j2
     dest: "{{ spur_home }}/etc/spur.conf"
     mode: "0644"
     force: "{{ spur_overwrite_conf | default(false) | bool }}"
-  when: spur_agent_conf_can_render
 
 - name: Install spurd systemd unit
   # WorkingDirectory in the unit is {{ spur_home }} so job stdout (spur-<N>.out)
@@ -149,24 +136,25 @@
     mode: "0644"
   register: spurd_unit
 
-- name: Enable and (re)start spurd
-  ansible.builtin.systemd:
-    name: spurd
-    daemon_reload: true
-    enabled: true
-    state: restarted
-
-- name: Wait for spurd to listen on {{ spur_agent_port }}
-  # Retry across the add-node bootstrap window: the reconcile can briefly prune the new peer until
-  # spurd registers, and spurd (Restart=on-failure) keeps retrying — so poll, don't fail on one miss.
-  ansible.builtin.wait_for:
-    port: "{{ spur_agent_port }}"
-    host: "127.0.0.1"
-    timeout: 30
-  register: spurd_listen
-  retries: 5
-  delay: 10
-  until: spurd_listen is succeeded
+# Restart + wait-for-listen merged into one shell (agent-local) to cut a
+# round-trip. Poll across the add-node bootstrap window: the reconcile can
+# briefly prune the new peer until spurd registers, and spurd
+# (Restart=on-failure) keeps retrying — so poll, don't fail on one miss.
+- name: Enable and (re)start spurd, then wait for it to listen on {{ spur_agent_port }}
+  ansible.builtin.shell: |
+    set -e
+    systemctl daemon-reload
+    systemctl enable spurd
+    systemctl restart spurd
+    for i in $(seq 1 200); do
+      (exec 3<>/dev/tcp/127.0.0.1/{{ spur_agent_port }}) 2>/dev/null && exit 0
+      sleep 1
+    done
+    echo "spurd never started listening on 127.0.0.1:{{ spur_agent_port }}"
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: true
 
 # Pre-install k0s at deploy time so `spur k8s up` doesn't wait on the ~262 MB runtime download
 # (which can trip the provisioning timeout). Local, idempotent; only on k0s-scoped nodes.
