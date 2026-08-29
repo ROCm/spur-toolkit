@@ -428,7 +428,7 @@ An already-registered agent with a job still running is drained first; if it's s
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true   # leave busy agents untouched, deploy the rest
 ```
 
-Agents get `spur.conf` too (the same file controllers get — `spurd` reads it best-effort for `[cluster]`/k0s and `[devices]`/GRES settings). On both controllers and agents, a missing `spur.conf` is always written; an existing one is left alone unless you pass `-e spur_overwrite_conf=true`.
+Agents get their own `spur.conf` too — a minimal one with just the `[cluster]`/k0s and `[devices]`/GRES sections `spurd` actually reads, not the controller's full file. On both controllers and agents, a missing `spur.conf` is always written; an existing one is left alone unless you pass `-e spur_overwrite_conf=true`.
 
 ```bash
 cargo build --release -p spur-cli -p spurctld -p spurd   # rebuild all three together, see caveat below
@@ -609,7 +609,7 @@ A field guide to things you might see while running or operating a cluster — m
 | Symptom | What's going on |
 |---|---|
 | `spurctld` logs an `ERROR` on restart — `Can not initialize last_log_id=... vote=...:committed` | Harmless — normal on any restart with existing Raft state. Judge health from `spur nodes` / jobs / `sacct`, not this line. |
-| `spurd` logs `failed to load spur.conf` on startup | `spurd` loads `spur.conf` best-effort for the `[cluster]` (SPUR-managed k0s) and `[devices]` (GPU/GRES) sections; everything else it needs (controller, node name, ports) comes from CLI flags. This role writes `spur.conf` on agents too (same file controllers get), so this should only appear on a brand-new agent whose config hasn't rendered yet (e.g. mid-`add_nodes.yml`, before the next full `deploy.yml`/`rolling_upgrade.yml`) — harmless there, self-resolves on the next run. |
+| `spurd` logs `failed to load spur.conf` on startup | `spurd` loads `spur.conf` best-effort for the `[cluster]` (SPUR-managed k0s) and `[devices]` (GPU/GRES) sections; everything else it needs (controller, node name, ports) comes from CLI flags. This role writes agents their own minimal `spur.conf` with just those sections (not the controller's full file), so this should only appear if that write itself failed — check disk space/permissions on `{{ spur_home }}/etc`. |
 | `invalid transition from Completed to Completed` after a multi-node job | Harmless — a follower's redundant terminal-state report, rejected by the leader. The job succeeded. |
 | `spur nodes` shows fewer rows than I have hosts | It collapses by partition — the NODES column is a count, not one row per host. Use `spur show node <name>` to check a specific host. |
 | Playbook fails during the accounting apt install with a dpkg-lock error | Another `apt`/unattended-upgrade is running. Wait for it to finish (don't force-clear the lock unless `apt-get` is genuinely hung). |

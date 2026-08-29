@@ -821,8 +821,8 @@ jobs:
           done
           echo "MPI plugin present on all agents"
 
-      # --- Agents get spur.conf too, at the same path as controllers -------
-      - name: Assert spur.conf path is identical on controller and agents, and spurd loaded it
+      # --- Agents get their own minimal spur.conf, at the same path as controllers ---
+      - name: Assert agents get a minimal spur.conf (not the controller's full file), and spurd loaded it
         run: |
           set -euo pipefail
           docker exec ctl-0 test -f /opt/spur/etc/spur.conf
@@ -832,13 +832,16 @@ jobs:
           done
           echo "PASS: spur.conf present at the same path (/opt/spur/etc/spur.conf) on ctl-0 and every agent"
 
-          # database_url must match verbatim between controller and an agent —
-          # both render the same template from the same accounting-IP fact.
-          ctl_url=$(docker exec ctl-0 grep '^database_url' /opt/spur/etc/spur.conf)
-          agent_url=$(docker exec gpu-1 grep '^database_url' /opt/spur/etc/spur.conf)
-          [ "$ctl_url" = "$agent_url" ] \
-            && echo "PASS: accounting database_url matches between ctl-0 and gpu-1" \
-            || { echo "FAIL: database_url differs — ctl-0=[$ctl_url] gpu-1=[$agent_url]"; exit 1; }
+          # The agent's copy must be the minimal per-agent template, not the
+          # controller's fleet-wide one — it should carry no accounting/node/
+          # partition content, which only the controller needs.
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" grep -q '^database_url' /opt/spur/etc/spur.conf \
+              && { echo "FAIL: $a's spur.conf has database_url — should only be on the controller"; exit 1; }
+            docker exec "$a" grep -q '^\[\[nodes\]\]' /opt/spur/etc/spur.conf \
+              && { echo "FAIL: $a's spur.conf has a [[nodes]] block — should only be on the controller"; exit 1; }
+          done
+          echo "PASS: agents' spur.conf is minimal (no controller/accounting/nodes/partitions content)"
 
           docker exec gpu-1 journalctl -u spurd --no-pager | grep -q "loaded spur.conf" \
             && echo "PASS: spurd log confirms it loaded spur.conf" \
