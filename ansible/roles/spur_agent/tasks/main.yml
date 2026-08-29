@@ -106,7 +106,7 @@
       (spur_binary_src | default('') | length > 0)
       or (
         spur_binary_src | default('') | length == 0
-        and 'RESULT=INSTALLED' not in (spur_mpi_install_sh_copy.stdout | default(''))
+        and 'RESULT=NOT_FOUND' in (spur_mpi_install_sh_copy.stdout | default(''))
       )
 
 # spurd loads spur.conf best-effort at startup (missing file is fine) — of
@@ -115,7 +115,6 @@
 # controller's full fleet-wide file. Rendering N agents' worth of the
 # [[nodes]]/[[partitions]] loop, once per agent, doesn't scale (O(N^2) across
 # a large fleet) and the content would be dead weight on an agent anyway.
-# content would be dead weight anyway.
 #
 # Respect an existing file unless the operator asks to re-render it — same
 # opt-in as rolling_upgrade.yml's spur_overwrite_conf for the controller.

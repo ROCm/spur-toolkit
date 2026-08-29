@@ -57,7 +57,7 @@
       esac
       sleep 1
     done
-    echo "RESULT=BUSY (last state: $st)"
+    echo "RESULT=BUSY (last state: ${st:-unknown/unreachable})"
     exit 0
   args:
     executable: /bin/bash
