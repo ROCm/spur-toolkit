@@ -77,11 +77,14 @@
   ansible.builtin.shell: |
     set -e
     src="{{ spur_install_dir | regex_replace('/[^/]+$', '') }}/lib/spur/spur_mpi_pmix.so"
-    if [ -f "$src" ]; then
-      install -m 0755 "$src" "{{ spur_mpi_plugin_dir }}/spur_mpi_pmix.so"
-      echo "RESULT=INSTALLED"
-    else
+    dest="{{ spur_mpi_plugin_dir }}/spur_mpi_pmix.so"
+    if [ ! -f "$src" ]; then
       echo "RESULT=NOT_FOUND"
+    elif cmp -s "$src" "$dest" 2>/dev/null; then
+      echo "RESULT=UNCHANGED"
+    else
+      install -m 0755 "$src" "$dest"
+      echo "RESULT=INSTALLED"
     fi
   args:
     executable: /bin/bash
@@ -106,12 +109,12 @@
         and 'RESULT=INSTALLED' not in (spur_mpi_install_sh_copy.stdout | default(''))
       )
 
-# spurd loads spur.conf best-effort at startup (missing file is fine) for the
-# [cluster] (SPUR-managed k0s) and [devices] (GPU/GRES) sections only —
-# everything else (controller/accounting/nodes/partitions) it ignores. This
-# role's own template renders only those sections, not the controller's full
-# fleet-wide one — rendering N agents' worth of the [[nodes]]/[[partitions]]
-# loop, once per agent, doesn't scale (O(N^2) across a large fleet) and the
+# spurd loads spur.conf best-effort at startup (missing file is fine) — of
+# what it reads (cluster identity, [cluster]/k0s, [devices]/GRES), this
+# role's own template only renders cluster identity + [cluster], not the
+# controller's full fleet-wide file. Rendering N agents' worth of the
+# [[nodes]]/[[partitions]] loop, once per agent, doesn't scale (O(N^2) across
+# a large fleet) and the content would be dead weight on an agent anyway.
 # content would be dead weight anyway.
 #
 # Respect an existing file unless the operator asks to re-render it — same

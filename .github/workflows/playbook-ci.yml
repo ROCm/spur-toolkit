@@ -847,6 +847,39 @@ jobs:
             && echo "PASS: spurd log confirms it loaded spur.conf" \
             || { echo "FAIL: spurd never logged loading spur.conf"; docker exec gpu-1 journalctl -u spurd --no-pager | tail -20; exit 1; }
 
+      # --- Agent template's k8s-enabled branch: render-only, no real k0s install ---
+      - name: Assert the agent template's [cluster]/k8s block renders correctly when enabled
+        working-directory: ansible
+        run: |
+          set -euo pipefail
+          cat > ./.ci-render-agent-k8s-conf.yml <<'EOF'
+          - hosts: localhost
+            gather_facts: no
+            vars:
+              spur_cluster_name: ci-cluster
+              spur_k8s_enabled: true
+              spur_k8s_control_plane_nodes: "k8s-cp-0,k8s-cp-1,k8s-cp-2"
+              spur_k8s_pod_cidr: "10.244.0.0/16"
+              spur_k8s_service_cidr: "10.96.0.0/12"
+              spur_k8s_cni: kuberouter
+              spur_k8s_cni_mtu: 1450
+              spur_k8s_version: v1.36.2+k0s.0
+            tasks:
+              - ansible.builtin.template:
+                  src: roles/spur_agent/templates/spur.conf.j2
+                  dest: /tmp/rendered-agent-k8s.conf
+          EOF
+          ansible-playbook ./.ci-render-agent-k8s-conf.yml
+          rm -f ./.ci-render-agent-k8s-conf.yml
+          conf=$(cat /tmp/rendered-agent-k8s.conf)
+          echo "$conf" | grep -q '^\[cluster\]' || { echo "FAIL: no [cluster] section rendered"; echo "$conf"; exit 1; }
+          echo "$conf" | grep -q 'pod_cidr = "10.244.0.0/16"' || { echo "FAIL: pod_cidr missing/wrong"; echo "$conf"; exit 1; }
+          echo "$conf" | grep -q 'service_cidr = "10.96.0.0/12"' || { echo "FAIL: service_cidr missing/wrong"; echo "$conf"; exit 1; }
+          echo "$conf" | grep -q 'control_plane_node = "k8s-cp-0"' || { echo "FAIL: control_plane_node missing/wrong"; echo "$conf"; exit 1; }
+          echo "$conf" | grep -q 'control_plane_replicas = 3' || { echo "FAIL: control_plane_replicas missing/wrong"; echo "$conf"; exit 1; }
+          echo "$conf" | grep -q 'k0s_version = "v1.36.2+k0s.0"' || { echo "FAIL: k0s_version missing/wrong"; echo "$conf"; exit 1; }
+          echo "PASS: agent template renders [cluster]/k8s block correctly when spur_k8s_enabled=true"
+
       # --- spur.conf preservation test (controller AND agent) ---------------
       - name: Stamp a sentinel line into spur.conf on ctl-0 and gpu-1 to detect overwrites
         run: |
