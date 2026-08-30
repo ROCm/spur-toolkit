@@ -116,30 +116,54 @@
 # no dependency on the spur_controller role having run first anymore, since
 # [controller].hosts/ansible_host are known upfront from the parsed file, not
 # computed via delegate_facts. A `--limit <agent-only>` run works too.
-- name: Read the master spur.conf and compute what to push to this agent
+#
+# A pure (non-controller) agent's push content never varies by target host —
+# same master file, same stripped [accounting], same autofilled facts — so
+# it's computed ONCE (run_once) instead of re-parsing the master file per
+# agent, which would cost O(fleet size) work per host (O(N^2) on a big fleet).
+# Only a co-located controller+agent host needs its own distinct computation
+# (its [controller].node_id differs per host).
+- name: Compute exclude_sections and the shared push content for non-controller agents once
+  run_once: true
+  vars:
+    master_conf_text: "{{ lookup('file', inventory_file) }}"
+    node_fact_fallbacks: "{{ groups['spur_agents'] | spur_conf_node_facts(hostvars) }}"
+  ansible.builtin.set_fact:
+    agent_exclude_sections: "{{ master_conf_text | spur_conf_exclude_sections }}"
+    agent_shared_conf: "{{ master_conf_text | spur_conf_for_push(node_fact_fallbacks, None, ['accounting']) }}"
+
+- name: Compute per-host push content for a co-located controller+agent host
+  when: inventory_hostname in groups['spur_controllers']
   vars:
     spur_controller_addr_attr: "{{ 'spur_wg_address' if spur_transport == 'wireguard' else 'ansible_host' }}"
     master_conf_text: "{{ lookup('file', inventory_file) }}"
-    exclude_sections: "{{ lookup('file', inventory_file) | spur_conf_exclude_sections }}"
     node_fact_fallbacks: "{{ groups['spur_agents'] | spur_conf_node_facts(hostvars) }}"
-    # A co-located controller+agent host (see inventory_plugins/spur_conf.py's
-    # co-location rule) gets its spur.conf written twice — once by
-    # spur_controller, again here by spur_agent, since both roles run on it.
     # Without this, the agent role's push (which has no reason to know about
     # HA) would clobber the controller role's carefully-filled peers/node_id
-    # with nothing, since the master file itself leaves them absent by
-    # design. Only compute/pass it when this host actually is a controller.
-    controller_ha_fallback: >-
-      {{ ({
-           'peers': (groups['spur_controllers']
-                     | map('extract', hostvars, spur_controller_addr_attr)
-                     | map('regex_replace', '$', ':' ~ spur_raft_port)
-                     | list),
-           'node_id': (groups['spur_controllers'].index(inventory_hostname) + 1),
-         }) if inventory_hostname in groups['spur_controllers'] else None }}
+    # with nothing, since the master file itself leaves them absent by design.
+    controller_ha_fallback:
+      peers: >-
+        {{ groups['spur_controllers']
+           | map('extract', hostvars, spur_controller_addr_attr)
+           | map('regex_replace', '$', ':' ~ spur_raft_port)
+           | list }}
+      node_id: "{{ groups['spur_controllers'].index(inventory_hostname) + 1 }}"
   ansible.builtin.set_fact:
     desired_conf: "{{ master_conf_text | spur_conf_for_push(node_fact_fallbacks, controller_ha_fallback) }}"
-    spur_conf_exclude_sections_list: "{{ exclude_sections }}"
+    spur_conf_exclude_sections_list: >-
+      {{ hostvars[ansible_play_hosts_all[0]].agent_exclude_sections }}
+
+- name: Use the shared push content for a pure (non-controller) agent
+  when: inventory_hostname not in groups['spur_controllers']
+  vars:
+    # [accounting] is never pushed to a pure agent, so excluding it here too
+    # would just make splice_excluded restore stale accounting content from
+    # a node that got it before this fix — never let it back in.
+    agent_drop_sections: ["accounting"]
+  ansible.builtin.set_fact:
+    desired_conf: "{{ hostvars[ansible_play_hosts_all[0]].agent_shared_conf }}"
+    spur_conf_exclude_sections_list: >-
+      {{ hostvars[ansible_play_hosts_all[0]].agent_exclude_sections | difference(agent_drop_sections) }}
 
 - name: Slurp the live spur.conf on this agent, if any
   ansible.builtin.slurp:

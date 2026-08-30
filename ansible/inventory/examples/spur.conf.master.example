@@ -12,9 +12,9 @@ cluster_name = "example-cluster"
 
 [ansible]
 default_user = "vm"
-# Sections listed here are never pushed by ansible; whatever's already on the
-# node for these sections is left exactly as-is. Use this for anything you
-# want to manage by hand outside of this file.
+# Sections listed here are preserved once they exist on a node (a brand-new
+# node still gets the master's version the first time). Use this for anything
+# you want to manage by hand after that.
 exclude_sections = ["accounting"]
 
 [controller]

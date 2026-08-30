@@ -43,11 +43,26 @@
     regexp: '^SPUR_ACCOUNTING_ADDR='
     state: absent
 
+- name: Resolve exclude_sections from the master spur.conf
+  ansible.builtin.set_fact:
+    exclude_sections: "{{ lookup('file', inventory_file) | spur_conf_exclude_sections }}"
+
+# [controller] carries peers/node_id, which the HA membership guard below
+# depends on being freshly computed every run — excluding it would silently
+# freeze topology changes instead of failing loudly, so refuse it outright.
+- name: Refuse to exclude [controller] from the spur.conf push
+  ansible.builtin.fail:
+    msg: >-
+      [ansible].exclude_sections lists "controller" — that section's
+      peers/node_id must stay in sync with the live Raft membership on every
+      run. Remove it from exclude_sections; use spur_wipe_state for an
+      intentional Raft reinit instead.
+  when: "'controller' in exclude_sections"
+
 - name: Read the master spur.conf and compute what to push to this host
   vars:
     spur_controller_addr_attr: "{{ 'spur_wg_address' if spur_transport == 'wireguard' else 'ansible_host' }}"
     master_conf_text: "{{ lookup('file', inventory_file) }}"
-    exclude_sections: "{{ lookup('file', inventory_file) | spur_conf_exclude_sections }}"
     node_fact_fallbacks: "{{ groups['spur_agents'] | spur_conf_node_facts(hostvars) }}"
     controller_ha_fallback:
       peers: >-

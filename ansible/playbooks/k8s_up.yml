@@ -27,7 +27,8 @@
   gather_facts: no
   any_errors_fatal: true
   vars:
-    ctrl_addr: "http://{{ hostvars[groups['spur_controllers'][0]]['ansible_host'] | default('127.0.0.1') }}:{{ spur_controller_port }}"
+    spur_controller_addr_attr: "{{ 'spur_wg_address' if spur_transport == 'wireguard' else 'ansible_host' }}"
+    ctrl_addr: "http://{{ hostvars[groups['spur_controllers'][0]][spur_controller_addr_attr] | default('127.0.0.1') }}:{{ spur_controller_port }}"
     k8s_ready_retries: 60
     k8s_ready_delay: 15
   tasks:

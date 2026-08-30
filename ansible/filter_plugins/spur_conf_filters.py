@@ -18,7 +18,7 @@ def spur_conf_exclude_sections(master_text):
     return list(doc.get("ansible", {}).get("exclude_sections", []))
 
 
-def spur_conf_for_push(master_text, node_fact_fallbacks=None, controller_ha_fallback=None):
+def spur_conf_for_push(master_text, node_fact_fallbacks=None, controller_ha_fallback=None, drop_sections=None):
     """Return the spur.conf content that should be pushed to a node: the
     master file with all ansible-only content stripped ([ansible] table,
     [[ansible_controllers]], [[ansible_login_nodes]], and any ansible_* keys
@@ -39,6 +39,10 @@ def spur_conf_for_push(master_text, node_fact_fallbacks=None, controller_ha_fall
     section omits them. node_id is inherently per-target-host (each
     controller has its own), so this must be computed by the caller once per
     host being pushed to, not once for the whole run.
+
+    drop_sections: optional list of section names to unconditionally remove,
+    bypassing exclude_sections entirely — used to keep controller-only
+    content (e.g. [accounting]'s DB credentials) off every compute agent.
     """
     if tomlkit is None:
         raise AnsibleFilterError("spur_conf_for_push requires the 'tomlkit' Python package")
@@ -49,6 +53,8 @@ def spur_conf_for_push(master_text, node_fact_fallbacks=None, controller_ha_fall
     doc.pop("ansible", None)
     doc.pop("ansible_controllers", None)
     doc.pop("ansible_login_nodes", None)
+    for section in drop_sections or []:
+        doc.pop(section, None)
 
     for node in doc.get("nodes", []):
         for key in [k for k in node.keys() if k.startswith("ansible_")]:

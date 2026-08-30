@@ -13,6 +13,10 @@
 # node(s) being removed must still be listed in it when you run this (ansible
 # needs to reach them for drain/cleanup); this playbook prunes their [[nodes]]
 # entries out of the master file itself, in place, once live removal succeeds.
+#
+# The master-file write-back has no cross-invocation lock — don't run two
+# `remove_nodes.yml` (or `add_nodes.yml`) invocations against the same
+# spur.conf concurrently, or the later write can clobber the earlier one.
 # No manual file edit needed afterward, unlike add_nodes.yml's precondition.
 #
 # Run:
@@ -61,17 +65,33 @@
       register: rn_all_nodes
       changed_when: false
 
-    - name: Fail if nodes_to_remove names a node that isn't currently registered
+    # A name can legitimately be gone from `spur show node` but still sit in
+    # spur.conf's [[nodes]] — e.g. a prior run's live removal succeeded but
+    # the master-file write-back at the end didn't. Re-running must finish
+    # pruning it, not hard-fail; only a name unknown to BOTH is a real typo.
+    - name: Split nodes_to_remove into currently-registered vs already-gone
+      vars:
+        rn_registered_names: "{{ rn_all_nodes.stdout_lines | select('match', '^NodeName=') | map('regex_replace', '^NodeName=', '') | list }}"
+      ansible.builtin.set_fact:
+        rn_registered_list: "{{ remove_list | intersect(rn_registered_names) }}"
+        rn_already_gone_list: "{{ remove_list | difference(rn_registered_names) }}"
+
+    - name: Fail if nodes_to_remove names a node unknown to both the cluster and spur.conf
       ansible.builtin.fail:
-        msg: "nodes_to_remove included {{ item }}, which isn't in `spur show node`."
-      loop: "{{ remove_list }}"
-      when: "('NodeName=' ~ item) not in (rn_all_nodes.stdout_lines | default([]))"
+        msg: "nodes_to_remove included {{ item }}, which isn't in `spur show node` or spur.conf's [[nodes]]."
+      loop: "{{ rn_already_gone_list }}"
+      when: item not in groups['spur_agents']
+
+    - name: Note nodes already removed live — will only be pruned from spur.conf
+      ansible.builtin.debug:
+        msg: "{{ item }} is already gone from the cluster; skipping drain, will still be pruned from spur.conf."
+      loop: "{{ rn_already_gone_list }}"
 
     - name: Drain each node (stop new scheduling; running jobs finish first)
       ansible.builtin.command: >-
         {{ spur_install_dir }}/spur node drain {{ item }}
         --reason "ansible decommission"
-      loop: "{{ remove_list }}"
+      loop: "{{ rn_registered_list }}"
       changed_when: true
 
     # Also accept DOWN: a genuinely unreachable node may independently cross
@@ -92,7 +112,7 @@
         exit 1
       args:
         executable: /bin/bash
-      loop: "{{ remove_list }}"
+      loop: "{{ rn_registered_list }}"
       register: rn_drain_wait
       changed_when: false
       # Non-fatal here — a still-busy node is an expected case handled below
@@ -140,11 +160,14 @@
     # Everything proceeds when forced; otherwise busy nodes are dropped from
     # the list (they were already refused above unless spur_skip_busy_agents
     # was set) so play 3 only removes the nodes that actually drained.
+    # Already-gone nodes need no live action (removal/peer-drop are already
+    # idempotent no-ops for them) but must still reach the write-back below.
     - name: Compute the final list of nodes to actually remove
       ansible.builtin.set_fact:
         rn_actual_remove_list: >-
-          {{ remove_list if (spur_force_remove_busy_nodes | default(false) | bool)
-             else (remove_list | difference(rn_busy_nodes)) }}
+          {{ (rn_registered_list if (spur_force_remove_busy_nodes | default(false) | bool)
+              else (rn_registered_list | difference(rn_busy_nodes)))
+             + rn_already_gone_list }}
 
 - name: Stop the agent on each removed node (best effort, if in inventory)
   # Map each requested name back to the inventory host whose spur_node_name /

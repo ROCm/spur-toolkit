@@ -19,11 +19,12 @@ ansible-playbook playbooks/deploy.yml -i spur.conf -e spur_binary_src=<path>
 
 Controllers come from `[controller].hosts`, agents from `[[nodes]]` — the same sections `spurctld`/`spurd` themselves read. A small `[ansible]`-prefixed layer carries connection metadata the runtime daemons don't need (SSH user/host, WireGuard address, per-section opt-outs) — it's stripped before the file is ever pushed to a node, so what lands on disk on each host is exactly the real schema, nothing ansible-only leaks into it.
 
-**The master file is always kept in sync.** Every playbook run pushes the current content of `spur.conf` to every node it manages — there's no "did I remember to re-render this" step, no drift between what you wrote and what's live. The only "leave this alone" mechanism is declarative: list a section under `[ansible].exclude_sections` and no playbook will ever touch it, permanently, until you remove it from that list. This replaced an older `-e spur_overwrite_conf=true` flag entirely — there's no flag to pass anymore, just the file's own declared intent.
+**The master file is always kept in sync.** Every playbook run pushes the current content of `spur.conf` to every node it manages — there's no "did I remember to re-render this" step, no drift between what you wrote and what's live. The only "leave this alone" mechanism is declarative: list a section under `[ansible].exclude_sections` and no playbook will ever overwrite whatever's already on that node for that section, until you remove it from that list — a brand-new node still gets the master's version on its first-ever push, since there's nothing on disk yet to preserve. This replaced an older `-e spur_overwrite_conf=true` flag entirely — there's no flag to pass anymore, just the file's own declared intent.
 
 **No spur.conf yet?** Run the one-time bootstrap generator first:
 
 ```bash
+cp inventory/hosts.example.ini inventory/hosts.ini && $EDITOR inventory/hosts.ini
 ansible-playbook playbooks/bootstrap_conf.yml -i inventory/hosts.ini -e spur_conf_out=./spur.conf
 ```
 
@@ -160,7 +161,7 @@ cluster_name = "example-cluster"
 
 [ansible]
 default_user = "vm"
-exclude_sections = ["accounting"]   # sections never pushed by ansible — hands-off, permanently
+exclude_sections = ["accounting"]   # preserved once it exists on a node; a brand-new node still gets this from the master file
 
 [controller]
 listen_addr = "[::]:6817"
@@ -407,7 +408,7 @@ An already-registered agent with a job still running is drained first; if it's s
 ansible-playbook playbooks/deploy.yml -i spur.conf -e spur_skip_busy_agents=true   # leave busy agents untouched, deploy the rest
 ```
 
-Agents get `spur.conf` too (the same file controllers get — `spurd` reads it best-effort for `[cluster]`/k0s and `[devices]`/GRES settings). Every run pushes whatever's currently in the master file to both — list a section under `[ansible].exclude_sections` if you want it left alone permanently.
+Agents get `spur.conf` too (same content controllers get, minus `[accounting]` — `spurd` reads it best-effort for `[cluster]`/k0s and `[devices]`/GRES settings). Every run pushes whatever's currently in the master file — list a section under `[ansible].exclude_sections` to preserve a node's existing on-disk copy of it going forward (a brand-new node still gets the master's version the first time, since nothing exists yet to preserve).
 
 ```bash
 cargo build --release -p spur-cli -p spurctld -p spurd   # rebuild all three together, see caveat below
