@@ -47,7 +47,9 @@ cargo build --release -p spur-cli -p spurctld -p spurd
 SPUR_BUILD="$(pwd)/target/release"
 cd -
 
-# 2. Ansible + spur.conf
+# 2. Ansible + spur.conf — hand-filling the example is simplest; if you'd
+# rather seed it from a classic hosts list instead, use the bootstrap
+# generator above (skip this cp and $EDITOR step).
 python3 -m pip install --user 'ansible-core>=2.14' tomlkit
 cp inventory/examples/spur.conf.master.example spur.conf
 $EDITOR spur.conf

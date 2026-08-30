@@ -17,11 +17,12 @@
 #   (bare process AND Docker container)
 #
 # integration-conf:
-#   deploy + [ansible].exclude_sections on BOTH controller and agent — a
-#   hand-edit inside an excluded section survives every playbook run
-#   untouched, while a non-excluded field change in the master fixture
-#   propagates every time, no flags needed (replaces the old
-#   spur_overwrite_conf-flag-based preserve/overwrite test)
+#   deploy + [ansible].exclude_sections on the controller (the only host that
+#   gets [accounting] — agents never do) — a hand-edit inside an excluded
+#   section survives every playbook run untouched, while a non-excluded field
+#   change in the master fixture propagates everywhere every time, no flags
+#   needed (replaces the old spur_overwrite_conf-flag-based preserve/overwrite
+#   test)
 #
 # integration-day2:
 #   remove_nodes.yml's busy-node job-safety model (refuse by default,
@@ -975,33 +976,34 @@ jobs:
           done
           echo "PASS: spur.conf present at the same path (/opt/spur/etc/spur.conf) on ctl-0 and every agent"
 
-          # database_url must match verbatim between controller and an agent —
-          # both push the same master file, filtered the same way.
-          ctl_url=$(docker exec ctl-0 grep '^database_url' /opt/spur/etc/spur.conf)
-          agent_url=$(docker exec gpu-1 grep '^database_url' /opt/spur/etc/spur.conf)
-          [ "$ctl_url" = "$agent_url" ] \
-            && echo "PASS: accounting database_url matches between ctl-0 and gpu-1" \
-            || { echo "FAIL: database_url differs — ctl-0=[$ctl_url] gpu-1=[$agent_url]"; exit 1; }
+          # A pure agent never gets [accounting] (it doesn't need the DB creds) —
+          # only the controller has it.
+          docker exec ctl-0 grep -q '^database_url' /opt/spur/etc/spur.conf \
+            || { echo "FAIL: ctl-0 is missing database_url"; exit 1; }
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" grep -q '^\[accounting\]' /opt/spur/etc/spur.conf \
+              && { echo "FAIL: $a has an [accounting] section — should be controller-only"; exit 1; }
+          done
+          echo "PASS: [accounting] present on ctl-0 only, not on any agent"
 
           docker exec gpu-1 journalctl -u spurd --no-pager | grep -q "loaded spur.conf" \
             && echo "PASS: spurd log confirms it loaded spur.conf" \
             || { echo "FAIL: spurd never logged loading spur.conf"; docker exec gpu-1 journalctl -u spurd --no-pager | tail -20; exit 1; }
 
-      # --- exclude_sections test (controller AND agent) ----------------------
-      # [accounting] is listed in the fixture's [ansible].exclude_sections
-      # (see the fixture step above) — the old spur_overwrite_conf flag is
-      # gone entirely; this declarative per-section opt-out is what replaces
-      # it. Hand-edit the excluded section, bump a NON-excluded field in the
-      # master fixture, then confirm: the hand-edit survives untouched while
-      # the non-excluded change propagates — on every playbook, no flags.
-      - name: Hand-edit the excluded [accounting] section on ctl-0 and gpu-1
+      # --- exclude_sections test (controller only — agents never get [accounting]) ---
+      # [accounting] is listed in the fixture's [ansible].exclude_sections (see the
+      # fixture step above) — the old spur_overwrite_conf flag is gone entirely;
+      # this declarative per-section opt-out is what replaces it. Hand-edit the
+      # excluded section, bump a NON-excluded field in the master fixture, then
+      # confirm: the hand-edit survives untouched on the controller (the only host
+      # that ever gets [accounting]) while the non-excluded change propagates
+      # everywhere — on every playbook, no flags.
+      - name: Hand-edit the excluded [accounting] section on ctl-0
         run: |
-          for h in ctl-0 gpu-1; do
-            docker exec "$h" sed -i 's/^fairshare_refresh_secs = .*/fairshare_refresh_secs = 999  # CI-SENTINEL/' /opt/spur/etc/spur.conf
-            docker exec "$h" grep -q 'CI-SENTINEL' /opt/spur/etc/spur.conf \
-              || { echo "sentinel not written on $h"; exit 1; }
-          done
-          echo "hand-edit stamped into the excluded [accounting] section on ctl-0 and gpu-1"
+          docker exec ctl-0 sed -i 's/^fairshare_refresh_secs = .*/fairshare_refresh_secs = 999  # CI-SENTINEL/' /opt/spur/etc/spur.conf
+          docker exec ctl-0 grep -q 'CI-SENTINEL' /opt/spur/etc/spur.conf \
+            || { echo "sentinel not written on ctl-0"; exit 1; }
+          echo "hand-edit stamped into the excluded [accounting] section on ctl-0"
 
       - name: Bump a non-excluded field in the master fixture (scheduler.interval_secs)
         run: sed -i 's/^interval_secs = 1$/interval_secs = 2/' "$GITHUB_WORKSPACE/ci-spur.conf"
@@ -1023,10 +1025,10 @@ jobs:
 
       - name: Assert accounting hand-edit survived AND scheduler change propagated
         run: |
+          docker exec ctl-0 grep -q 'CI-SENTINEL' /opt/spur/etc/spur.conf \
+            && echo "PASS: excluded [accounting] section preserved on ctl-0" \
+            || { echo "FAIL: excluded [accounting] section was overwritten on ctl-0"; exit 1; }
           for h in ctl-0 gpu-1; do
-            docker exec "$h" grep -q 'CI-SENTINEL' /opt/spur/etc/spur.conf \
-              && echo "PASS: excluded [accounting] section preserved on $h" \
-              || { echo "FAIL: excluded [accounting] section was overwritten on $h"; exit 1; }
             docker exec "$h" grep -qx 'interval_secs = 2' /opt/spur/etc/spur.conf \
               && echo "PASS: non-excluded scheduler.interval_secs synced on $h" \
               || { echo "FAIL: scheduler.interval_secs did not sync on $h"; exit 1; }
@@ -1050,10 +1052,10 @@ jobs:
 
       - name: Assert accounting hand-edit still survived AND scheduler change propagated again
         run: |
+          docker exec ctl-0 grep -q 'CI-SENTINEL' /opt/spur/etc/spur.conf \
+            && echo "PASS: excluded [accounting] section still preserved on ctl-0" \
+            || { echo "FAIL: excluded [accounting] section was overwritten on ctl-0"; exit 1; }
           for h in ctl-0 gpu-1; do
-            docker exec "$h" grep -q 'CI-SENTINEL' /opt/spur/etc/spur.conf \
-              && echo "PASS: excluded [accounting] section still preserved on $h" \
-              || { echo "FAIL: excluded [accounting] section was overwritten on $h"; exit 1; }
             docker exec "$h" grep -qx 'interval_secs = 3' /opt/spur/etc/spur.conf \
               && echo "PASS: non-excluded scheduler.interval_secs synced on $h" \
               || { echo "FAIL: scheduler.interval_secs did not sync on $h"; exit 1; }

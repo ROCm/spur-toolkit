@@ -87,6 +87,19 @@
         msg: "{{ item }} is already gone from the cluster; skipping drain, will still be pruned from spur.conf."
       loop: "{{ rn_already_gone_list }}"
 
+    # Pruned here, immediately, rather than waiting for the final write-back at
+    # the end of the play — a busy-node refusal below (any_errors_fatal: true)
+    # would otherwise abort the whole run before that later write-back for an
+    # UNRELATED node in the same invocation ever executes. Idempotent: a name
+    # already absent from the file is simply a no-op for spur_conf_remove_node.
+    - name: Prune already-gone node(s) from the master file right away
+      ansible.builtin.copy:
+        content: "{{ lookup('file', inventory_file) | spur_conf_remove_node(rn_already_gone_list) }}"
+        dest: "{{ inventory_file }}"
+      delegate_to: localhost
+      become: false
+      when: rn_already_gone_list | length > 0
+
     - name: Drain each node (stop new scheduling; running jobs finish first)
       ansible.builtin.command: >-
         {{ spur_install_dir }}/spur node drain {{ item }}
