@@ -140,6 +140,9 @@
     dckj_force_busy: "{{ spur_force_upgrade_busy_agents | default(false) | bool }}"
     dckj_force_flag: spur_force_upgrade_busy_agents
   pre_tasks:
+    - name: Compute the shared spur.conf push content for non-controller agents
+      ansible.builtin.include_tasks: tasks/compute_shared_agent_conf.yml
+
     - name: Drain + guard this node against job loss before touching its binaries
       ansible.builtin.include_tasks: tasks/drain_and_guard_agent.yml
 

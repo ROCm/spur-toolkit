@@ -117,28 +117,14 @@
 # [controller].hosts/ansible_host are known upfront from the parsed file, not
 # computed via delegate_facts. A `--limit <agent-only>` run works too.
 #
-# A pure (non-controller) agent's push content never varies by target host —
-# same master file, same stripped [accounting], same autofilled facts — so
-# it's computed ONCE instead of re-parsing the master file per agent, which
-# would cost O(fleet size) work per host (O(N^2) on a big fleet). Delegated to
-# a controller (not just run_once in-place) so the fact lands on a host that's
-# always present regardless of serial batching or spur_ignore_unreachable_agents
-# dropping a down agent out of this play's active host list — run_once alone
-# ties the computation to whichever host happens to run it, which isn't
-# guaranteed to be reachable across every batch/host set this role runs under.
-# Only a co-located controller+agent host needs its own distinct computation
-# (its [controller].node_id differs per host).
-- name: Compute exclude_sections and the shared push content for non-controller agents once
-  run_once: true
-  delegate_to: "{{ groups['spur_controllers'][0] }}"
-  delegate_facts: true
-  vars:
-    master_conf_text: "{{ lookup('file', inventory_file) }}"
-    node_fact_fallbacks: "{{ groups['spur_agents'] | spur_conf_node_facts(hostvars) }}"
-  ansible.builtin.set_fact:
-    agent_exclude_sections: "{{ master_conf_text | spur_conf_exclude_sections }}"
-    agent_shared_conf: "{{ master_conf_text | spur_conf_for_push(node_fact_fallbacks, None, ['accounting']) }}"
-
+# A pure (non-controller) agent's push content never varies by target host, so
+# it's computed ONCE for the whole fleet rather than re-parsed per agent (see
+# playbooks/tasks/compute_shared_agent_conf.yml, included from every caller's
+# pre_tasks — NOT here, since a role-level `when:` like "skip a busy node"
+# would apply to a run_once task in here too, and can skip this computation
+# fleet-wide if it lands on the one host run_once would pick). Only a
+# co-located controller+agent host needs its own distinct computation (its
+# [controller].node_id differs per host).
 - name: Compute per-host push content for a co-located controller+agent host
   when: inventory_hostname in groups['spur_controllers']
   vars:

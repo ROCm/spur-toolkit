@@ -118,6 +118,9 @@
       ansible.builtin.set_fact:
         spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
 
+    - name: Compute the shared spur.conf push content for non-controller agents
+      ansible.builtin.include_tasks: tasks/compute_shared_agent_conf.yml
+
     - name: Is this node already registered with the controller?
       # `spur show node <name>` does NOT filter server-side — it prints every node
       # and returns rc=0 regardless of the name. So grep the exact `NodeName=<name>`

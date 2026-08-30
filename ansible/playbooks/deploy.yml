@@ -139,6 +139,9 @@
       ansible.builtin.set_fact:
         spur_node_name: "{{ spur_node_name | default(ansible_hostname | default(inventory_hostname)) }}"
 
+    - name: Compute the shared spur.conf push content for non-controller agents
+      ansible.builtin.include_tasks: tasks/compute_shared_agent_conf.yml
+
     # One query for the whole fleet instead of one delegate_to call per agent —
     # `spur show node` with NO name argument lists every registered node, so a
     # single run_once here is enough for every host to check itself against
