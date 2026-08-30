@@ -164,7 +164,7 @@ exclude_sections = ["accounting"]   # sections never pushed by ansible — hands
 
 [controller]
 listen_addr = "[::]:6817"
-hosts = ["10.11.98.147"]
+hosts = ["10.0.0.10"]
 state_dir = "/opt/spur/state"
 raft_listen_addr = "[::]:6821"
 
@@ -173,7 +173,7 @@ plugin = "backfill"
 interval_secs = 1
 
 [accounting]
-database_url = "postgresql://spur:spur@10.11.98.147:5432/spur"
+database_url = "postgresql://spur:spur@10.0.0.10:5432/spur"
 fairshare_refresh_secs = 30
 
 [network]
@@ -185,7 +185,7 @@ agent_port = 6818
 # explicit value always wins.
 [[nodes]]
 names = "gpu-1"
-ansible_host = "10.11.71.210"
+ansible_host = "10.0.0.20"
 ansible_user = "vm"
 
 [[partitions]]
@@ -203,7 +203,7 @@ max_time = "INFINITE"
 
 ```toml
 [[ansible_controllers]]
-host = "10.11.98.147"        # must match a [controller].hosts entry
+host = "10.0.0.10"        # must match a [controller].hosts entry
 ansible_host = "ctl-0.internal"
 ansible_user = "root"
 ```
