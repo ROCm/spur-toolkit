@@ -22,16 +22,19 @@
 #   section survives every playbook run untouched, while a non-excluded field
 #   change in the master fixture propagates everywhere every time, no flags
 #   needed (replaces the old spur_overwrite_conf-flag-based preserve/overwrite
-#   test)
+#   test). Also asserts exclude_sections=["controller"] is refused outright,
+#   and that add_nodes.yml refuses a node with no [[nodes]] entry.
 #
 # integration-day2:
 #   remove_nodes.yml's busy-node job-safety model (refuse by default,
 #   spur_skip_busy_agents=true, spur_force_remove_busy_nodes=true), plus its
 #   write-back (pruning the master spur.conf fixture itself, exercised by the
-#   force-remove case). Also teardown.yml's disruptive-by-default/opt-in-drain
-#   behavior (no flags: stops a busy agent immediately and sweeps its job
-#   cgroup clean, no wait; spur_skip_busy_agents=true or
-#   spur_force_teardown_busy_agents=true opts back into draining first)
+#   force-remove case AND by a node removed live outside the playbook while
+#   still listed in spur.conf — must prune on the next run, not hard-fail).
+#   Also teardown.yml's disruptive-by-default/opt-in-drain behavior (no
+#   flags: stops a busy agent immediately and sweeps its job cgroup clean, no
+#   wait; spur_skip_busy_agents=true or spur_force_teardown_busy_agents=true
+#   opts back into draining first)
 #
 # integration-ha-mesh:
 #   3-controller HA cluster over a real WireGuard mesh (SPUR-195, PR #23) — the
@@ -42,7 +45,10 @@
 #   (pinned .1-.6, matching the fixture's ansible_wg_address values), full
 #   controller<->controller connectivity (not hub-and-spoke), Raft quorum over
 #   the mesh, spur.conf's HA peers/node_id (auto-filled since the fixture
-#   leaves them absent), the remove_nodes.yml / add_nodes.yml all-controllers
+#   leaves them absent — a render-only check in the lint job separately
+#   proves an explicit value in the master file wins over the auto-fill),
+#   [accounting] present only on co-located controller+agent hosts and never
+#   on a pure agent, the remove_nodes.yml / add_nodes.yml all-controllers
 #   WG peer sync (no ghost peer; regenerated key refreshed on every
 #   controller — re-adding a node requires re-inserting its [[nodes]] entry
 #   into the fixture first, add_nodes.yml's usual precondition), and
@@ -106,6 +112,64 @@ jobs:
             echo "== syntax-check $pb =="
             ansible-playbook --syntax-check -i inventory/examples/spur.conf.master.example $DUMMY "$pb" || exit 1
           done
+
+      - name: A [[nodes]] entry with no 'names' must fail with a clear inventory error
+        working-directory: ansible
+        run: |
+          cat > /tmp/bad-spur.conf <<'EOF'
+          cluster_name = "bad-cluster"
+
+          [controller]
+          hosts = ["10.0.0.10"]
+
+          [[nodes]]
+          ansible_host = "10.0.0.20"
+          EOF
+          # ansible-inventory doesn't hard-fail on a parse error (it warns and
+          # falls back to an empty inventory) — the warning text IS the signal
+          # an operator sees, so assert on that rather than the exit code.
+          out=$(ansible-inventory -i /tmp/bad-spur.conf --list 2>&1)
+          echo "$out" | grep -q "entry is missing 'names'" \
+            && echo "PASS: malformed spur.conf reports a clear parse error" \
+            || { echo "FAIL: error message did not match expected text"; echo "$out"; exit 1; }
+          echo "$out" | grep -q '"hostvars": {}' \
+            && echo "PASS: no hosts silently registered from the malformed file" \
+            || { echo "FAIL: expected an empty inventory after the parse failure"; echo "$out"; exit 1; }
+
+      - name: An explicit [controller].peers/node_id in the master file must win over the auto-fill
+        working-directory: ansible
+        run: |
+          cat > ./.ci-render-explicit-ha.yml <<'EOF'
+          - hosts: localhost
+            gather_facts: no
+            vars:
+              master_conf_text: |
+                cluster_name = "explicit-ha-cluster"
+
+                [controller]
+                hosts = ["10.0.0.10", "10.0.0.11"]
+                peers = ["10.0.0.10:9999", "10.0.0.11:9999"]
+                node_id = 42
+              controller_ha_fallback:
+                peers: ["10.0.0.10:6821", "10.0.0.11:6821"]
+                node_id: 2
+            tasks:
+              - ansible.builtin.set_fact:
+                  rendered: "{{ master_conf_text | spur_conf_for_push(None, controller_ha_fallback) }}"
+              - ansible.builtin.debug:
+                  msg: "{{ rendered }}"
+              - ansible.builtin.copy:
+                  content: "{{ rendered }}"
+                  dest: /tmp/rendered-explicit-ha.conf
+          EOF
+          ansible-playbook ./.ci-render-explicit-ha.yml
+          rm -f ./.ci-render-explicit-ha.yml
+          conf=$(cat /tmp/rendered-explicit-ha.conf)
+          echo "$conf" | grep -qx 'node_id = 42' \
+            || { echo "FAIL: explicit node_id was overwritten by the auto-fill"; echo "$conf"; exit 1; }
+          echo "$conf" | grep -q '9999' \
+            || { echo "FAIL: explicit peers were overwritten by the auto-fill"; echo "$conf"; exit 1; }
+          echo "PASS: explicit [controller].peers/node_id in the master file survive the push"
 
   # ---------------------------------------------------------------------------
   # Job 1: rolling upgrade resilience + force upgrade + container kill
@@ -1061,6 +1125,28 @@ jobs:
               || { echo "FAIL: scheduler.interval_secs did not sync on $h"; exit 1; }
           done
 
+      # --- exclude_sections must refuse "controller" — it'd silently freeze HA topology edits ---
+      - name: List "controller" in exclude_sections (must make deploy.yml refuse)
+        run: sed -i 's/exclude_sections = \["accounting"\]/exclude_sections = ["accounting", "controller"]/' "$GITHUB_WORKSPACE/ci-spur.conf"
+
+      - name: deploy.yml with exclude_sections=["controller"] (must refuse)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          if ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/deploy.yml \
+              -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+              -e spur_install_dir=/usr/local/bin \
+              -e spur_home=/opt/spur \
+              -e spur_verify_enabled=false; then
+            echo "FAIL: deploy.yml should have refused with \"controller\" in exclude_sections"; exit 1
+          else
+            echo "PASS: deploy.yml refused to push with \"controller\" excluded"
+          fi
+
+      - name: Drop "controller" from exclude_sections again
+        run: sed -i 's/exclude_sections = \["accounting", "controller"\]/exclude_sections = ["accounting"]/' "$GITHUB_WORKSPACE/ci-spur.conf"
+
       # --- add_nodes.yml pushes spur.conf unconditionally, without restarting spurctld ---
       - name: Stamp a sentinel line into spur.conf on ctl-0, and note spurctld's current PID
         run: |
@@ -1088,6 +1174,21 @@ jobs:
           diff /tmp/ctl0-pid-before-addnodes /tmp/ctl0-pid-after-addnodes \
             && echo "PASS: spurctld was not restarted by add_nodes.yml" \
             || { echo "FAIL: spurctld's PID changed — add_nodes.yml restarted the controller"; exit 1; }
+
+      # --- add_nodes.yml must refuse a name with no [[nodes]] entry in spur.conf ---
+      - name: add_nodes.yml with an unknown node name (must refuse)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          if ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/add_nodes.yml \
+              -e new_nodes=ghost-node \
+              -e spur_install_dir=/usr/local/bin \
+              -e spur_home=/opt/spur; then
+            echo "FAIL: add_nodes.yml should have refused a node with no [[nodes]] entry"; exit 1
+          else
+            echo "PASS: add_nodes.yml refused ghost-node (no spur.conf entry)"
+          fi
 
       # TODO(next): manage_accounts.yml / healthcheck.yml
 
@@ -1289,6 +1390,65 @@ jobs:
             sleep 2
           done
           [ -z "$missing" ] || { echo "agents still missing:$missing"; exit 1; }
+
+      # --- remove_nodes.yml must recover a node already gone live but still ---
+      # --- listed in spur.conf (e.g. a prior run's write-back didn't finish) ---
+      - name: Remove gpu-1 live via the CLI, bypassing the playbook (simulates a partial prior removal)
+        run: docker exec ctl-0 /usr/local/bin/spur node remove gpu-1 --force --reason ci-simulate-partial-removal
+
+      - name: remove_nodes.yml gpu-1 (already gone live, still in spur.conf — must prune, not fail)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/remove_nodes.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e nodes_to_remove=gpu-1
+
+      - name: Assert gpu-1 is pruned from the spur.conf fixture
+        run: |
+          grep -q 'names = "gpu-1"' "$GITHUB_WORKSPACE/ci-spur.conf" \
+            && { echo "FAIL: gpu-1 still has a [[nodes]] entry in the fixture"; exit 1; }
+          echo "PASS: gpu-1 pruned from spur.conf after being already-gone live"
+
+      - name: Re-add gpu-1's entry to the spur.conf fixture (add_nodes.yml's precondition)
+        env:
+          CI_CONF: ${{ github.workspace }}/ci-spur.conf
+        run: |
+          python3 - <<'PYEOF'
+          import os, tomlkit
+          path = os.environ["CI_CONF"]
+          doc = tomlkit.parse(open(path).read())
+          doc["nodes"].append({"names": "gpu-1", "ansible_host": "gpu-1"})
+          part = doc["partitions"][0]
+          members = [m for m in part["nodes"].split(",") if m]
+          if "gpu-1" not in members:
+              members.append("gpu-1")
+          part["nodes"] = ",".join(members)
+          open(path, "w").write(tomlkit.dumps(doc))
+          PYEOF
+
+      - name: add_nodes.yml gpu-1 (bring it back for the busy-node tests below)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i "$GITHUB_WORKSPACE/ci-spur.conf" playbooks/add_nodes.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e new_nodes=gpu-1
+
+      - name: Assert gpu-1 re-registered
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" && break
+            sleep 2
+          done
+          docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -qx "NodeName=gpu-1" \
+            || { echo "::error::gpu-1 did not re-register after add_nodes.yml"; exit 1; }
 
       # --- remove_nodes.yml: refuse / skip / force on a busy node -----------
       - name: Submit a busy job on gpu-1 for the remove_nodes.yml tests
@@ -1691,6 +1851,9 @@ jobs:
           plugin = "backfill"
           interval_secs = 1
 
+          [accounting]
+          database_url = ""
+
           [network]
           wg_enabled = true
           wg_interface = "spur0"
@@ -1737,7 +1900,7 @@ jobs:
           echo "== ci-ha-spur.conf =="
           cat "$GITHUB_WORKSPACE/ci-ha-spur.conf"
 
-      - name: deploy.yml — 3-controller HA over WireGuard (no accounting/k0s)
+      - name: deploy.yml — 3-controller HA over WireGuard (accounting disabled ansible-side; no k0s)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
@@ -1808,6 +1971,23 @@ jobs:
               && echo "PASS: $n node_id = $got" \
               || { echo "::error::$n node_id is '$got', expected ${wantid[$n]}"; exit 1; }
           done
+
+      - name: Assert a co-located controller+agent host keeps [accounting], a pure agent doesn't
+        run: |
+          set -euo pipefail
+          # ctl-0/1/2 are controllers AND agents (co-located, per inventory_plugins/spur_conf.py's
+          # ctl-N == [[nodes]] names collision rule) — they must keep [accounting].
+          for n in ctl-0 ctl-1 ctl-2; do
+            docker exec "$n" grep -q '^\[accounting\]' /opt/spur/etc/spur.conf \
+              && echo "PASS: co-located $n kept [accounting]" \
+              || { echo "::error::co-located $n is missing [accounting]"; exit 1; }
+          done
+          # worker-0/1 are pure agents — never controllers — so [accounting] must be absent.
+          for n in worker-0 worker-1; do
+            docker exec "$n" grep -q '^\[accounting\]' /opt/spur/etc/spur.conf \
+              && { echo "::error::pure agent $n has an [accounting] section — should be controller-only"; exit 1; }
+          done
+          echo "PASS: [accounting] present only on co-located controller+agent hosts, not pure agents"
 
       - name: Assert Raft quorum formed over the mesh (a leader exists and all agents registered)
         run: |

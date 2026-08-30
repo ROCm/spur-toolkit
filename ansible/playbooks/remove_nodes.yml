@@ -306,11 +306,15 @@
       changed_when: false
 
     - name: Result + inventory reminder
+      vars:
+        rn_freshly_removed: "{{ rn_actual_remove_list | difference(rn_already_gone_list) }}"
       ansible.builtin.debug:
         msg: >-
           {{
-            (["Removed from the running cluster: " ~ (rn_actual_remove_list | join(', '))]
-             if (rn_actual_remove_list | length > 0) else [])
+            (["Removed from the running cluster this run: " ~ (rn_freshly_removed | join(', '))]
+             if (rn_freshly_removed | length > 0) else [])
+            + (["Already gone before this run, pruned from spur.conf: " ~ (rn_already_gone_list | join(', '))]
+               if (rn_already_gone_list | length > 0) else [])
             + (["Left in the cluster, un-removed (still busy): " ~ (rn_busy_nodes | difference(rn_actual_remove_list) | join(', '))]
                if (rn_busy_nodes | default([]) | difference(rn_actual_remove_list) | length > 0) else [])
             + rn_after.stdout_lines
