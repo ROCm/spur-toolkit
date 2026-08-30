@@ -9,7 +9,7 @@
 # idempotent — re-running applies the same desired state.
 #
 # Run:
-#   ansible-playbook playbooks/manage_accounts.yml -i inventory/hosts.ini
+#   ansible-playbook playbooks/manage_accounts.yml -i spur.conf
 #
 # Everything is applied on one controller (accounting is served in-process by
 # every spurctld, so any controller reaches the same database).

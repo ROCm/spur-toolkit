@@ -9,13 +9,23 @@
 #   4. spur node remove --force (authoritative, WAL-durable removal)
 # then remind the operator to drop it from [spur_agents] in inventory.
 #
+# spur.conf IS the inventory (see inventory_plugins/spur_conf.py) — the
+# node(s) being removed must still be listed in it when you run this (ansible
+# needs to reach them for drain/cleanup); this playbook prunes their [[nodes]]
+# entries out of the master file itself, in place, once live removal succeeds.
+#
+# The master-file write-back has no cross-invocation lock — don't run two
+# `remove_nodes.yml` (or `add_nodes.yml`) invocations against the same
+# spur.conf concurrently, or the later write can clobber the earlier one.
+# No manual file edit needed afterward, unlike add_nodes.yml's precondition.
+#
 # Run:
-#   ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4
+#   ansible-playbook playbooks/remove_nodes.yml -i spur.conf -e nodes_to_remove=gpu-3,gpu-4
 #
 # Names are the node names as they appear in `spur nodes` (each agent's
-# ansible_hostname — the same value spur.conf uses). Draining/removal are done
-# from the first controller; the spurd stop is attempted on the matching
-# inventory host when one exists (an already-dead host is fine — it's skipped).
+# spur.conf [[nodes]].names). Draining/removal are done from the first
+# controller; the spurd stop is attempted on the matching inventory host when
+# one exists (an already-dead host is fine — it's skipped).
 #
 # A node with a job still running does not finish draining. Same job-safety
 # model as deploy.yml/rolling_upgrade.yml/teardown.yml: by default the run
@@ -23,7 +33,7 @@
 # to remove only the nodes that drained cleanly (leaving busy ones in the
 # cluster, un-removed), or -e spur_force_remove_busy_nodes=true to kill the
 # running job on a busy node and remove it anyway:
-#   ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4 -e spur_force_remove_busy_nodes=true
+#   ansible-playbook playbooks/remove_nodes.yml -i spur.conf -e nodes_to_remove=gpu-3,gpu-4 -e spur_force_remove_busy_nodes=true
 
 - name: Guard rails + node decommission
   hosts: "{{ groups['spur_controllers'][0] }}"
@@ -55,17 +65,46 @@
       register: rn_all_nodes
       changed_when: false
 
-    - name: Fail if nodes_to_remove names a node that isn't currently registered
+    # A name can legitimately be gone from `spur show node` but still sit in
+    # spur.conf's [[nodes]] — e.g. a prior run's live removal succeeded but
+    # the master-file write-back at the end didn't. Re-running must finish
+    # pruning it, not hard-fail; only a name unknown to BOTH is a real typo.
+    - name: Split nodes_to_remove into currently-registered vs already-gone
+      vars:
+        rn_registered_names: "{{ rn_all_nodes.stdout_lines | select('match', '^NodeName=') | map('regex_replace', '^NodeName=', '') | list }}"
+      ansible.builtin.set_fact:
+        rn_registered_list: "{{ remove_list | intersect(rn_registered_names) }}"
+        rn_already_gone_list: "{{ remove_list | difference(rn_registered_names) }}"
+
+    - name: Fail if nodes_to_remove names a node unknown to both the cluster and spur.conf
       ansible.builtin.fail:
-        msg: "nodes_to_remove included {{ item }}, which isn't in `spur show node`."
-      loop: "{{ remove_list }}"
-      when: "('NodeName=' ~ item) not in (rn_all_nodes.stdout_lines | default([]))"
+        msg: "nodes_to_remove included {{ item }}, which isn't in `spur show node` or spur.conf's [[nodes]]."
+      loop: "{{ rn_already_gone_list }}"
+      when: item not in groups['spur_agents']
+
+    - name: Note nodes already removed live — will only be pruned from spur.conf
+      ansible.builtin.debug:
+        msg: "{{ item }} is already gone from the cluster; skipping drain, will still be pruned from spur.conf."
+      loop: "{{ rn_already_gone_list }}"
+
+    # Pruned here, immediately, rather than waiting for the final write-back at
+    # the end of the play — a busy-node refusal below (any_errors_fatal: true)
+    # would otherwise abort the whole run before that later write-back for an
+    # UNRELATED node in the same invocation ever executes. Idempotent: a name
+    # already absent from the file is simply a no-op for spur_conf_remove_node.
+    - name: Prune already-gone node(s) from the master file right away
+      ansible.builtin.copy:
+        content: "{{ lookup('file', inventory_file) | spur_conf_remove_node(rn_already_gone_list) }}"
+        dest: "{{ inventory_file }}"
+      delegate_to: localhost
+      become: false
+      when: rn_already_gone_list | length > 0
 
     - name: Drain each node (stop new scheduling; running jobs finish first)
       ansible.builtin.command: >-
         {{ spur_install_dir }}/spur node drain {{ item }}
         --reason "ansible decommission"
-      loop: "{{ remove_list }}"
+      loop: "{{ rn_registered_list }}"
       changed_when: true
 
     # Also accept DOWN: a genuinely unreachable node may independently cross
@@ -86,7 +125,7 @@
         exit 1
       args:
         executable: /bin/bash
-      loop: "{{ remove_list }}"
+      loop: "{{ rn_registered_list }}"
       register: rn_drain_wait
       changed_when: false
       # Non-fatal here — a still-busy node is an expected case handled below
@@ -134,11 +173,14 @@
     # Everything proceeds when forced; otherwise busy nodes are dropped from
     # the list (they were already refused above unless spur_skip_busy_agents
     # was set) so play 3 only removes the nodes that actually drained.
+    # Already-gone nodes need no live action (removal/peer-drop are already
+    # idempotent no-ops for them) but must still reach the write-back below.
     - name: Compute the final list of nodes to actually remove
       ansible.builtin.set_fact:
         rn_actual_remove_list: >-
-          {{ remove_list if (spur_force_remove_busy_nodes | default(false) | bool)
-             else (remove_list | difference(rn_busy_nodes)) }}
+          {{ (rn_registered_list if (spur_force_remove_busy_nodes | default(false) | bool)
+              else (rn_registered_list | difference(rn_busy_nodes)))
+             + rn_already_gone_list }}
 
 - name: Stop the agent on each removed node (best effort, if in inventory)
   # Map each requested name back to the inventory host whose spur_node_name /
@@ -158,7 +200,7 @@
     # rn_actual_remove_list was set via plain set_fact on the controller in
     # play 1 (a DIFFERENT host) — a bare reference here would look at THIS
     # host's own (unset) vars, not the controller's, so it must go through
-    # hostvars[] explicitly (same lesson as spur_accounting_listen_ip).
+    # hostvars[] explicitly.
     rn_actual_remove_list: "{{ hostvars[groups['spur_controllers'][0]].rn_actual_remove_list | default([]) }}"
   tasks:
     # Only nodes actually being removed — a node left in the cluster via
@@ -264,16 +306,58 @@
       changed_when: false
 
     - name: Result + inventory reminder
+      vars:
+        rn_freshly_removed: "{{ rn_actual_remove_list | difference(rn_already_gone_list) }}"
       ansible.builtin.debug:
         msg: >-
           {{
-            (["Removed from the running cluster: " ~ (rn_actual_remove_list | join(', '))]
-             if (rn_actual_remove_list | length > 0) else [])
+            (["Removed from the running cluster this run: " ~ (rn_freshly_removed | join(', '))]
+             if (rn_freshly_removed | length > 0) else [])
+            + (["Already gone before this run, pruned from spur.conf: " ~ (rn_already_gone_list | join(', '))]
+               if (rn_already_gone_list | length > 0) else [])
             + (["Left in the cluster, un-removed (still busy): " ~ (rn_busy_nodes | difference(rn_actual_remove_list) | join(', '))]
                if (rn_busy_nodes | default([]) | difference(rn_actual_remove_list) | length > 0) else [])
-            + ["IMPORTANT: also delete removed hosts from [spur_agents] in your inventory,",
-               "otherwise a future `deploy.yml` run will re-add them. No re-deploy is",
-               "needed just to complete the removal — it's already done.",
-               "Current nodes:"]
             + rn_after.stdout_lines
           }}
+
+# Unlike add_nodes.yml (which requires the operator to hand-add a [[nodes]]
+# entry first), removal writes the master spur.conf itself: the node had to
+# stay listed in it until the live removal above succeeded (ansible needed to
+# reach it for draining/cleanup), so pruning it now — after, not before — is
+# the only ordering that works. Runs on the control node, not a managed host.
+- name: Write the removed node(s) out of the master spur.conf
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: false
+  gather_facts: no
+  vars:
+    rn_actual_remove_list: "{{ hostvars[groups['spur_controllers'][0]].rn_actual_remove_list | default([]) }}"
+  tasks:
+    # delegate_to: localhost, not a play-level `connection: local` — a host's
+    # own ansible_connection (e.g. docker, set via spur.conf's [ansible]
+    # table) takes precedence over a play-level connection keyword, so
+    # `connection: local` alone would silently run this INSIDE the target
+    # container instead of on the control node.
+    - name: Prune removed node(s) from the master file and write it back
+      ansible.builtin.copy:
+        content: "{{ lookup('file', inventory_file) | spur_conf_remove_node(rn_actual_remove_list) }}"
+        dest: "{{ inventory_file }}"
+      delegate_to: localhost
+      become: false
+      when: rn_actual_remove_list | length > 0
+
+# Surviving controllers' pushed spur.conf must drop the removed node too —
+# no restart needed, spurd deregistering (or the RPC removal above) already
+# told the running controller; this just keeps the on-disk file in sync for
+# a future restart, same no-restart pattern as add_nodes.yml.
+- name: Refresh surviving controllers' spur.conf (no restart)
+  hosts: spur_controllers
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    rn_actual_remove_list: "{{ hostvars[groups['spur_controllers'][0]].rn_actual_remove_list | default([]) }}"
+  roles:
+    - role: spur_controller
+      vars:
+        spur_controller_skip_restart: true
+      when: rn_actual_remove_list | length > 0

@@ -1,0 +1,69 @@
+# HA Spur cluster — 3 controllers + N agents, direct (LAN) transport.
+#
+# Quorum math: tolerate floor((N-1)/2) controller failures.
+#   3 controllers -> tolerates 1 failure
+#   5 controllers -> tolerates 2 failures
+#
+# HA mode is auto-enabled when [controller].hosts has more than one entry.
+# peers[]/node_id are left absent here on purpose — ansible auto-fills them
+# (mechanical, position-in-hosts-derived) the first time this is pushed; an
+# explicit value in the file would always win instead.
+#
+# Controllers double as agents here (small-cluster pattern) via a [[nodes]]
+# entry per controller whose `names` matches its ctl-N inventory name — see
+# inventory_plugins/spur_conf.py's co-location rule. Two dedicated workers are
+# also agent-only nodes.
+#
+#   Deploy: ansible-playbook playbooks/deploy.yml -i spur.conf.ha.example
+#
+# Copy this to a real file and fill in your hosts/credentials.
+
+cluster_name = "ha-cluster"
+
+[ansible]
+default_user = "root"
+exclude_sections = []
+
+[controller]
+listen_addr = "[::]:6817"
+hosts = ["10.0.0.10", "10.0.0.11", "10.0.0.12"]
+state_dir = "/opt/spur/state"
+raft_listen_addr = "[::]:6821"
+
+[scheduler]
+plugin = "backfill"
+interval_secs = 1
+
+[accounting]
+database_url = "postgresql://spur:spur@10.0.0.10:5432/spur"
+fairshare_refresh_secs = 30
+
+[network]
+wg_enabled = false
+agent_port = 6818
+
+[[nodes]]
+names = "ctl-0"
+ansible_host = "10.0.0.10"
+
+[[nodes]]
+names = "ctl-1"
+ansible_host = "10.0.0.11"
+
+[[nodes]]
+names = "ctl-2"
+ansible_host = "10.0.0.12"
+
+[[nodes]]
+names = "gpu-1"
+ansible_host = "10.0.0.21"
+
+[[nodes]]
+names = "gpu-2"
+ansible_host = "10.0.0.22"
+
+[[partitions]]
+name = "default"
+default = true
+nodes = "ctl-0,ctl-1,ctl-2,gpu-1,gpu-2"
+max_time = "INFINITE"

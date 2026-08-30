@@ -6,10 +6,10 @@
 # run still fails when anything is unhealthy — no separate summary pass needed).
 #
 # Run:
-#   ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini
+#   ansible-playbook playbooks/healthcheck.yml -i spur.conf
 #
 # Skip agents unreachable over SSH (default false = strict, abort the check):
-#   ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini -e spur_ignore_unreachable_agents=true
+#   ansible-playbook playbooks/healthcheck.yml -i spur.conf -e spur_ignore_unreachable_agents=true
 
 - name: Controller health
   hosts: spur_controllers

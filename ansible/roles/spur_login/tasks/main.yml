@@ -5,16 +5,15 @@
 # endpoint rotation survives any single controller being down. Accounting rides the
 # same address (no separate env var since spurdbd was folded into spurctld).
 #
-# spur_controller runs before this role in the same play and sets
-# spur_controller_listen_ip on every controller (its .1/.N mesh address under
-# wireguard, else its LAN IP), so reuse it directly rather than recomputing a
-# parallel fact — a run_once delegated set_fact here doesn't reliably surface on
-# a login host before the endpoint list reads it.
+# spur_wg_address is the inventory-provided hostvar (from spur.conf's
+# ansible_wg_address) under wireguard; ansible_host is already each
+# controller's listen IP straight from [controller].hosts otherwise.
 - name: Set SPUR_CONTROLLER_ADDR in /etc/environment (login nodes)
   vars:
+    spur_controller_addr_attr: "{{ 'spur_wg_address' if spur_transport == 'wireguard' else 'ansible_host' }}"
     all_controller_endpoints: >-
       {{ groups['spur_controllers']
-         | map('extract', hostvars, 'spur_controller_listen_ip')
+         | map('extract', hostvars, spur_controller_addr_attr)
          | map('regex_replace', '^(.*)$', 'http://\1:' ~ spur_controller_port)
          | join(',') }}
   ansible.builtin.lineinfile:

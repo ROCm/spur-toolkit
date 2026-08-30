@@ -1,0 +1,60 @@
+---
+# Day-0 ONLY: generate a starter spur.conf from a classic hosts.ini, since
+# every other playbook now reads its inventory FROM spur.conf itself (see
+# inventory_plugins/spur_conf.py) — there's nothing to derive it from on a
+# genuinely fresh cluster. Run this exactly once per new cluster, then use
+# the file it writes as -i for deploy.yml and everything else from then on.
+#
+# Run:
+#   ansible-playbook -i inventory/hosts.ini playbooks/bootstrap_conf.yml \
+#     -e spur_conf_out=./spur.conf
+#
+# The output is a starting point, not a finished file — review it, then fill
+# in real values the template can't know (accounting DB creds if not
+# co-located, k8s CIDRs if spur_k8s_enabled, [ansible] section per-node
+# ansible_host/ansible_user if they differ from the hosts.ini you fed in).
+
+- name: Gather facts across the fleet named in the bootstrap hosts.ini
+  hosts: spur_controllers:spur_agents
+  become: false
+  gather_facts: yes
+  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  tasks:
+    - name: Resolve each node's short name (used by the template's [[nodes]] block)
+      ansible.builtin.set_fact:
+        spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
+
+- name: Render the starter spur.conf on the control node
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  vars:
+    spur_conf_out: "./spur.conf"
+    spur_bootstrap_ansible_user: "{{ ansible_user | default('root') }}"
+  tasks:
+    - name: Require spur_conf_out doesn't already exist (never clobber a real master file)
+      ansible.builtin.stat:
+        path: "{{ spur_conf_out }}"
+      register: spur_conf_out_stat
+
+    - name: Refuse to overwrite an existing file
+      ansible.builtin.fail:
+        msg: >-
+          {{ spur_conf_out }} already exists — this playbook only ever writes a
+          brand-new starter file. Remove it first, or pass a different
+          -e spur_conf_out=... path.
+      when: spur_conf_out_stat.stat.exists
+
+    - name: Render spur.conf.j2 to spur_conf_out
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../roles/spur_controller/templates/spur.conf.j2"
+        dest: "{{ spur_conf_out }}"
+        mode: "0644"
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: >-
+          Wrote {{ spur_conf_out }}. Review it, fill in anything the template
+          couldn't know (accounting DB creds, k8s CIDRs), then use it as -i for
+          deploy.yml and every other playbook from now on.

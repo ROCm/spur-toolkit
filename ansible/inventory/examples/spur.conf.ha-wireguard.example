@@ -1,0 +1,75 @@
+# HA Spur cluster over a WireGuard mesh — 3 controllers + N agents, no k0s.
+#
+# The multi-controller counterpart to spur.conf.ha.example: same 3-controller
+# Raft quorum, but the whole control plane (and Raft) rides an encrypted mesh
+# instead of the LAN. [controller].hosts below are the MESH addresses (not the
+# underlying LAN IPs) — the spur_wireguard role bootstraps the mesh on the
+# first controller (net init, .1), joins every other node, then runs a
+# full-mesh pass (spur net mesh) so controllers peer each other directly
+# (required for Raft elections when the bootstrap controller is down).
+#
+# ansible_wg_address pins the mesh IP per node explicitly (recommended for a
+# fixed, readable layout); omit it to auto-assign positionally instead.
+#
+#   Deploy:  ansible-playbook playbooks/deploy.yml       -i spur.conf.ha-wireguard.example -e spur_transport=wireguard
+#   Remove:  ansible-playbook playbooks/remove_nodes.yml -i spur.conf.ha-wireguard.example -e spur_transport=wireguard -e nodes_to_remove=worker-1
+#   Re-add:  ansible-playbook playbooks/add_nodes.yml    -i spur.conf.ha-wireguard.example -e spur_transport=wireguard -e new_nodes=worker-1
+#
+# spur_transport is still an ansible-side variable (gates which roles/tasks
+# run), separate from this file's [network].wg_enabled — pass both.
+#
+# Copy this to a real file and fill in your hosts/credentials — do not commit
+# real IPs/hostnames.
+
+cluster_name = "ha-wireguard-cluster"
+
+[ansible]
+default_user = "root"
+exclude_sections = []
+
+[controller]
+listen_addr = "[::]:6817"
+hosts = ["10.44.0.1", "10.44.0.2", "10.44.0.3"]
+state_dir = "/opt/spur/state"
+raft_listen_addr = "[::]:6821"
+
+[scheduler]
+plugin = "backfill"
+interval_secs = 1
+
+[network]
+wg_enabled = true
+wg_interface = "spur0"
+wg_cidr = "10.44.0.0/16"
+wg_port = 51820
+agent_port = 6818
+
+# Every controller also runs spurd so it registers as a node and stays in the
+# mesh membership (a mesh member that never registers is pruned from every
+# peer). ansible_host here is each controller's real, reachable LAN address —
+# distinct from its WG mesh address (ansible_wg_address).
+[[nodes]]
+names = "ctl-0"
+ansible_host = "10.0.0.10"
+ansible_wg_address = "10.44.0.1"
+
+[[nodes]]
+names = "ctl-1"
+ansible_host = "10.0.0.11"
+ansible_wg_address = "10.44.0.2"
+
+[[nodes]]
+names = "ctl-2"
+ansible_host = "10.0.0.12"
+ansible_wg_address = "10.44.0.3"
+
+[[nodes]]
+names = "worker-1"
+ansible_host = "10.0.0.21"
+ansible_wg_address = "10.44.0.4"
+
+[[partitions]]
+name = "default"
+default = true
+nodes = "ctl-0,ctl-1,ctl-2,worker-1"
+max_time = "INFINITE"
