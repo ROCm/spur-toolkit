@@ -1052,6 +1052,10 @@ jobs:
             case "$st" in running|degraded) break ;; esac
             sleep 2
           done
+          # gpu-4 is created after "Install in-container preflight deps" already
+          # ran for $NODES — spur_install's own preflight check requires curl/tar,
+          # neither present in the base image, so it needs the same treatment here.
+          docker exec gpu-4 bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
           sed -i '/^\[spur_agents\]/a gpu-4' ansible/inventory/ci.ini
           cat ansible/inventory/ci.ini
 
