@@ -88,13 +88,24 @@
 
 # spur.conf's [[nodes]] block needs ansible_processor_vcpus, ansible_memtotal_mb,
 # and ansible_hostname for every agent. These are only available after fact-gathering.
-# Playbooks that target agents before the controller role (deploy.yml, rolling_upgrade.yml)
-# gather facts on all hosts up front, so this is a no-op there. add_nodes.yml only
-# gathers facts for the new nodes by the time the controller role runs, so any
-# pre-existing agents may be missing facts — this task fills the gap.
-# ignore_unreachable/ignore_errors: a temporarily down agent (e.g. during a rolling
-# upgrade) must not abort the controller upgrade. The template uses | default() so
-# spur.conf is still rendered with the last-known or 0-fallback values for that node.
+# add_nodes.yml only gathers facts for the new nodes by the time the controller
+# role runs, so any pre-existing agents may be missing facts entirely — this task
+# fills that real gap and must stay enabled there
+# (spur_controller_gather_missing_agent_facts, default true).
+#
+# deploy.yml/rolling_upgrade.yml already gather facts on the whole cluster up
+# front (same ignore_unreachable tolerance), so by the time this task runs it
+# only ever re-targets a host that JUST failed that same gather moments ago —
+# a retry vanishingly unlikely to succeed. rolling_upgrade.yml disables this
+# (spur_controller_gather_missing_agent_facts: false, set on the role in
+# playbooks/rolling_upgrade.yml) because it's also the costliest place to run
+# it: the controllers play is serial:1, so with C controllers and N still-down
+# agents this retries every down agent, serially, C times over — pure downside
+# once the ServerAlive keepalive fix bounds each attempt instead of letting it
+# hang, since it's now a guaranteed-bounded wait for a guaranteed failure. The
+# template's | default(0) fallback (see spur.conf.j2) makes skipping it safe:
+# a still-unreachable agent gets cpus=0/memory_mb=0 in its [[nodes]] entry —
+# identical to what a failed retry would have produced anyway.
 - name: Gather facts for any agent missing them (needed for spur.conf [[nodes]] block)
   ansible.builtin.setup:
     gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
@@ -102,7 +113,9 @@
   delegate_facts: true
   loop: "{{ groups['spur_agents'] }}"
   run_once: true
-  when: hostvars[item].ansible_processor_vcpus is not defined
+  when: >-
+    (spur_controller_gather_missing_agent_facts | default(true) | bool) and
+    hostvars[item].ansible_processor_vcpus is not defined
   ignore_unreachable: true
   ignore_errors: true
 

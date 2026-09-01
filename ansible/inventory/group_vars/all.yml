@@ -111,6 +111,24 @@ spur_gather_subset:
   - hardware
   - distribution
 
+# SSH keepalive tuning (see ansible.cfg's ssh_args for ConnectTimeout/
+# ControlPersist, which are static and not overridable per-run). These bound
+# how long a task can block on a connection that's gone silent — e.g. an
+# agent that dropped off the network mid-play, or a stale ControlPersist
+# master socket — instead of hanging indefinitely. Deliberately looser than
+# ConnectTimeout: an established session can legitimately go quiet for a
+# while (a busy remote host under this playbook's own forks=20 concurrency, a
+# long-running install/copy task with no channel chatter), so this needs
+# enough slack to not misclassify a slow-but-reachable node as dead. Override
+# with -e if your fleet needs tighter failure detection (fast, reliable LAN)
+# or more slack (loaded nodes, high-latency/lossy network):
+#   -e spur_ssh_server_alive_interval=5 -e spur_ssh_server_alive_count_max=3
+ansible_ssh_extra_args: >-
+  -o ServerAliveInterval={{ spur_ssh_server_alive_interval | default(15) }}
+  -o ServerAliveCountMax={{ spur_ssh_server_alive_count_max | default(3) }}
+spur_ssh_server_alive_interval: 15
+spur_ssh_server_alive_count_max: 3
+
 # Logging
 spur_log_level: info
 

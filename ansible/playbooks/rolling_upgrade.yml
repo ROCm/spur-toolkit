@@ -126,6 +126,16 @@
         # is live and its config is known-good. Pass -e spur_overwrite_conf=true to
         # re-render it from the Ansible template (e.g. after changing inventory vars).
         spur_controller_skip_conf: "{{ not (spur_overwrite_conf | default(false) | bool) }}"
+        # This playbook already gathered facts for the whole cluster (controllers
+        # AND agents) with the same ignore_unreachable tolerance in the play just
+        # above — spur_controller's own per-agent re-gather only ever re-targets a
+        # host that already failed that gather moments ago, a retry vanishingly
+        # unlikely to succeed. Worse, this play is serial:1, so with C controllers
+        # and N still-unreachable agents that retry runs N times over, C times
+        # over. Skip it here; see spur_controller/tasks/main.yml for why that's
+        # safe (the spur.conf template's | default(0) fallback already covers a
+        # missing agent's facts identically either way).
+        spur_controller_gather_missing_agent_facts: false
 
 - name: Rolling upgrade — agents, drained and upgraded in batches
   hosts: spur_agents
