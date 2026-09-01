@@ -1052,7 +1052,6 @@ jobs:
             case "$st" in running|degraded) break ;; esac
             sleep 2
           done
-          docker exec gpu-4 systemctl enable --now docker
           sed -i '/^\[spur_agents\]/a gpu-4' ansible/inventory/ci.ini
           cat ansible/inventory/ci.ini
 
