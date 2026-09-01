@@ -1029,12 +1029,63 @@ jobs:
             && { echo "FAIL: add_nodes.yml -e spur_overwrite_conf=true did not overwrite spur.conf on ctl-0"; exit 1; } \
             || echo "PASS: spur.conf re-rendered on ctl-0 (sentinel gone)"
 
+      # --- add_nodes.yml must verify registration by the real hostname, not
+      # the inventory alias — those two are only the same by convention, and
+      # every OTHER container in this suite is started with --hostname equal
+      # to its inventory name, so none of them would ever catch a regression
+      # here. gpu-4 is deliberately given a --hostname that differs from its
+      # inventory alias to close that gap.
+      - name: Start gpu-4 with a hostname that deliberately differs from its inventory alias
+        env:
+          IMG: jrei/systemd-ubuntu:22.04
+        run: |
+          set -euo pipefail
+          docker run -d --name gpu-4 --hostname gpu-4-real-hostname \
+            --network spur-ci \
+            --privileged \
+            --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+            "$IMG"
+          for i in $(seq 1 30); do
+            st=$(docker exec gpu-4 systemctl is-system-running 2>/dev/null || true)
+            case "$st" in running|degraded) break ;; esac
+            sleep 2
+          done
+          # gpu-4 is created after "Install in-container preflight deps" already
+          # ran for $NODES — spur_install's own preflight check requires curl/tar,
+          # neither present in the base image, so it needs the same treatment here.
+          docker exec gpu-4 bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
+          sed -i '/^\[spur_agents\]/a gpu-4' ansible/inventory/ci.ini
+          cat ansible/inventory/ci.ini
+
+      - name: add_nodes.yml gpu-4 (inventory alias "gpu-4" != real hostname "gpu-4-real-hostname")
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/add_nodes.yml \
+            -e new_nodes=gpu-4 \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur
+
+      - name: Assert gpu-4 registered under its real hostname, not the inventory alias
+        run: |
+          set -euo pipefail
+          docker exec ctl-0 /usr/local/bin/spur show node gpu-4-real-hostname 2>/dev/null \
+            | grep -qx "NodeName=gpu-4-real-hostname" \
+            || { echo "FAIL: gpu-4 should have registered as gpu-4-real-hostname"; docker exec ctl-0 /usr/local/bin/spur nodes; exit 1; }
+          docker exec ctl-0 /usr/local/bin/spur show node gpu-4 2>/dev/null \
+            | grep -qx "NodeName=gpu-4" \
+            && { echo "FAIL: gpu-4 should NOT be registered under its inventory alias"; exit 1; }
+          echo "PASS: add_nodes.yml verified gpu-4 by its real hostname, not the inventory alias"
+
       # TODO(next): manage_accounts.yml / healthcheck.yml
 
       - name: Dump logs on failure
         if: failure()
         run: |
-          for n in $NODES; do
+          for n in $NODES gpu-4; do
             echo "===== $n journal (spur*) ====="
             docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -50' || true
           done
@@ -1042,7 +1093,7 @@ jobs:
       - name: Teardown containers
         if: always()
         run: |
-          for n in $NODES; do docker rm -f "$n" || true; done
+          for n in $NODES gpu-4; do docker rm -f "$n" || true; done
           docker network rm spur-ci || true
 
   # ---------------------------------------------------------------------------

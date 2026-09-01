@@ -171,13 +171,22 @@
     - name: Wait for each new node to appear in the cluster
       # grep the exact NodeName= line — `spur show node` doesn't filter, so a bare
       # rc check would pass even if the node never registered.
+      #
+      # Check by spur_node_name (the name the agent actually registered
+      # under — ansible_hostname, resolved per-host in "Bring new agents
+      # online" above), NOT the bare inventory alias (item/add_list). Those
+      # two are only the same when the inventory alias happens to match the
+      # machine's real hostname — not guaranteed, and when they differ this
+      # loop was checking for a NodeName that could never appear, reporting
+      # "did not register" for a node that actually registered fine, just
+      # under its real name.
       ansible.builtin.shell: |
         for i in $(seq 1 30); do
-          {{ spur_install_dir }}/spur show node {{ item }} 2>/dev/null \
-            | grep -qx "NodeName={{ item }}" && exit 0
+          {{ spur_install_dir }}/spur show node {{ hostvars[item].spur_node_name | default(item) }} 2>/dev/null \
+            | grep -qx "NodeName={{ hostvars[item].spur_node_name | default(item) }}" && exit 0
           sleep 1
         done
-        echo "{{ item }} did not register within 30s"
+        echo "{{ item }} ({{ hostvars[item].spur_node_name | default(item) }}) did not register within 30s"
         exit 1
       args:
         executable: /bin/bash
