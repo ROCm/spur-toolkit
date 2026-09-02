@@ -324,9 +324,11 @@ jobs:
             docker exec "$a" bash -c '[ "$(readlink /usr/local/bin/squeue)" = /usr/local/bin/spur ]'
             # docker exec skips PAM's /etc/environment sourcing a real SSH login
             # shell does — set -a so `source` exports to the spur child process too.
-            docker exec "$a" bash -c 'set -a; source /etc/environment; set +a; /usr/local/bin/spur nodes' \
-              | grep -q "NodeName=" \
-              || { echo "FAIL: spur CLI on $a could not list cluster nodes"; exit 1; }
+            # `spur nodes` (plural) prints a sinfo-style table with no NodeName=
+            # field — show node <name> matches the grep pattern used elsewhere here.
+            docker exec "$a" bash -c "set -a; source /etc/environment; set +a; /usr/local/bin/spur show node $a" \
+              | grep -q "NodeName=$a" \
+              || { echo "FAIL: spur CLI on $a could not find its own node entry"; exit 1; }
           done
           echo "spur CLI present and working on all agents (direct transport)"
 
