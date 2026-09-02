@@ -316,6 +316,26 @@ jobs:
           done
           echo "MPI plugin present on all agents"
 
+      - name: Assert spur CLI works locally on agents under direct transport
+        run: |
+          set -euo pipefail
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" test -x /usr/local/bin/spur
+            docker exec "$a" bash -c '[ "$(readlink /usr/local/bin/squeue)" = /usr/local/bin/spur ]'
+            # docker exec skips PAM's /etc/environment sourcing a real SSH login
+            # shell does — set -a so `source` exports to the spur child process too.
+            # Diagnostic only (never gates): the real assertion is the spur
+            # invocation below, checked by its actual output, not this exit code.
+            docker exec "$a" bash -c 'set -a; source /etc/environment; set +a; env | grep ^SPUR_CONTROLLER_ADDR' \
+              || echo "(SPUR_CONTROLLER_ADDR not set on $a)"
+            # `spur nodes` (plural) prints a sinfo-style table with no NodeName=
+            # field — show node <name> matches the grep pattern used elsewhere here.
+            out=$(docker exec "$a" bash -c "set -a; source /etc/environment; set +a; /usr/local/bin/spur show node $a" 2>&1)
+            echo "$out" | grep -qx "NodeName=$a" \
+              || { echo "FAIL: spur CLI on $a could not find its own node entry"; echo "--- output ---"; echo "$out"; exit 1; }
+          done
+          echo "spur CLI present and working on all agents (direct transport)"
+
       - name: Assert a job runs to completion
         run: |
           set -euo pipefail
@@ -820,6 +840,20 @@ jobs:
             docker exec "$a" test -f /usr/lib/spur/spur_mpi_pmix.so
           done
           echo "MPI plugin present on all agents"
+
+      - name: Assert spur CLI works locally on agents under direct transport
+        run: |
+          set -euo pipefail
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" test -x /usr/local/bin/spur
+            docker exec "$a" bash -c '[ "$(readlink /usr/local/bin/squeue)" = /usr/local/bin/spur ]'
+            docker exec "$a" bash -c 'set -a; source /etc/environment; set +a; env | grep ^SPUR_CONTROLLER_ADDR' \
+              || echo "(SPUR_CONTROLLER_ADDR not set on $a)"
+            out=$(docker exec "$a" bash -c "set -a; source /etc/environment; set +a; /usr/local/bin/spur show node $a" 2>&1)
+            echo "$out" | grep -qx "NodeName=$a" \
+              || { echo "FAIL: spur CLI on $a could not find its own node entry"; echo "--- output ---"; echo "$out"; exit 1; }
+          done
+          echo "spur CLI present and working on all agents (direct transport)"
 
       # --- Agents get their own minimal spur.conf, at the same path as controllers ---
       - name: Assert agents get a minimal spur.conf (not the controller's full file), and spurd loaded it

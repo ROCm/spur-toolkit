@@ -1,9 +1,8 @@
 ---
 - name: Determine which Spur components this host needs
-  # Under wireguard, agents also need the `spur` CLI — spur_wireguard runs `spur net join` on
-  # each agent. In direct transport agents need only spurd.
+  # Every host this role runs on (controller, agent, or login) gets the `spur`
+  # CLI — squeue/sinfo/etc. work locally on any node regardless of spur_transport.
   ansible.builtin.set_fact:
-    spur_needs_cli: "{{ inventory_hostname in groups['spur_controllers'] or inventory_hostname in groups.get('spur_login', []) or (spur_transport | default('direct') == 'wireguard' and inventory_hostname in groups['spur_agents']) }}"
     spur_needs_ctld: "{{ inventory_hostname in groups['spur_controllers'] }}"
     spur_needs_agent_bin: "{{ inventory_hostname in groups['spur_agents'] }}"
 
@@ -30,7 +29,7 @@
       echo "non-spur process(es) on spur ports: $bad"
       exit 1
     fi
-    [ -e "{{ spur_install_dir }}/{{ 'spur' if spur_needs_cli else 'spurd' }}" ] && echo MARKER_EXISTS
+    [ -e "{{ spur_install_dir }}/spur" ] && echo MARKER_EXISTS
     if grep -q "{{ spur_install_dir }}" /etc/environment 2>/dev/null; then
       echo PATH_ALREADY_SET
     else
@@ -67,7 +66,7 @@
     dest: "{{ spur_install_dir }}/{{ item }}"
     mode: "0755"
   loop: >-
-    {{ (['spur'] if spur_needs_cli else [])
+    {{ ['spur']
        + (['spurctld'] if spur_needs_ctld else [])
        + (['spurd'] if spur_needs_agent_bin else []) }}
   when: spur_binary_src | default('') | length > 0
@@ -90,19 +89,17 @@
 # pre-merge spurdbd binary and any component this host role doesn't need
 # (a host upgraded from an older role revision, or moved between inventory
 # groups, can carry binaries a prior run copied unconditionally), verifies
-# every needed binary is present, and (CLI hosts only) creates all 18
-# Slurm-compatible symlinks — or removes them on a host that doesn't need
-# the CLI. One round-trip instead of a stat-per-binary and a module-call-
+# every needed binary is present, and creates all 18 Slurm-compatible
+# symlinks. One round-trip instead of a stat-per-binary and a module-call-
 # per-symlink over the wire.
-- name: Remove unneeded binaries/symlinks, verify needed binaries, symlink Slurm-compatible CLI names
+- name: Remove unneeded binaries, verify needed binaries, symlink Slurm-compatible CLI names
   vars:
     spur_needed_bins: >-
-      {{ (['spur'] if spur_needs_cli else [])
+      {{ ['spur']
          + (['spurctld'] if spur_needs_ctld else [])
          + (['spurd'] if spur_needs_agent_bin else []) }}
     spur_unneeded_bins: >-
       {{ (['spurctld'] if not spur_needs_ctld else [])
-         + (['spur'] if not spur_needs_cli else [])
          + (['spurd'] if not spur_needs_agent_bin else []) }}
   ansible.builtin.shell: |
     set -e
@@ -113,7 +110,6 @@
     for b in {{ spur_needed_bins | join(' ') }}; do
       [ -f "{{ spur_install_dir }}/$b" ] || { echo "missing binary: $b"; exit 1; }
     done
-    {% if spur_needs_cli %}
     changed=0
     for s in sbatch squeue sinfo scancel sacct sacctmgr scontrol salloc srun sattach scrontab sdiag smd sprio sreport sshare sstat strigger; do
       link="{{ spur_install_dir }}/$s"
@@ -121,11 +117,6 @@
       ln -sf "{{ spur_install_dir }}/spur" "$link"
     done
     [ "$changed" -eq 1 ] && echo SYMLINKS_UPDATED
-    {% else %}
-    for s in sbatch squeue sinfo scancel sacct sacctmgr scontrol salloc srun sattach scrontab sdiag smd sprio sreport sshare sstat strigger; do
-      rm -f "{{ spur_install_dir }}/$s"
-    done
-    {% endif %}
     exit 0
   args:
     executable: /bin/bash

@@ -20,18 +20,16 @@
       {{ (spur_controller_endpoints | default([])) + ["http://" ~ controller_ip ~ ":" ~ spur_controller_port] }}
   loop: "{{ groups['spur_controllers'] }}"
 
-# CLI on agents must target the controller over the same transport spurd uses (mesh IP under
-# wireguard), not the node's own underlay IP left over from a prior run.
-- name: Set SPUR_CONTROLLER_ADDR in /etc/environment (agents with the CLI)
+# Every agent gets the CLI now (spur_install always installs it), so this is
+# unconditional — CLI on agents must target the controller over the same
+# transport spurd uses (mesh IP under wireguard), not the node's own underlay
+# IP left over from a prior run.
+- name: Set SPUR_CONTROLLER_ADDR in /etc/environment (every agent has the CLI)
   ansible.builtin.lineinfile:
     path: /etc/environment
     regexp: '^SPUR_CONTROLLER_ADDR='
     line: "SPUR_CONTROLLER_ADDR={{ spur_controller_endpoints | join(',') }}"
     create: true
-  when: >-
-    (spur_transport | default('direct') == 'wireguard')
-    or (inventory_hostname in groups['spur_controllers'])
-    or (inventory_hostname in groups.get('spur_login', []))
 
 - name: Ensure MPI plugin directory exists
   ansible.builtin.file:

@@ -82,7 +82,7 @@ Release and nightly tarballs from [ROCm/spur](https://github.com/ROCm/spur/relea
 
 > A pre-merge build (before upstream folded `spurdbd` into `spurctld`) also produces a `spurdbd` binary. It's harmless sitting alongside the other three — the role only ever reads `spur`/`spurctld`/`spurd` by exact name.
 
-**Each host only gets the binaries it needs.** Agent-only hosts (in `[spur_agents]` but not `[spur_controllers]`/`[spur_login]`) get `spurd` only — no `spur` CLI, no `spurctld`, no Slurm symlinks. Controllers get `spur` + `spurctld` + symlinks (and `spurd` too if also an agent); login nodes get `spur` + symlinks. This keeps compute nodes free of an interactive CLI and the controller daemon they never run.
+**Every host gets the `spur` CLI + Slurm symlinks.** Agent-only hosts (in `[spur_agents]` but not `[spur_controllers]`/`[spur_login]`) also get `spurd`; controllers also get `spurctld` (and `spurd` too if also an agent). Only `spurctld` (the controller daemon) is host-specific — the CLI is everywhere so `squeue`/`sinfo`/etc. work locally on any node.
 
 Omit `spur_binary_src` and the playbook falls back to downloading a published release via upstream `install.sh` instead (see [Build prerequisites](#build-prerequisites)).
 
@@ -197,7 +197,7 @@ ctl-1 ansible_host=10.0.0.11 ansible_user=root
 ctl-2 ansible_host=10.0.0.12 ansible_user=root
 
 [spur_agents]
-gpu-1 ansible_host=10.0.0.21 ansible_user=root   ; dedicated compute — no spurctld, no spur CLI/symlinks
+gpu-1 ansible_host=10.0.0.21 ansible_user=root   ; dedicated compute — no spurctld
 gpu-2 ansible_host=10.0.0.22 ansible_user=root
 ```
 
@@ -349,7 +349,7 @@ ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_accounting_
 
 Every controller connects to the accounting host over the network; the role opens `listen_addresses`/`pg_hba.conf` for each controller's IP. If the host's PostgreSQL isn't on the default port, pass `-e spur_accounting_db_port=<port>`.
 
-On **controller nodes**, the playbook writes `SPUR_CONTROLLER_ADDR` (listing every controller) to `/etc/environment`. This means the whole CLI works there with no per-command flags — `squeue`/`sinfo`/`scontrol` and `sacct`/`sacctmgr`/`sreport`/`sshare` alike. Accounting rides the same address; there's no separate env var for it anymore. On non-controller nodes, or to override, set it yourself:
+On every managed host (controllers, agents, login nodes), the playbook writes `SPUR_CONTROLLER_ADDR` (listing every controller) to `/etc/environment`. This means the whole CLI works everywhere with no per-command flags — `squeue`/`sinfo`/`scontrol` and `sacct`/`sacctmgr`/`sreport`/`sshare` alike. Accounting rides the same address; there's no separate env var for it anymore. On a host outside the managed inventory, or to override, set it yourself:
 
 ```bash
 export SPUR_CONTROLLER_ADDR=http://<a-controller>:6817[,http://<another>:6817,...]
