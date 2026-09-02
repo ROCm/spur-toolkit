@@ -331,7 +331,7 @@ jobs:
             # `spur nodes` (plural) prints a sinfo-style table with no NodeName=
             # field — show node <name> matches the grep pattern used elsewhere here.
             out=$(docker exec "$a" bash -c "set -a; source /etc/environment; set +a; /usr/local/bin/spur show node $a" 2>&1)
-            echo "$out" | grep -q "NodeName=$a" \
+            echo "$out" | grep -qx "NodeName=$a" \
               || { echo "FAIL: spur CLI on $a could not find its own node entry"; echo "--- output ---"; echo "$out"; exit 1; }
           done
           echo "spur CLI present and working on all agents (direct transport)"
@@ -850,7 +850,7 @@ jobs:
             docker exec "$a" bash -c 'set -a; source /etc/environment; set +a; env | grep ^SPUR_CONTROLLER_ADDR' \
               || echo "(SPUR_CONTROLLER_ADDR not set on $a)"
             out=$(docker exec "$a" bash -c "set -a; source /etc/environment; set +a; /usr/local/bin/spur show node $a" 2>&1)
-            echo "$out" | grep -q "NodeName=$a" \
+            echo "$out" | grep -qx "NodeName=$a" \
               || { echo "FAIL: spur CLI on $a could not find its own node entry"; echo "--- output ---"; echo "$out"; exit 1; }
           done
           echo "spur CLI present and working on all agents (direct transport)"
