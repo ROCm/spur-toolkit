@@ -27,6 +27,10 @@
 # Controllers and agents both get spur.conf (spurd reads it best-effort for
 # [cluster]/k0s and [devices]/GRES settings). A missing spur.conf is always
 # written; an existing one is left alone unless you pass -e spur_overwrite_conf=true.
+#
+# First run against a pre-existing direct-transport agent that predates the
+# spur-CLI-everywhere change: it won't have `spur` yet, so this run re-fetches
+# the release (network dependency) to install it, once.
 
 - name: Preflight + install Spur on all hosts
   # Accounting is embedded in spurctld now — a dedicated (non-controller/non-agent)

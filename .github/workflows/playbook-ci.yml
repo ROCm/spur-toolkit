@@ -316,6 +316,20 @@ jobs:
           done
           echo "MPI plugin present on all agents"
 
+      - name: Assert spur CLI works locally on agents under direct transport
+        run: |
+          set -euo pipefail
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" test -x /usr/local/bin/spur
+            docker exec "$a" bash -c '[ "$(readlink /usr/local/bin/squeue)" = /usr/local/bin/spur ]'
+            # docker exec skips PAM's /etc/environment sourcing that a real SSH
+            # login shell does — source it explicitly to match.
+            docker exec "$a" bash -c 'source /etc/environment && /usr/local/bin/spur nodes' \
+              | grep -q "NodeName=" \
+              || { echo "FAIL: spur CLI on $a could not list cluster nodes"; exit 1; }
+          done
+          echo "spur CLI present and working on all agents (direct transport)"
+
       - name: Assert a job runs to completion
         run: |
           set -euo pipefail
@@ -820,6 +834,18 @@ jobs:
             docker exec "$a" test -f /usr/lib/spur/spur_mpi_pmix.so
           done
           echo "MPI plugin present on all agents"
+
+      - name: Assert spur CLI works locally on agents under direct transport
+        run: |
+          set -euo pipefail
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" test -x /usr/local/bin/spur
+            docker exec "$a" bash -c '[ "$(readlink /usr/local/bin/squeue)" = /usr/local/bin/spur ]'
+            docker exec "$a" bash -c 'source /etc/environment && /usr/local/bin/spur nodes' \
+              | grep -q "NodeName=" \
+              || { echo "FAIL: spur CLI on $a could not list cluster nodes"; exit 1; }
+          done
+          echo "spur CLI present and working on all agents (direct transport)"
 
       # --- Agents get their own minimal spur.conf, at the same path as controllers ---
       - name: Assert agents get a minimal spur.conf (not the controller's full file), and spurd loaded it
