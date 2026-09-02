@@ -324,9 +324,13 @@ jobs:
             docker exec "$a" bash -c '[ "$(readlink /usr/local/bin/squeue)" = /usr/local/bin/spur ]'
             # docker exec skips PAM's /etc/environment sourcing a real SSH login
             # shell does — set -a so `source` exports to the spur child process too.
+            # Diagnostic only (never gates): the real assertion is the spur
+            # invocation below, checked by its actual output, not this exit code.
+            docker exec "$a" bash -c 'set -a; source /etc/environment; set +a; env | grep ^SPUR_CONTROLLER_ADDR' \
+              || echo "(SPUR_CONTROLLER_ADDR not set on $a)"
             # `spur nodes` (plural) prints a sinfo-style table with no NodeName=
             # field — show node <name> matches the grep pattern used elsewhere here.
-            out=$(docker exec "$a" bash -c "set -a; source /etc/environment; set +a; env | grep ^SPUR_CONTROLLER_ADDR; /usr/local/bin/spur show node $a" 2>&1)
+            out=$(docker exec "$a" bash -c "set -a; source /etc/environment; set +a; /usr/local/bin/spur show node $a" 2>&1)
             echo "$out" | grep -q "NodeName=$a" \
               || { echo "FAIL: spur CLI on $a could not find its own node entry"; echo "--- output ---"; echo "$out"; exit 1; }
           done
@@ -843,7 +847,9 @@ jobs:
           for a in gpu-1 gpu-2 gpu-3; do
             docker exec "$a" test -x /usr/local/bin/spur
             docker exec "$a" bash -c '[ "$(readlink /usr/local/bin/squeue)" = /usr/local/bin/spur ]'
-            out=$(docker exec "$a" bash -c "set -a; source /etc/environment; set +a; env | grep ^SPUR_CONTROLLER_ADDR; /usr/local/bin/spur show node $a" 2>&1)
+            docker exec "$a" bash -c 'set -a; source /etc/environment; set +a; env | grep ^SPUR_CONTROLLER_ADDR' \
+              || echo "(SPUR_CONTROLLER_ADDR not set on $a)"
+            out=$(docker exec "$a" bash -c "set -a; source /etc/environment; set +a; /usr/local/bin/spur show node $a" 2>&1)
             echo "$out" | grep -q "NodeName=$a" \
               || { echo "FAIL: spur CLI on $a could not find its own node entry"; echo "--- output ---"; echo "$out"; exit 1; }
           done

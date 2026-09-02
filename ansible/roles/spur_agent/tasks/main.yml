@@ -20,11 +20,11 @@
       {{ (spur_controller_endpoints | default([])) + ["http://" ~ controller_ip ~ ":" ~ spur_controller_port] }}
   loop: "{{ groups['spur_controllers'] }}"
 
-# Every agent gets the CLI now (spur_needs_cli, spur_install role), so this is
+# Every agent gets the CLI now (spur_install always installs it), so this is
 # unconditional — CLI on agents must target the controller over the same
 # transport spurd uses (mesh IP under wireguard), not the node's own underlay
 # IP left over from a prior run.
-- name: Set SPUR_CONTROLLER_ADDR in /etc/environment (agents with the CLI)
+- name: Set SPUR_CONTROLLER_ADDR in /etc/environment (every agent has the CLI)
   ansible.builtin.lineinfile:
     path: /etc/environment
     regexp: '^SPUR_CONTROLLER_ADDR='
