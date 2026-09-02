@@ -326,9 +326,9 @@ jobs:
             # shell does — set -a so `source` exports to the spur child process too.
             # `spur nodes` (plural) prints a sinfo-style table with no NodeName=
             # field — show node <name> matches the grep pattern used elsewhere here.
-            docker exec "$a" bash -c "set -a; source /etc/environment; set +a; /usr/local/bin/spur show node $a" \
-              | grep -q "NodeName=$a" \
-              || { echo "FAIL: spur CLI on $a could not find its own node entry"; exit 1; }
+            out=$(docker exec "$a" bash -c "set -a; source /etc/environment; set +a; env | grep ^SPUR_CONTROLLER_ADDR; /usr/local/bin/spur show node $a" 2>&1)
+            echo "$out" | grep -q "NodeName=$a" \
+              || { echo "FAIL: spur CLI on $a could not find its own node entry"; echo "--- output ---"; echo "$out"; exit 1; }
           done
           echo "spur CLI present and working on all agents (direct transport)"
 
@@ -843,9 +843,9 @@ jobs:
           for a in gpu-1 gpu-2 gpu-3; do
             docker exec "$a" test -x /usr/local/bin/spur
             docker exec "$a" bash -c '[ "$(readlink /usr/local/bin/squeue)" = /usr/local/bin/spur ]'
-            docker exec "$a" bash -c "set -a; source /etc/environment; set +a; /usr/local/bin/spur show node $a" \
-              | grep -q "NodeName=$a" \
-              || { echo "FAIL: spur CLI on $a could not find its own node entry"; exit 1; }
+            out=$(docker exec "$a" bash -c "set -a; source /etc/environment; set +a; env | grep ^SPUR_CONTROLLER_ADDR; /usr/local/bin/spur show node $a" 2>&1)
+            echo "$out" | grep -q "NodeName=$a" \
+              || { echo "FAIL: spur CLI on $a could not find its own node entry"; echo "--- output ---"; echo "$out"; exit 1; }
           done
           echo "spur CLI present and working on all agents (direct transport)"
 
