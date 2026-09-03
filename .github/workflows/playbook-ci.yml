@@ -469,6 +469,92 @@ jobs:
             echo "PASS: rolling_upgrade.yml validated spur_controller_upgrade_order before touching any host"
           fi
 
+      # --- rolling_upgrade.yml --limit scopes to specific agents only -------
+      # --limit intersects with EVERY play's hosts:, not just the one the
+      # operator has in mind: it also empties out the "Guard rails" preflight
+      # play (hosts: spur_controllers[0]) and the controllers play, since
+      # neither pattern includes the limited-to agent. Confirms both the
+      # intended behavior (only the named agent is touched) and that gotcha
+      # (the preflight health check + controller are silently skipped, not
+      # run and passing) — see --list-hosts output below for the whole play
+      # topology this asserts against.
+      - name: rolling_upgrade.yml --limit gpu-1 — dry-run play topology
+        working-directory: ansible
+        run: |
+          set -euo pipefail
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            --limit gpu-1 \
+            --list-hosts | tee /tmp/limit-list-hosts.out
+
+          assert_hosts() {
+            # $1 = play name substring, $2.. = expected hosts (space-separated, "" = none)
+            local play="$1"; shift
+            local expected="$*"
+            local block actual
+            block=$(awk -v p="$play" '
+              $0 ~ p { found=1 }
+              found && /hosts \(/ { print; capture=1; next }
+              found && capture && /^      / { print }
+              found && capture && !/^      / && !/hosts \(/ { exit }
+            ' /tmp/limit-list-hosts.out)
+            actual=$(echo "$block" | tail -n +2 | awk '{$1=$1};1' | tr '\n' ' ' | awk '{$1=$1};1')
+            [ "$actual" = "$expected" ] || {
+              echo "FAIL: play '$play' hosts = '$actual', expected = '$expected'"
+              echo "$block"
+              exit 1
+            }
+            echo "PASS: play '$play' hosts = '${actual:-<none>}'"
+          }
+
+          assert_hosts "Guard rails" ""
+          assert_hosts "Gather facts across the whole cluster" "gpu-1"
+          assert_hosts "Rolling upgrade — controllers" ""
+          assert_hosts "Rolling upgrade — agents" "gpu-1"
+
+      - name: rolling_upgrade.yml --limit gpu-1 — real run
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            --limit gpu-1
+
+      - name: Assert --limit gpu-1 only upgraded gpu-1 — controller and other agents untouched
+        run: |
+          set -euo pipefail
+          new_sum=$(sha256sum "$GITHUB_WORKSPACE/spur-bin-new/spurd" | awk '{print $1}')
+          old_sum=$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurd" | awk '{print $1}')
+          old_ctld_sum=$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurctld" | awk '{print $1}')
+
+          gpu1_sum=$(docker exec gpu-1 sha256sum /usr/local/bin/spurd | awk '{print $1}')
+          [ "$gpu1_sum" = "$new_sum" ] || { echo "FAIL: gpu-1's spurd should match spur-bin-new (got $gpu1_sum)"; exit 1; }
+          echo "PASS: gpu-1's spurd upgraded to spur-bin-new"
+
+          for a in gpu-2 gpu-3; do
+            sum=$(docker exec "$a" sha256sum /usr/local/bin/spurd | awk '{print $1}')
+            [ "$sum" = "$old_sum" ] || { echo "FAIL: $a's spurd should be untouched (still spur-bin, got $sum)"; exit 1; }
+            echo "PASS: $a's spurd untouched (still spur-bin)"
+          done
+
+          ctld_sum=$(docker exec ctl-0 sha256sum /usr/local/bin/spurctld | awk '{print $1}')
+          [ "$ctld_sum" = "$old_ctld_sum" ] || { echo "FAIL: ctl-0's spurctld should be untouched (still spur-bin, got $ctld_sum)"; exit 1; }
+          echo "PASS: ctl-0's spurctld untouched (still spur-bin) — controllers play correctly skipped"
+
+          found=""
+          for i in $(seq 1 30); do
+            docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null \
+              | grep -qx "NodeName=gpu-1" && { found=1; break; }
+            sleep 2
+          done
+          [ -n "$found" ] || { echo "FAIL: gpu-1 did not re-register after --limit upgrade"; exit 1; }
+          echo "PASS: gpu-1 re-registered after --limit upgrade"
+
       # --- Pass 1: resilience (3 agent states in one run) ------------------
       - name: Simulate gpu-2 unreachable and gpu-3 busy
         run: |

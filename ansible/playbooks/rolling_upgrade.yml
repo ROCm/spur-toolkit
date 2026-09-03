@@ -101,8 +101,13 @@
   gather_facts: yes
   gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   # ignore_unreachable: a temporarily down agent must not abort the whole upgrade.
-  # The spur_controller role's setup task will re-attempt fact-gathering for any
-  # agent still missing facts when spur.conf is re-rendered.
+  # The later per-host plays below also say gather_facts: yes — with
+  # ansible.cfg's gathering=smart that's a no-op for a host already covered
+  # here, but still re-scans one that's still missing facts (e.g. it was down
+  # for this gather and has since recovered). spur_controller's own per-agent
+  # re-gather (spur_controller_gather_missing_agent_facts) is deliberately
+  # disabled below instead — see that var's use further down for why a
+  # same-moment retry there is different from this later-play retry.
   ignore_unreachable: true
   tasks: []
 
