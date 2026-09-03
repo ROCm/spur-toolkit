@@ -60,14 +60,19 @@
     - name: Wait for every node's k0s component to stop and reset
       # Per-node teardown is fire-and-forget from the controller's reconcile loop (an
       # unreachable agent's role is cleared best-effort rather than blocking this), so
-      # poll status until it reports phase down with no nodes still carrying a k0s role.
+      # poll until phase is down AND no per-node status row remains (each is printed
+      # indented by two spaces) — phase alone flips to "down" immediately on request,
+      # before any node has actually finished resetting.
       ansible.builtin.shell: |
         set -o pipefail
-        {{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }} 2>/dev/null
+        out=$({{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }} 2>/dev/null)
+        phase=$(printf '%s\n' "$out" | awk -F': ' '/^phase:/ {print $2}')
+        node_lines=$(printf '%s\n' "$out" | grep -c '^  ' || true)
+        echo "phase=${phase} node_lines=${node_lines}"
       args:
         executable: /bin/bash
       register: k8s_teardown_status
-      until: "k8s_teardown_status.stdout | trim == 'phase: down'"
+      until: "k8s_teardown_status.stdout | trim == 'phase=down node_lines=0'"
       retries: "{{ k8s_teardown_retries }}"
       delay: "{{ k8s_teardown_delay }}"
       changed_when: false
