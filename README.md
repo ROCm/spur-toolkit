@@ -10,6 +10,7 @@ This repo is also packaged as a [Claude Code](.claude-plugin/plugin.json) / [Cur
 
 - **[`ansible/`](ansible/README.md)** — self-contained Ansible playbooks for bare-metal deployment. `playbooks/deploy.yml` covers single-node, multi-node, HA (multi-controller Raft), and HA-with-separate-compute topologies, with optional PostgreSQL/spurdbd accounting and WireGuard mesh; `playbooks/teardown.yml` tears a cluster back down. All playbooks share the same `roles/` and `inventory/`.
 - **[`skills/deploy-spur/`](skills/deploy-spur/SKILL.md)** — standalone Claude Code skill that drives the same deployment with only SSH + bash, no Ansible required. Useful for ad-hoc or one-off deploys.
+- **[`skills/diagnose-job/`](skills/diagnose-job/SKILL.md)** — Claude Code skill that diagnoses why a Spur job won't start, failed, timed out, got OOM-killed, or is otherwise misbehaving. Covers all job states and 40+ pending reasons.
 - **[`techsupport/`](techsupport/README.md)** — `spur-techsupport.sh`, a standalone SSH + bash script that collects a diagnostic bundle (logs, Raft state, sanitized config, cluster state, DB version) from a running native-host cluster into a single `.tar.gz`.
 
 The Ansible and skill paths reach the same end state (systemd-managed daemons, Slurm-compatible CLI symlinks) and are independent of each other — using one doesn't require the other to be present.
