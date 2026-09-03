@@ -1470,8 +1470,11 @@ jobs:
       - name: Assert k0s was torn down before any Spur daemon was stopped
         run: |
           set -euo pipefail
-          k0s_line=$(grep -n '^TASK \[spur k8s down --reset\]' /tmp/teardown-full.log | head -1 | cut -d: -f1)
-          stop_line=$(grep -n '^TASK \[Stop and disable Spur systemd services\]' /tmp/teardown-full.log | head -1 | cut -d: -f1)
+          # `|| true` on each: under pipefail, a no-match grep would otherwise make the
+          # assignment itself exit non-zero and (with -e) abort before the explicit
+          # [ -n ... ] checks below get a chance to print a real diagnostic.
+          k0s_line=$( (grep -n '^TASK \[spur k8s down --reset\]' /tmp/teardown-full.log || true) | head -1 | cut -d: -f1)
+          stop_line=$( (grep -n '^TASK \[Stop and disable Spur systemd services\]' /tmp/teardown-full.log || true) | head -1 | cut -d: -f1)
           [ -n "$k0s_line" ] || { echo "FAIL: teardown.yml never attempted 'spur k8s down' with spur_k8s_enabled=true"; exit 1; }
           [ -n "$stop_line" ] || { echo "FAIL: no daemon-stop task found in the log"; exit 1; }
           [ "$k0s_line" -lt "$stop_line" ] \
