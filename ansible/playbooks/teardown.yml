@@ -23,10 +23,11 @@
 # needs a live controller and live agents to reach every node. Skipped
 # entirely when spur_k8s_enabled is unset/false.
 #
-# This first play targets only the first controller — running with --limit in
-# a way that excludes every controller (e.g. --limit spur_agents) skips it
-# silently, so the agents' k0s components never get reset. Don't combine
-# --limit with spur_k8s_enabled=true unless a controller is included.
+# This first play targets specifically the FIRST controller (groups['spur_controllers'][0])
+# — running with --limit in a way that excludes that one host, even if other
+# controllers are included, skips it silently and leaves agents' k0s
+# components un-reset. Don't combine --limit with spur_k8s_enabled=true
+# unless the first controller is included.
 
 - name: Tear down any Spur-managed k0s cluster (full reset) before stopping Spur
   # Must run before both plays below: tearing a node's k0s component down is
@@ -65,7 +66,10 @@
       # before any node has actually finished resetting.
       ansible.builtin.shell: |
         set -o pipefail
-        out=$({{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }} 2>/dev/null)
+        if ! out=$({{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }} 2>&1); then
+          echo "spur k8s status failed: $out" >&2
+          exit 1
+        fi
         phase=$(printf '%s\n' "$out" | awk -F': ' '/^phase:/ {print $2}')
         node_lines=$(printf '%s\n' "$out" | grep -c '^  ' || true)
         echo "phase=${phase} node_lines=${node_lines}"
