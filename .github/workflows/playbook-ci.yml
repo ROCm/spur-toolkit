@@ -1453,15 +1453,37 @@ jobs:
             && { echo "FAIL: spurd should have been stopped on gpu-3"; exit 1; }
           echo "PASS: gpu-3's job was killed and spurd stopped by teardown.yml --force"
 
-      # --- teardown.yml basic smoke: full teardown stops every daemon ------
-      - name: teardown.yml (full cluster — basic smoke)
+      # --- teardown.yml basic smoke: full teardown stops every daemon, ------
+      # --- tearing down k0s (if enabled) first ------------------------------
+      - name: teardown.yml (full cluster — basic smoke, spur_k8s_enabled=true)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
+          set -euo pipefail
           ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
             -e spur_install_dir=/usr/local/bin \
-            -e spur_home=/opt/spur
+            -e spur_home=/opt/spur \
+            -e spur_k8s_enabled=true \
+            | tee /tmp/teardown-full.log
+
+      - name: Assert k0s was torn down before any Spur daemon was stopped
+        run: |
+          set -euo pipefail
+          # `|| true` on each: under pipefail, a no-match grep would otherwise make the
+          # assignment itself exit non-zero and (with -e) abort before the explicit
+          # [ -n ... ] checks below get a chance to print a real diagnostic.
+          k0s_line=$( (grep -n '^TASK \[spur k8s down --reset\]' /tmp/teardown-full.log || true) | head -1 | cut -d: -f1)
+          stop_line=$( (grep -n '^TASK \[Stop and disable Spur systemd services\]' /tmp/teardown-full.log || true) | head -1 | cut -d: -f1)
+          [ -n "$k0s_line" ] || { echo "FAIL: teardown.yml never attempted 'spur k8s down' with spur_k8s_enabled=true"; exit 1; }
+          [ -n "$stop_line" ] || { echo "FAIL: no daemon-stop task found in the log"; exit 1; }
+          [ "$k0s_line" -lt "$stop_line" ] \
+            || { echo "FAIL: k0s teardown ran at line $k0s_line, after daemons were stopped at line $stop_line"; exit 1; }
+          # A TASK header is printed whether or not `when:` skipped it, so also confirm
+          # it actually ran (ok/changed) rather than being silently skipped.
+          sed -n "${k0s_line},\$p" /tmp/teardown-full.log | sed -n '2,/^TASK \[/p' | grep -qE '^(ok|changed): \[ctl-0\]' \
+            || { echo "FAIL: 'spur k8s down' was listed but not actually executed (skipped?)"; exit 1; }
+          echo "PASS: k0s cluster teardown ran (not skipped) before any Spur daemon was stopped"
 
       - name: Assert every daemon is stopped after full teardown
         run: |
