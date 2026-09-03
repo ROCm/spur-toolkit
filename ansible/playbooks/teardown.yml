@@ -17,6 +17,61 @@
 # deploy.yml/rolling_upgrade.yml/remove_nodes.yml) before it's disrupted:
 #   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_skip_busy_agents=true            # drain first; leave a still-busy agent running, tear down the rest
 #   ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_force_teardown_busy_agents=true  # drain first; kill a still-busy agent's job and tear it down anyway
+#
+# If spur_k8s_enabled=true, any Spur-managed k0s cluster is torn down (`spur
+# k8s down --reset`) FIRST, before any Spur daemon is stopped — the reset
+# needs a live controller and live agents to reach every node. Skipped
+# entirely when spur_k8s_enabled is unset/false.
+#
+# This first play targets only the first controller — running with --limit in
+# a way that excludes every controller (e.g. --limit spur_agents) skips it
+# silently, so the agents' k0s components never get reset. Don't combine
+# --limit with spur_k8s_enabled=true unless a controller is included.
+
+- name: Tear down any Spur-managed k0s cluster (full reset) before stopping Spur
+  # Must run before both plays below: tearing a node's k0s component down is
+  # a controller -> agent RPC, so it needs spurctld AND spurd still running
+  # everywhere. spur_k8s_enabled=false (default) skips this play entirely.
+  # any_errors_fatal: without it, a failure here only drops this one host from
+  # this play — the daemon-stop plays below run regardless and leave k0s half
+  # torn down.
+  hosts: "{{ groups['spur_controllers'][0] }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    ctrl_addr: "http://{{ hostvars[groups['spur_controllers'][0]]['spur_controller_listen_ip'] | default('127.0.0.1') }}:{{ spur_controller_port }}"
+    k8s_teardown_retries: 60
+    k8s_teardown_delay: 15
+  tasks:
+    - name: spur k8s down --reset
+      # Idempotent: a cluster that's already down, or was never brought up,
+      # is accepted as a no-op — safe to call unconditionally when enabled.
+      ansible.builtin.command: >-
+        {{ spur_install_dir }}/spur k8s down --reset
+          --controller {{ ctrl_addr }}
+      register: k8s_down_out
+      changed_when: "'down requested' in k8s_down_out.stdout"
+      failed_when: >-
+        (k8s_down_out.rc != 0) or
+        ('NOT accepted' in (k8s_down_out.stderr | default('')))
+      when: spur_k8s_enabled | default(false) | bool
+
+    - name: Wait for every node's k0s component to stop and reset
+      # Per-node teardown is fire-and-forget from the controller's reconcile loop (an
+      # unreachable agent's role is cleared best-effort rather than blocking this), so
+      # poll status until it reports phase down with no nodes still carrying a k0s role.
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }} 2>/dev/null
+      args:
+        executable: /bin/bash
+      register: k8s_teardown_status
+      until: "k8s_teardown_status.stdout | trim == 'phase: down'"
+      retries: "{{ k8s_teardown_retries }}"
+      delay: "{{ k8s_teardown_delay }}"
+      changed_when: false
+      when: spur_k8s_enabled | default(false) | bool
 
 - name: Stop Spur daemons — agents
   # Kept as its own play (rather than merged with the one below) so
