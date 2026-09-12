@@ -6,7 +6,9 @@
 #   1. drain it (stop new scheduling; running jobs finish on their own)
 #   2. wait until it reports DRAINED
 #   3. stop + disable spurd on the node itself (if reachable in inventory)
-#   4. spur node remove --force (authoritative, WAL-durable removal)
+#   4. reap any job supervisor (spurstepd) still running there, and its session
+#      state — those are built to outlive the agent, so step 3 doesn't stop them
+#   5. spur node remove --force (authoritative, WAL-durable removal)
 # then remind the operator to drop it from [spur_agents] in inventory.
 #
 # Run:
@@ -177,6 +179,18 @@
         enabled: false
       when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
       failed_when: false
+
+    # A job supervisor is built to outlive its agent (own session, reparented
+    # to init, spared by the unit's KillMode=process), so stopping spurd above
+    # leaves one running on a host that is no longer part of any cluster. The
+    # node is being decommissioned and nothing will ever re-adopt its sessions,
+    # so the on-disk state goes with them. A cleanly drained node has neither,
+    # and the task is a no-op there.
+    - name: Reap job supervisors and session state on nodes being removed
+      ansible.builtin.include_tasks: tasks/reap_stepd_supervisors.yml
+      vars:
+        stepd_purge_sessions: true
+      when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
 
     # Mesh cleanup (wireguard only). Capture this node's pubkey so the controller can drop it as a
     # peer, then tear down its interface so it doesn't linger as a ghost peer or rejoin on reboot.

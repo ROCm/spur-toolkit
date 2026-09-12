@@ -12,6 +12,14 @@
 # It still kills any job processes/containers left on a disrupted agent (same
 # cgroup sweep rolling_upgrade.yml --force uses) — only the wait-for-drain
 # part is skipped, not the cleanup.
+#
+# Teardown also reaps the per-(job, step) supervisors (spurstepd). Those are
+# built to outlive their agent — their own session, reparented to init, and
+# spared by the unit's KillMode=process — so stopping spurd leaves them
+# running. Explicitly killing them is deliberate and is what "the cluster is
+# coming down" means; the opt-in drain above is how you let jobs finish on
+# their own instead. Session state on disk is left alone unless -e wipe=true,
+# so a teardown you intend to undo can still be undone.
 # Passing -e spur_skip_busy_agents=true or -e spur_force_teardown_busy_agents=true
 # opts back into draining each agent first (same job-safety model as
 # deploy.yml/rolling_upgrade.yml/remove_nodes.yml) before it's disrupted:
@@ -159,6 +167,18 @@
       args:
         executable: /bin/bash
       changed_when: false
+      when: spur_ok_to_disrupt
+
+    # After the daemons are down, not before: a live spurd would otherwise race
+    # this by reacting to the supervisor exits it is watching for.
+    - name: Reap job supervisors that outlived the agent
+      ansible.builtin.include_tasks: tasks/reap_stepd_supervisors.yml
+      vars:
+        # Sessions are what a restarted agent re-adopts its jobs from, so a
+        # non-wiping teardown leaves them on disk. -e wipe=true removes
+        # spur_home anyway; this also covers a spur_agent_state_dir pointed
+        # outside it.
+        stepd_purge_sessions: "{{ wipe | default(false) | bool }}"
       when: spur_ok_to_disrupt
 
     - name: Tear down WireGuard interface + disable its boot unit
