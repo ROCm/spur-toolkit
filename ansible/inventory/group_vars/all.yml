@@ -7,6 +7,33 @@ spur_version: latest                # latest | nightly | vX.Y.Z
 spur_install_dir: /root/.local/bin
 spur_home: /root/spur
 
+# spurstepd — the per-(job, step) supervisor spurd spawns. It MUST sit in the
+# same directory as spurd: the agent resolves it beside its own executable and
+# does not search $PATH, so a missing spurstepd fails every job launch on that
+# node. Builds that predate it ship no such binary, so spur_install installs it
+# whenever the install source provides one and warns prominently when it
+# doesn't. Set spur_require_stepd=true on a cluster whose build DOES ship it to
+# turn that warning into a hard failure (in spur_install, and in
+# healthcheck.yml's agent probe).
+spur_require_stepd: false
+
+# Where each agent keeps its own persisted runtime state — the supervisor
+# sessions that let a job survive an spurd restart (they live in a runtime/
+# subdirectory of this path). Deliberately NOT spur_home/state, which is the
+# controller's Raft directory: on a host that is both controller and agent the
+# two must not share a directory. Passed to spurd as SPUR_STEPD_STATE_DIR
+# rather than --state-dir, because a build that predates spurstepd ignores an
+# unknown environment variable but refuses to start on an unknown flag.
+spur_agent_state_dir: "{{ spur_home }}/agent-state"
+
+# Acknowledge that a rolling_upgrade.yml run crosses the spurstepd cutover —
+# the one upgrade that needs an empty cluster, because sessions written by the
+# previous build are not adopted and a new controller dispatching to a
+# not-yet-upgraded agent tears the job down. rolling_upgrade.yml refuses to run
+# across that cutover unless this is set; deploy.yml (full convergence) is the
+# supported path. See the rolling_upgrade.yml header.
+spur_accept_stepd_cutover: false
+
 # MPI PMIx plugin (spur_mpi_pmix.so) — installed on agents only (spur_agent role).
 # Matches spurd's default [mpi].plugin_dir. Runtime --mpi=pmix jobs also need
 # libpmix and Open MPI on the agent host (not installed by these playbooks).

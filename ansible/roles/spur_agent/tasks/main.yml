@@ -125,6 +125,16 @@
     mode: "0644"
     force: "{{ spur_overwrite_conf | default(false) | bool }}"
 
+# Supervisor sessions live in a runtime/ subdirectory of this path. spurd
+# creates it on demand, but pre-creating it 0700 keeps a session descriptor
+# (which carries the job's environment) off a loose umask, and makes the
+# directory visible to healthcheck/teardown before the first job ever runs.
+- name: Ensure the agent's own runtime state directory exists
+  ansible.builtin.file:
+    path: "{{ spur_agent_state_dir }}"
+    state: directory
+    mode: "0700"
+
 - name: Install spurd systemd unit
   # WorkingDirectory in the unit is {{ spur_home }} so job stdout (spur-<N>.out)
   # always lands there regardless of where the daemon was launched from.
