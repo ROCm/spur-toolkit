@@ -43,6 +43,15 @@
 # at a time — this only changes which one goes first/last, not the batching).
 # Must name every controller in [spur_controllers] exactly once:
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_controller_upgrade_order=ctl-2,ctl-0,ctl-1
+#
+# ONE UPGRADE IS NOT ROLLABLE: the release that introduces spurstepd. Sessions
+# written by the previous build are not adopted, and a new controller
+# dispatching to a not-yet-upgraded agent tears the job down — which is exactly
+# what this playbook's one-host-at-a-time window creates. Drain the cluster and
+# use deploy.yml (full convergence, every host in one pass) for that release.
+# This playbook detects the crossing (new build ships spurstepd, agents have
+# none) and refuses; see the "spurstepd cutover" guard-rail play below. Every
+# upgrade after it rolls normally, and jobs then survive the agent restart.
 
 - name: Guard rails — refuse to start against a wipe-flagged or unhealthy cluster
   hosts: spur_controllers[0]
@@ -90,6 +99,120 @@
       register: spur_pre_upgrade_health
       changed_when: false
       failed_when: spur_pre_upgrade_health.rc != 0
+
+# The spurstepd cutover is the one upgrade that cannot be rolled. A supervisor
+# written by the previous build is not adopted by the new one, and during the
+# batched window a new controller dispatching to a not-yet-upgraded agent tears
+# the job down — so that release needs an empty cluster and a single pass over
+# every host, which is deploy.yml, not this playbook.
+#
+# Detected rather than declared: "the new build ships spurstepd and the agents
+# have none" is exactly the crossing, and it is true only once.
+- name: Guard rails — refuse to roll across the spurstepd cutover
+  hosts: spur_agents
+  become: true
+  gather_facts: no
+  # Match the agent play below: a down agent shouldn't abort the check once the
+  # operator has already said it may be skipped. Its hostvars are simply absent
+  # from the aggregates below.
+  ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
+  vars:
+    # Each agent records its own name (or an empty string) rather than a
+    # boolean, so aggregating is a plain truthiness filter — a `False` that has
+    # been stringified by templating would survive one.
+    ru_crossing_agents: >-
+      {{ groups['spur_agents'] | map('extract', hostvars, 'ru_stepd_crossing')
+         | select('defined') | select | list }}
+    ru_agents_with_stepd: >-
+      {{ groups['spur_agents'] | map('extract', hostvars, 'ru_stepd_installed')
+         | select('defined') | select | list }}
+  tasks:
+    - name: Does the new build ship spurstepd?
+      # Only answerable for spur_binary_src. install.sh's payload isn't known
+      # until it has already been unpacked onto the host, so that path gets the
+      # heads-up at the bottom of this play instead of a verdict.
+      ansible.builtin.stat:
+        path: "{{ spur_binary_src }}/spurstepd"
+      delegate_to: localhost
+      become: false
+      register: ru_src_stepd
+      when: spur_binary_src | default('') | length > 0
+
+    - name: Does this agent already run a spurstepd build?
+      ansible.builtin.stat:
+        path: "{{ spur_install_dir }}/spurstepd"
+      register: ru_agent_stepd
+
+    - name: Record this agent's side of the cutover
+      ansible.builtin.set_fact:
+        ru_stepd_installed: "{{ inventory_hostname if (ru_agent_stepd.stat.exists | default(false)) else '' }}"
+        ru_stepd_crossing: >-
+          {{ inventory_hostname
+             if ((ru_src_stepd.stat.exists | default(false))
+                 and not (ru_agent_stepd.stat.exists | default(false)))
+             else '' }}
+
+    # Read once, for the refusal message — an operator who is told the cluster
+    # still has work on it doesn't have to go and look.
+    - name: Read the job queue for the refusal message
+      ansible.builtin.command: "{{ spur_install_dir }}/spur queue"
+      delegate_to: "{{ groups['spur_controllers'][0] }}"
+      run_once: true
+      register: ru_queue
+      changed_when: false
+      failed_when: false
+      when: ru_crossing_agents | length > 0
+
+    # run_once so the refusal is one message about the whole fleet rather than
+    # one per agent; every host in the play has recorded its answer by now.
+    - name: Refuse the upgrade if any agent is crossing the cutover
+      ansible.builtin.fail:
+        msg: >-
+          This upgrade introduces spurstepd on {{ ru_crossing_agents | join(', ') }},
+          and rolling_upgrade.yml cannot roll across it. Sessions written by the
+          running build are not adopted by the new one, and inside this
+          playbook's one-host-at-a-time window an upgraded controller
+          dispatching to a not-yet-upgraded agent tears the job down — mixed
+          versions are unsupported for this release only. Drain the cluster, let
+          running jobs finish or cancel them, then use deploy.yml, which
+          converges every host in a single pass:
+          `ansible-playbook playbooks/deploy.yml -i <inventory> -e spur_binary_src={{ spur_binary_src }}`.
+          The controller currently reports
+          {{ [((ru_queue.stdout_lines | default([]) | length) - 1), 0] | max }}
+          queued/running job(s). If the cluster is already empty and will stay
+          that way, re-run with -e spur_accept_stepd_cutover=true. Every upgrade
+          AFTER this one rolls normally, and jobs then survive the agent restart.
+      run_once: true
+      when:
+        - ru_crossing_agents | length > 0
+        - not (spur_accept_stepd_cutover | default(false) | bool)
+
+    - name: Warn that this run is crossing the spurstepd cutover
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: spur_accept_stepd_cutover=true — rolling across the spurstepd
+          cutover on {{ ru_crossing_agents | join(', ') }}. Only safe on a
+          cluster that is empty and stays empty for the whole run: a job
+          dispatched by an upgraded controller to an agent still on the old
+          build is torn down, and nothing running now is adopted afterwards.
+      run_once: true
+      when:
+        - ru_crossing_agents | length > 0
+        - spur_accept_stepd_cutover | default(false) | bool
+
+    # install.sh can't be inspected before it runs. Only worth saying while the
+    # cutover is still ahead of this cluster (no agent has spurstepd yet).
+    - name: Note the cutover cannot be detected for an install.sh upgrade
+      ansible.builtin.debug:
+        msg: >-
+          spur_binary_src is unset, so this run installs whatever upstream
+          install.sh fetches and the spurstepd cutover cannot be detected in
+          advance. If spur_version={{ spur_version }} resolves to the release
+          that introduces spurstepd, drain the cluster and use deploy.yml.
+      run_once: true
+      when:
+        - spur_binary_src | default('') | length == 0
+        - ru_agents_with_stepd | length == 0
 
 # spur_controller re-renders spur.conf on every controller it touches, which
 # needs ansible_hostname for every agent (the [[nodes]] block) — gather facts
