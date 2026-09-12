@@ -268,7 +268,7 @@ run_and_capture() {
 # path/size/mtime/sha256 fingerprint of the installed binaries instead.
 collect_build_fingerprint() {
   local target="$1" short="$2" hostdir="$3"
-  local remote_cmd="found=0; for b in spur spurctld spurd; do p=\"$SPUR_INSTALL_DIR/\$b\"; [ -e \"\$p\" ] || continue; found=1; printf '%s: ' \"\$b\"; stat -c 'path=%n size=%s mtime=%y' \"\$p\"; sha256sum \"\$p\"; done; if [ \"\$found\" -eq 0 ]; then echo \"no spur/spurctld/spurd binaries found under $SPUR_INSTALL_DIR\" >&2; exit 1; fi"
+  local remote_cmd="found=0; for b in spur spurctld spurd spurstepd; do p=\"$SPUR_INSTALL_DIR/\$b\"; [ -e \"\$p\" ] || continue; found=1; printf '%s: ' \"\$b\"; stat -c 'path=%n size=%s mtime=%y' \"\$p\"; sha256sum \"\$p\"; done; if [ \"\$found\" -eq 0 ]; then echo \"no spur/spurctld/spurd/spurstepd binaries found under $SPUR_INSTALL_DIR\" >&2; exit 1; fi"
   run_and_capture "$target" "$remote_cmd" "$hostdir/build-fingerprint.txt" "$short: binary fingerprint"
 }
 

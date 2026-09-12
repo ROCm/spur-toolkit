@@ -9,6 +9,7 @@ Spur is an AI-native job scheduler with these daemons:
 
 - **spurctld** — controller / scheduler / Raft consensus (1 instance, or ≥ 3 for HA). Also serves accounting (sacct/fairshare, backed by PostgreSQL) in-process on its own gRPC port whenever `[accounting].database_url` is set — there is no separate accounting daemon. Only Postgres itself is a distinct service, on `ACCT_HOST` (default: first controller; may be a dedicated node).
 - **spurd** — node agent, runs on every compute host
+- **spurstepd** — per-`(job, step)` supervisor that `spurd` spawns, on every compute host. It owns the job's process tree, cgroup and exit status, and outlives the agent so a restart or upgrade of `spurd` doesn't kill running work. It **must** be installed in the same directory as `spurd`: the agent resolves it beside its own executable and does not search `$PATH`, so a node without it fails every job launch. Builds before it existed ship no such binary; that's fine, and this skill installs it only when the source provides one.
 
 > Pre-merge Spur builds additionally shipped a standalone `spurdbd` accounting daemon; upstream folded it into `spurctld`. If you're upgrading a cluster that still has `spurdbd.service` active, see **Step 5b: migrating off a standalone spurdbd** below — don't skip it, or you'll end up with two accounting paths fighting over the same Postgres.
 
@@ -133,7 +134,7 @@ Fail-fast rules:
 
 ## Step 2: install Spur binaries on all hosts (idempotent)
 
-Two sources, same as the playbook. ROCm/spur publishes releases (https://github.com/ROCm/spur/releases) — `install.sh` (no `SPUR_BINARY_SRC` set) downloads one automatically (`SPUR_VERSION=latest` by default, or `nightly` for a mainline build, or a specific `vX.Y.Z`). Set `SPUR_BINARY_SRC` to a local dir holding pre-built `spur`, `spurctld`, `spurd`, and optionally `spur_mpi_pmix.so`, instead when you need mainline changes not yet released, an air-gapped install, or a custom build.
+Two sources, same as the playbook. ROCm/spur publishes releases (https://github.com/ROCm/spur/releases) — `install.sh` (no `SPUR_BINARY_SRC` set) downloads one automatically (`SPUR_VERSION=latest` by default, or `nightly` for a mainline build, or a specific `vX.Y.Z`). Set `SPUR_BINARY_SRC` to a local dir holding pre-built `spur`, `spurctld`, `spurd`, `spurstepd`, and optionally `spur_mpi_pmix.so`, instead when you need mainline changes not yet released, an air-gapped install, or a custom build. Build it with `cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd` — omitting `-p spur-stepd` produces a `spurd` whose every job launch then fails on the target.
 
 ```bash
 resolve_mpi_plugin_src() {
@@ -173,7 +174,13 @@ for tgt in "${HOSTS_ALL[@]}"; do
   if [ -n "$SPUR_BINARY_SRC" ]; then
     # Push pre-built binaries from the operator box. scp can't land a file directly under
     # /root (it runs as the plain SSH user), so stage in /tmp and sudo-install from there.
-    for b in spur spurctld spurd; do
+    # spurstepd only when the build has one — a pinned older release ships none.
+    # It goes to the same directory as spurd, in the same loop, so the pair on a
+    # node always comes from one build: a supervisor written by one build is not
+    # adopted by another.
+    push_bins=(spur spurctld spurd)
+    [ -f "${SPUR_BINARY_SRC}/spurstepd" ] && push_bins+=(spurstepd)
+    for b in "${push_bins[@]}"; do
       scp -q "${SPUR_BINARY_SRC}/${b}" "${tgt}:/tmp/${b}.spur-push"
       ssh "$tgt" "sudo install -m 0755 /tmp/${b}.spur-push ${SPUR_INSTALL_DIR}/${b} && rm -f /tmp/${b}.spur-push"
     done
@@ -213,6 +220,11 @@ done
 ```
 
 > Do NOT rely on `spur --version` — it is not a supported flag and errors. Check for the file with `test -x` instead.
+
+> **`spurstepd` check.** After installing, confirm every agent has it beside `spurd`:
+> `ssh "$ag" "sudo test -x ${SPUR_INSTALL_DIR}/spurstepd"`. If it's absent, say so plainly
+> rather than continuing quietly: on a build that expects one, every job launch on that node
+> fails. On a build that predates it, absence is correct and nothing is wrong.
 
 > **MPI plugin:** release/nightly tarballs ship `lib/spur/spur_mpi_pmix.so`. `install.sh` places it under `$(dirname SPUR_INSTALL_DIR)/lib/spur/`; this step copies it to `${SPUR_MPI_PLUGIN_DIR}` where `spurd` looks by default. `--mpi=pmix` jobs still need `libpmix` and Open MPI on the agent — not installed here.
 
@@ -255,6 +267,9 @@ Stop via systemd if a unit exists, and belt-and-suspenders `pkill -x` (exact nam
 ```bash
 for tgt in "${HOSTS_ALL[@]}"; do
   ssh "$tgt" '
+    # spurstepd is NOT in this list: a supervisor is meant to outlive its agent,
+    # and a stop here is followed by a restart. Kill them only where the host is
+    # actually going away — see the teardown note at the end of this skill.
     for svc in spurd spurctld spurdbd; do
       sudo systemctl stop "$svc" 2>/dev/null || true
     done
@@ -505,6 +520,8 @@ done
 
 `spurd --controller` accepts a comma-separated endpoint list and rotates past a dead one (spur-client endpoint rotation), so every agent is pointed at **every** controller, not just `CONTROLLERS[0]` — a single surviving controller is enough (followers forward writes via Raft either way). `WorkingDirectory=${SPUR_HOME}` in the unit sets the *fallback* stdout dir for `spur-<N>.out` (a job's own `WorkDir`/submit-CWD takes precedence). `--hostname`/`--address` are explicit (auto-detect picks `127.0.0.1`, breaking inter-node dispatch).
 
+`KillMode=process` is required, not cosmetic: job supervisors detach from the agent into their own session but stay in the unit's cgroup, so systemd's default (`control-group`) kills them on every stop/restart and takes the running work with them. `SPUR_STEPD_STATE_DIR` is where the agent keeps the supervisor sessions it re-adopts after a restart; it is deliberately not `${SPUR_HOME}/state` (the controller's Raft directory), so a hyperconverged host never has the two share one. It is set as an environment variable rather than `spurd --state-dir` because a build predating `spurstepd` ignores an unknown variable but refuses to start on an unknown flag.
+
 ```bash
 CTL_ENDPOINTS="$ctl_endpoints_csv"   # reuse the list built for the client env above
 for ag in "${AGENTS[@]}"; do
@@ -519,10 +536,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=HOME=${SPUR_HOME}
+Environment=SPUR_STEPD_STATE_DIR=${SPUR_HOME}/agent-state
 WorkingDirectory=${SPUR_HOME}
 ExecStart=${SPUR_INSTALL_DIR}/spurd --controller ${CTL_ENDPOINTS} --hostname ${SHORT[$ag]} --address ${IP[$ag]} --listen 0.0.0.0:${SPUR_AGENT_PORT} --log-level ${SPUR_LOG_LEVEL}
 Restart=on-failure
 RestartSec=3
+KillMode=process
 User=root
 LimitNOFILE=65536
 
@@ -684,11 +703,17 @@ done
 
 ## Step 11: teardown (only when asked)
 
+Job supervisors have to be killed explicitly here. A `spurstepd` is built to outlive its agent — its own session, reparented to init, and spared by the unit's `KillMode=process` — so disabling `spurd` leaves it running. It also ignores a bare `SIGTERM` by design, so the `SIGKILL` below is what actually lands. Kill the job's own processes first (they live in the job's cgroup, not the supervisor's): a supervisor whose workload just died reports the exit, and killing the supervisor first would throw that completion away.
+
 ```bash
 for tgt in "${HOSTS_ALL[@]}"; do
   ssh "$tgt" "
+    # Job processes first, then the daemons, then the supervisors they left behind.
+    pids=\$(sudo find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null | xargs -r sudo cat 2>/dev/null | sort -u)
+    [ -n \"\$pids\" ] && { echo \"\$pids\" | xargs sudo kill -TERM 2>/dev/null; sleep 5; echo \"\$pids\" | xargs sudo kill -KILL 2>/dev/null; } || true
     for svc in spurd spurctld spurdbd; do sudo systemctl disable --now \$svc 2>/dev/null || true; done
     sudo pkill -x spurd 2>/dev/null; sudo pkill -x spurctld 2>/dev/null; sudo pkill -x spurdbd 2>/dev/null
+    sudo pkill -x -TERM spurstepd 2>/dev/null; sleep 2; sudo pkill -x -KILL spurstepd 2>/dev/null
     sudo rm -f /etc/systemd/system/spurd.service /etc/systemd/system/spurctld.service /etc/systemd/system/spurdbd.service
     sudo systemctl daemon-reload 2>/dev/null || true
     sudo rm -rf ${SPUR_HOME}
@@ -701,7 +726,17 @@ To also remove accounting data (destructive): `ssh "$ACCT_HOST" "sudo -u postgre
 
 ## Step 12: rolling upgrade (only when asked to upgrade a live cluster)
 
-Use this instead of re-running Steps 1–9 when jobs are currently running and a full-cluster daemon bounce (which Steps 1-9 do — no draining, no batching) is not acceptable. Assumes the cluster is already up and healthy; refuse to proceed otherwise. Requires `SPUR_BINARY_SRC` pointing at the new build (rebuild all three binaries together — same caveat as any upgrade). Push `spur_mpi_pmix.so` to agents when present in `SPUR_BINARY_SRC`. Only exercised so far with `TRANSPORT=direct`; the `IP[]` map this step reuses from Step 3 still needs to hold real addresses (`WG_IP[]` per Step 2b) for a wireguard cluster — re-derive it in this shell session first if it isn't already populated.
+Use this instead of re-running Steps 1–9 when jobs are currently running and a full-cluster daemon bounce (which Steps 1-9 do — no draining, no batching) is not acceptable. Assumes the cluster is already up and healthy; refuse to proceed otherwise. Requires `SPUR_BINARY_SRC` pointing at the new build (rebuild every binary together — same caveat as any upgrade; `spurd` and `spurstepd` especially, since a supervisor written by one build is not adopted by another).
+
+**Do not use this step for the upgrade that introduces `spurstepd`.** That one needs an empty cluster and a single pass over every host (Steps 1–9), because sessions from the previous build aren't adopted and, inside this step's staggered window, an upgraded controller dispatching to a not-yet-upgraded agent tears the job down. Detect it the same way the playbook does — `SPUR_BINARY_SRC` has a `spurstepd` and the agents have none — and refuse:
+
+```bash
+if [ -f "${SPUR_BINARY_SRC}/spurstepd" ] \
+   && ! ssh "${AGENTS[0]}" "sudo test -x ${SPUR_INSTALL_DIR}/spurstepd"; then
+  echo "this upgrade introduces spurstepd and cannot be rolled — drain the cluster and use Steps 1-9" >&2
+  exit 1
+fi
+``` Push `spur_mpi_pmix.so` to agents when present in `SPUR_BINARY_SRC`. Only exercised so far with `TRANSPORT=direct`; the `IP[]` map this step reuses from Step 3 still needs to hold real addresses (`WG_IP[]` per Step 2b) for a wireguard cluster — re-derive it in this shell session first if it isn't already populated.
 
 **This step only pushes new binaries and restarts daemons — it does not touch `spur.conf` or Postgres.** If the cluster is still on the pre-merge standalone-`spurdbd` architecture, do the Step 5b migration first (a full-flow, bounce-based operation: Steps 2/4/5b/5/6/7/8/9/10) and confirm it's healthy on the merged-accounting build *before* using this step for further low-disruption upgrades. Running this step against a still-unmigrated cluster would push a spurctld binary that expects the new embedded-accounting config shape without updating `spur.conf`/`pg_hba.conf` to match — don't do that.
 
@@ -755,7 +790,9 @@ while [ $i -lt ${#AGENTS[@]} ]; do
     done
   done
   for ag in "${batch[@]}"; do
-    for b in spur spurctld spurd; do
+    push_bins=(spur spurctld spurd)
+    [ -f "${SPUR_BINARY_SRC}/spurstepd" ] && push_bins+=(spurstepd)
+    for b in "${push_bins[@]}"; do
       scp -q "${SPUR_BINARY_SRC}/${b}" "${ag}:/tmp/${b}.spur-push"
       ssh "$ag" "sudo install -m 0755 /tmp/${b}.spur-push ${SPUR_INSTALL_DIR}/${b} && rm -f /tmp/${b}.spur-push"
     done
