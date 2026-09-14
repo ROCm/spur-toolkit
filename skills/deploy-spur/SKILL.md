@@ -728,15 +728,7 @@ To also remove accounting data (destructive): `ssh "$ACCT_HOST" "sudo -u postgre
 
 Use this instead of re-running Steps 1–9 when jobs are currently running and a full-cluster daemon bounce (which Steps 1-9 do — no draining, no batching) is not acceptable. Assumes the cluster is already up and healthy; refuse to proceed otherwise. Requires `SPUR_BINARY_SRC` pointing at the new build (rebuild every binary together — same caveat as any upgrade; `spurd` and `spurstepd` especially, since a supervisor written by one build is not adopted by another).
 
-**Do not use this step for the upgrade that introduces `spurstepd`.** That one needs an empty cluster and a single pass over every host (Steps 1–9), because sessions from the previous build aren't adopted and, inside this step's staggered window, an upgraded controller dispatching to a not-yet-upgraded agent tears the job down. Detect it the same way the playbook does — `SPUR_BINARY_SRC` has a `spurstepd` and the agents have none — and refuse:
-
-```bash
-if [ -f "${SPUR_BINARY_SRC}/spurstepd" ] \
-   && ! ssh "${AGENTS[0]}" "sudo test -x ${SPUR_INSTALL_DIR}/spurstepd"; then
-  echo "this upgrade introduces spurstepd and cannot be rolled — drain the cluster and use Steps 1-9" >&2
-  exit 1
-fi
-``` Push `spur_mpi_pmix.so` to agents when present in `SPUR_BINARY_SRC`. Only exercised so far with `TRANSPORT=direct`; the `IP[]` map this step reuses from Step 3 still needs to hold real addresses (`WG_IP[]` per Step 2b) for a wireguard cluster — re-derive it in this shell session first if it isn't already populated.
+`spurstepd` is pushed to agents alongside `spurd` in this step, same as any other binary — no special handling needed even for the upgrade that introduces it. Push `spur_mpi_pmix.so` to agents when present in `SPUR_BINARY_SRC`. Only exercised so far with `TRANSPORT=direct`; the `IP[]` map this step reuses from Step 3 still needs to hold real addresses (`WG_IP[]` per Step 2b) for a wireguard cluster — re-derive it in this shell session first if it isn't already populated.
 
 **This step only pushes new binaries and restarts daemons — it does not touch `spur.conf` or Postgres.** If the cluster is still on the pre-merge standalone-`spurdbd` architecture, do the Step 5b migration first (a full-flow, bounce-based operation: Steps 2/4/5b/5/6/7/8/9/10) and confirm it's healthy on the merged-accounting build *before* using this step for further low-disruption upgrades. Running this step against a still-unmigrated cluster would push a spurctld binary that expects the new embedded-accounting config shape without updating `spur.conf`/`pg_hba.conf` to match — don't do that.
 

@@ -26,14 +26,6 @@ spur_require_stepd: false
 # unknown environment variable but refuses to start on an unknown flag.
 spur_agent_state_dir: "{{ spur_home }}/agent-state"
 
-# Acknowledge that a rolling_upgrade.yml run crosses the spurstepd cutover —
-# the one upgrade that needs an empty cluster, because sessions written by the
-# previous build are not adopted and a new controller dispatching to a
-# not-yet-upgraded agent tears the job down. rolling_upgrade.yml refuses to run
-# across that cutover unless this is set; deploy.yml (full convergence) is the
-# supported path. See the rolling_upgrade.yml header.
-spur_accept_stepd_cutover: false
-
 # MPI PMIx plugin (spur_mpi_pmix.so) — installed on agents only (spur_agent role).
 # Matches spurd's default [mpi].plugin_dir. Runtime --mpi=pmix jobs also need
 # libpmix and Open MPI on the agent host (not installed by these playbooks).

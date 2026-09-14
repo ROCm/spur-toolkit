@@ -389,7 +389,6 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 | `spur_home` | `/root/spur` | Per-host root for state, logs, and config. |
 | `spur_agent_state_dir` | `{{ spur_home }}/agent-state` | Each agent's own runtime state — the `spurstepd` sessions a restarted `spurd` re-adopts. Passed to `spurd` as `SPUR_STEPD_STATE_DIR`. Kept out of `{{ spur_home }}/state` (the controller's Raft dir) so a host running both daemons never shares one. |
 | `spur_require_stepd` | `false` | Treat a missing `spurstepd` as a hard failure in `spur_install` and a reported problem in `healthcheck.yml`. Default `false` because builds that predate it ship none; set `true` on a cluster whose build does. |
-| `spur_accept_stepd_cutover` | `false` | Override `rolling_upgrade.yml`'s refusal to roll across the release that introduces `spurstepd`. Only for an already-empty, locked cluster — see [Upgrading](#upgrading). |
 | `spur_mpi_plugin_dir` | `/usr/lib/spur` | Where `spur_mpi_pmix.so` is installed on agents (matches `spurd` default). |
 | `spur_mpi_plugin_enabled` | `true` | Install the MPI plugin on agents when a source file is available. |
 | `spur_transport` | `direct` | Network transport: `direct` or `wireguard`. |
@@ -476,19 +475,7 @@ It reuses the same `spur_install`/`spur_controller`/`spur_agent`/`spur_verify` r
 3. **Agents, in configurable batches** (`spur_rolling_batch_size`, default `1`). For each node: `spur node drain <node>`, poll until `DRAINED` (once no running jobs are left), force-reinstall, restart `spurd`, wait for re-registration, then `scontrol update NodeName=<node> State=RESUME`.
 4. **Verify** *(opt-in — `-e spur_verify_enabled=true`)*. Submits a real test job at the end to confirm the upgraded cluster actually schedules work. Off by default so routine upgrades don't add job noise; CI enables it.
 
-The same rebuild-everything-together caveat from full convergence applies here too.
-
-#### One upgrade can't be rolled: the `spurstepd` cutover
-
-The release that introduces `spurstepd` needs an **empty cluster and a single pass over every host**, which is `deploy.yml`, not this playbook. Sessions written by the previous build are not adopted, and this playbook's one-host-at-a-time window is exactly where an upgraded controller dispatches to a not-yet-upgraded agent and tears the job down. Mixed versions are unsupported *across that one upgrade*; every upgrade after it rolls normally, and jobs then survive the agent restart.
-
-`rolling_upgrade.yml` detects the crossing — the new build ships `spurstepd`, the agents have none — and refuses, reporting the current queue depth and pointing at `deploy.yml`. Drain the cluster, let running jobs finish (or cancel them), then:
-
-```bash
-ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release
-```
-
-If the cluster is already empty and will stay that way, `-e spur_accept_stepd_cutover=true` overrides the refusal with a prominent warning. The crossing can only be detected for a `spur_binary_src` upgrade — upstream `install.sh` isn't inspectable before it runs, so that path gets a heads-up instead of a verdict.
+The same rebuild-everything-together caveat from full convergence applies here too. `spurstepd` is installed/upgraded on agents the same way `spur`/`spurctld`/`spurd` are — no special handling.
 
 `spur_rolling_batch_size` trades speed for blast radius. The default `1` disrupts at most one agent's capacity at a time; a higher value upgrades faster but drains more capacity concurrently.
 
