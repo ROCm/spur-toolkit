@@ -159,6 +159,31 @@
     - name: Drain + guard this node against job loss before touching its binaries
       ansible.builtin.include_tasks: tasks/drain_and_guard_agent.yml
 
+    - name: Does this agent already run a spurstepd build?
+      ansible.builtin.stat:
+        path: "{{ spur_install_dir }}/spurstepd"
+      register: ru_agent_stepd_before
+
+    - name: Does the new build ship spurstepd?
+      ansible.builtin.stat:
+        path: "{{ spur_binary_src }}/spurstepd"
+      delegate_to: localhost
+      become: false
+      register: ru_src_stepd
+      when: spur_binary_src | default('') | length > 0
+
+    # Informational only, nothing here blocks — spurstepd installs unconditionally below.
+    - name: Note this agent is getting spurstepd for the first time in this run
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} has no spurstepd yet and this run's source
+          has one — the controllers ahead of it in this rolling upgrade are
+          already on the new build. Proceeding; if you'd rather avoid any
+          window of risk here, drain the cluster and use deploy.yml instead.
+      when:
+        - not (ru_agent_stepd_before.stat.exists | default(false))
+        - ru_src_stepd.stat.exists | default(false)
+
   roles:
     # Skipped for a busy node (spur_node_busy=true, opted in via
     # spur_skip_busy_agents) — overwriting a running agent's binaries out from

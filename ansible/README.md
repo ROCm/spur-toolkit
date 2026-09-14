@@ -475,7 +475,7 @@ It reuses the same `spur_install`/`spur_controller`/`spur_agent`/`spur_verify` r
 3. **Agents, in configurable batches** (`spur_rolling_batch_size`, default `1`). For each node: `spur node drain <node>`, poll until `DRAINED` (once no running jobs are left), force-reinstall, restart `spurd`, wait for re-registration, then `scontrol update NodeName=<node> State=RESUME`.
 4. **Verify** *(opt-in — `-e spur_verify_enabled=true`)*. Submits a real test job at the end to confirm the upgraded cluster actually schedules work. Off by default so routine upgrades don't add job noise; CI enables it.
 
-The same rebuild-everything-together caveat from full convergence applies here too. `spurstepd` is installed/upgraded on agents the same way `spur`/`spurctld`/`spurd` are — no special handling.
+The same rebuild-everything-together caveat from full convergence applies here too. `spurstepd` is installed/upgraded on agents the same way `spur`/`spurctld`/`spurd` are — no special handling, though the run prints an informational note (not a refusal) the first time it lands on an agent, since the controllers ahead of it in the batch are already on the new build.
 
 `spur_rolling_batch_size` trades speed for blast radius. The default `1` disrupts at most one agent's capacity at a time; a higher value upgrades faster but drains more capacity concurrently.
 

@@ -42,3 +42,4 @@ These are hard-won findings from validation: real bugs and non-obvious Spur/Ansi
 - **A drained node stays drained after `spurd` restarts** — draining is server-side state, not tied to the agent process. The playbook explicitly `RESUME`s each node after its upgrade; skip that and upgraded capacity sits idle.
 - **Controllers restart one at a time (`serial: 1`), never in parallel**, so Raft quorum is never lost — with 3 controllers, restarting 1 leaves 2 for quorum.
 - **Refuses to run under `spur_transport=wireguard`** — it doesn't re-derive `spur_wg_address` the way `deploy.yml` does. Use `deploy.yml` for a wireguard cluster instead.
+- **`spurstepd` installs unconditionally, like any other binary** — no refusal, but the agent play prints an informational note the first time it lands on a node, since the controllers ahead of it in the batch are already upgraded.

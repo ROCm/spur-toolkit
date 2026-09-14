@@ -190,6 +190,14 @@
       ansible.builtin.include_tasks: tasks/reap_stepd_supervisors.yml
       vars:
         stepd_purge_sessions: true
+      ignore_errors: true
+      when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
+
+    # A supervisor surviving SIGKILL must not be swallowed by ignore_errors above —
+    # the final play's "removed" message needs to know so it isn't misleading.
+    - name: Record whether this node's supervisor reap failed
+      ansible.builtin.set_fact:
+        rn_reap_failed: "{{ inventory_hostname if (stepd_reap.rc | default(0) | int != 0) else '' }}"
       when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
 
     # Mesh cleanup (wireguard only). Capture this node's pubkey so the controller can drop it as a
@@ -255,6 +263,10 @@
   hosts: "{{ groups['spur_controllers'][0] }}"
   become: true
   gather_facts: no
+  vars:
+    rn_reap_failures: >-
+      {{ groups['spur_agents'] | map('extract', hostvars, 'rn_reap_failed')
+         | select('defined') | select | list }}
   tasks:
     # Belt-and-suspenders: spurd deregisters gracefully on SIGTERM, so a node
     # whose agent we just stopped is usually already gone from the controller.
@@ -285,6 +297,9 @@
              if (rn_actual_remove_list | length > 0) else [])
             + (["Left in the cluster, un-removed (still busy): " ~ (rn_busy_nodes | difference(rn_actual_remove_list) | join(', '))]
                if (rn_busy_nodes | default([]) | difference(rn_actual_remove_list) | length > 0) else [])
+            + (["WARNING: supervisor reap failed on: " ~ (rn_reap_failures | join(', ')) ~
+                " — a spurstepd process may still be running there; investigate and kill it manually."]
+               if (rn_reap_failures | length > 0) else [])
             + ["IMPORTANT: also delete removed hosts from [spur_agents] in your inventory,",
                "otherwise a future `deploy.yml` run will re-add them. No re-deploy is",
                "needed just to complete the removal — it's already done.",
