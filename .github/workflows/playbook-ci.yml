@@ -555,6 +555,56 @@ jobs:
             echo "busy job $jid never reached RUNNING (last: ${st:-none})"; exit 1
           '
 
+          # Also submit the two jobs the later force-upgrade pass needs (a bare
+          # sleep + a Docker container), right now, while gpu-3 and the
+          # controller are still on the same build. Submitting them AFTER the
+          # controller crosses into the spurstepd release (below) would route
+          # a brand-new dispatch through an already-upgraded controller talking
+          # to gpu-3's still-old spurd, which fails the new two-phase
+          # LaunchJob/StartJob handshake outright ("failed to release the job
+          # on node") — that's the exact crossing risk rolling_upgrade.yml no
+          # longer refuses, so the test has to stop doing it too.
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=force-bare\nsleep 600\n" > /tmp/ci-force-bare.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-bare.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-force-bare.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "force-bare job $jid RUNNING on gpu-3"; exit 0; }
+              sleep 1
+            done
+            echo "force-bare job $jid never reached RUNNING"; exit 1
+          '
+
+          # The job script launches a detached Docker container inside gpu-3
+          # then sleeps in the foreground so the spur job stays RUNNING.
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            cat > /tmp/ci-force-docker.sh <<EOF
+          #!/bin/bash
+          #SBATCH --job-name=force-docker
+          docker run -d --name ci-force-container ubuntu:22.04 sleep 600
+          sleep 600
+          EOF
+            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-docker.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-force-docker.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "force-docker job $jid RUNNING on gpu-3"; exit 0; }
+              sleep 1
+            done
+            echo "force-docker job $jid never reached RUNNING"; exit 1
+          '
+
+          # Confirm the Docker container is actually running inside gpu-3.
+          for i in $(seq 1 20); do
+            docker exec gpu-3 docker ps --filter name=ci-force-container --format '{{.Names}}' \
+              | grep -q ci-force-container && { echo "ci-force-container running"; break; }
+            sleep 2
+          done
+          docker exec gpu-3 docker ps --filter name=ci-force-container
+
       - name: rolling_upgrade.yml default (must refuse on gpu-3's busy job, no skip/force set)
         working-directory: ansible
         env:
@@ -629,59 +679,23 @@ jobs:
           docker exec ctl-0 /usr/local/bin/spur show node gpu-3
 
       # --- Pass 2: force upgrade — bare process + Docker container killed ---
-      - name: Submit force-upgrade test jobs on gpu-3 (bare sleep + Docker container)
+      # Both jobs were submitted back in "Simulate gpu-2 unreachable and
+      # gpu-3 busy", before gpu-3's controller crossed into the spurstepd
+      # release — nothing here dispatches anything new, just confirms they
+      # (and the original busy job) are still alive right before the force
+      # upgrade tears them down.
+      - name: Confirm gpu-3's jobs are still running before the force upgrade
         run: |
           set -euo pipefail
-          # Cancel the original busy job and wait for gpu-3 to go IDLE.
-          jid=$(docker exec ctl-0 cat /tmp/ci-busy.jid)
-          docker exec ctl-0 /usr/local/bin/spur scancel "$jid" || true
-          for i in $(seq 1 30); do
-            st=$(docker exec ctl-0 /usr/local/bin/spur show node gpu-3 2>/dev/null | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
-            [ "$st" = IDLE ] && break
-            sleep 2
+          for f in ci-busy ci-force-bare ci-force-docker; do
+            jid=$(docker exec ctl-0 cat "/tmp/${f}.jid")
+            st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
+            [ "$st" = RUNNING ] || { echo "FAIL: $f job $jid should still be RUNNING (state: $st)"; exit 1; }
+            echo "$f job $jid still RUNNING on gpu-3"
           done
-
-          # Job A: bare sleep (existing test path).
-          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
-            set -e
-            printf "#!/bin/bash\n#SBATCH --job-name=force-bare\nsleep 600\n" > /tmp/ci-force-bare.sh
-            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-bare.sh | grep -oE "[0-9]+" | head -1)
-            echo "$jid" > /tmp/ci-force-bare.jid
-            for i in $(seq 1 30); do
-              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
-              [ "$st" = RUNNING ] && { echo "bare job $jid RUNNING on gpu-3"; exit 0; }
-              sleep 1
-            done
-            echo "bare job $jid never reached RUNNING"; exit 1
-          '
-
-          # Job B: Docker container (tests the container-kill code path).
-          # The job script launches a detached Docker container inside gpu-3
-          # then sleeps in the foreground so the spur job stays RUNNING.
-          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
-            set -e
-            cat > /tmp/ci-force-docker.sh <<EOF
-          #!/bin/bash
-          #SBATCH --job-name=force-docker
-          docker run -d --name ci-force-container ubuntu:22.04 sleep 600
-          sleep 600
-          EOF
-            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-docker.sh | grep -oE "[0-9]+" | head -1)
-            echo "$jid" > /tmp/ci-force-docker.jid
-            for i in $(seq 1 30); do
-              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
-              [ "$st" = RUNNING ] && { echo "docker job $jid RUNNING on gpu-3"; exit 0; }
-              sleep 1
-            done
-            echo "docker job $jid never reached RUNNING"; exit 1
-          '
-
-          # Confirm the Docker container is actually running inside gpu-3.
-          for i in $(seq 1 20); do
-            docker exec gpu-3 docker ps --filter name=ci-force-container --format '{{.Names}}' \
-              | grep -q ci-force-container && { echo "ci-force-container running"; break; }
-            sleep 2
-          done
+          # Informational only, same as this check always was pre-#38: the
+          # container job's own script has no `set -e`, so this doesn't prove
+          # `docker run` inside it actually succeeded either way.
           docker exec gpu-3 docker ps --filter name=ci-force-container
 
       - name: rolling_upgrade.yml --force (gpu-3 force-upgraded, jobs+container killed)
