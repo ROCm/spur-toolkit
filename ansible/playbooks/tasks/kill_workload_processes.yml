@@ -19,6 +19,16 @@
 #    and gives them 5s to flush/checkpoint.
 #
 # 3. SIGKILL to anything still alive after the grace period.
+#
+# The sweep is rooted at /sys/fs/cgroup/spur, so it still reaches a job's
+# processes now that each step gets its own leaf cgroup under the job's.
+#
+# It deliberately does NOT touch the job's supervisor (spurstepd), which sits
+# outside the job cgroup. A supervisor whose workload just died observes the
+# exit and reports it, so the controller sees a finished job rather than a
+# stranded one — killing the supervisor first throws that away. Where the host
+# itself is going away and the supervisors have to go too,
+# tasks/reap_stepd_supervisors.yml does that explicitly, afterwards.
 - name: Kill job processes and containers in spur cgroups
   ansible.builtin.shell: |
     set -uo pipefail

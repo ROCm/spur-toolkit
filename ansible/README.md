@@ -15,14 +15,14 @@ Run everything from this repo's `ansible/` directory.
 
 `spur` (the upstream source) is a separate repo. Clone and build it wherever's convenient, then point `spur_binary_src` straight at the build output — no need to copy it anywhere.
 
-> The role only ever reads the three named files `spur`/`spurctld`/`spurd` out of that directory. The MPI PMIx plugin (`spur_mpi_pmix.so`) is installed separately on agents by the `spur_agent` role (see [Build prerequisites](#build-prerequisites)).
+> The role only ever reads the named files `spur`/`spurctld`/`spurd`/`spurstepd` out of that directory — `spurstepd` only when the build provides one, since builds before it shipped none. The MPI PMIx plugin (`spur_mpi_pmix.so`) is installed separately on agents by the `spur_agent` role (see [Build prerequisites](#build-prerequisites)).
 
 ```bash
 # 1. Build spur (picks up mainline changes not yet in a tagged release; see Build prerequisites)
 git clone https://github.com/ROCm/spur.git && cd spur
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
 sudo apt install -y protobuf-compiler build-essential
-cargo build --release -p spur-cli -p spurctld -p spurd
+cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
 SPUR_BUILD="$(pwd)/target/release"
 cd -
 
@@ -70,19 +70,34 @@ You have two options: use a published release, or build the binaries yourself.
 
 > Already have Rust from somewhere other than rustup (distro package, asdf, …)? Compare `rustc --version` against `rust-toolchain.toml`'s `channel`. A mismatch can fail the build in ways that don't look version-related.
 
-A local build produces three binaries under `target/release/`:
+A local build produces four binaries under `target/release/`:
 
 | Binary | Role |
 |---|---|
 | `spur` | multi-call CLI, symlinked to 18 Slurm-compatible names (`sbatch`, `squeue`, `sacct`, `sacctmgr`, `scontrol`, `salloc`, `srun`, `sinfo`, `scancel`, `sattach`, `scrontab`, `sdiag`, `smd`, `sprio`, `sreport`, `sshare`, `sstat`, `strigger`) |
 | `spurctld` | controller / scheduler / Raft — also serves accounting in-process on the same gRPC port when `[accounting].database_url` is set |
 | `spurd` | node agent |
+| `spurstepd` | per-(job, step) supervisor the agent spawns — see [spurstepd](#spurstepd-the-job-supervisor) |
+
+> `spurstepd` is newer than the other three. A pinned older release ships none, which is fine; what is **not** fine is a build that expects one where the binary is missing. Don't drop `-p spur-stepd` from the `cargo build` above.
 
 Release and nightly tarballs from [ROCm/spur](https://github.com/ROCm/spur/releases) also ship `lib/spur/spur_mpi_pmix.so`. The playbooks install it on **agents only** at `/usr/lib/spur/` (matches `spurd`'s default plugin path). For a local build, also run `cargo build --release -p spur-mpi-pmix` and stage `target/release/libspur_mpi_pmix.so` (or rename to `spur_mpi_pmix.so`) in `spur_binary_src`. PMIx jobs (`--mpi=pmix`) additionally require `libpmix` and Open MPI on agent hosts — the playbooks do not install those packages.
 
-> A pre-merge build (before upstream folded `spurdbd` into `spurctld`) also produces a `spurdbd` binary. It's harmless sitting alongside the other three — the role only ever reads `spur`/`spurctld`/`spurd` by exact name.
+> A pre-merge build (before upstream folded `spurdbd` into `spurctld`) also produces a `spurdbd` binary. It's harmless sitting alongside the others — the role only ever reads `spur`/`spurctld`/`spurd`/`spurstepd` by exact name.
 
-**Every host gets the `spur` CLI + Slurm symlinks.** Agent-only hosts (in `[spur_agents]` but not `[spur_controllers]`/`[spur_login]`) also get `spurd`; controllers also get `spurctld` (and `spurd` too if also an agent). Only `spurctld` (the controller daemon) is host-specific — the CLI is everywhere so `squeue`/`sinfo`/etc. work locally on any node.
+**Every host gets the `spur` CLI + Slurm symlinks.** Agent-only hosts (in `[spur_agents]` but not `[spur_controllers]`/`[spur_login]`) also get `spurd` and `spurstepd`; controllers also get `spurctld` (and the agent pair too if also an agent). Only `spurctld` (the controller daemon) is host-specific — the CLI is everywhere so `squeue`/`sinfo`/etc. work locally on any node.
+
+### spurstepd, the job supervisor
+
+`spurstepd` supervises one `(job, step)` each. `spurd` spawns them detached — their own session, reparented to init — so they own the job's process tree, cgroup and exit status, and keep running across an `spurd` restart or upgrade; the restarted agent re-adopts them. Three things follow, and the playbooks handle all three:
+
+- **It must live in the same directory as `spurd`** (`spur_install_dir`). The agent resolves it beside its own executable and **does not search `$PATH`**, so a node without it fails *every* job launch. `spur_install` copies it from the same source as `spurd`, in the same task, so the pair always comes from one build — a supervisor written by one build is not adopted by another. It participates in the same checksum comparison, so an unchanged re-run stays a no-op.
+- **The `spurd` unit sets `KillMode=process`.** Supervisors detach from the agent but remain in its cgroup, so systemd's default (`control-group`) would kill them on every stop or restart and silently defeat the feature.
+- **Each agent gets its own session directory**, `spur_agent_state_dir` (default `{{ spur_home }}/agent-state`), passed as `SPUR_STEPD_STATE_DIR` in the unit. Deliberately not `{{ spur_home }}/state`, which is the controller's Raft directory: a host running both daemons must not have them share one. The environment variable is used rather than `spurd --state-dir` because a build that predates `spurstepd` ignores an unknown variable but refuses to start on an unknown flag.
+
+Builds before `spurstepd` existed ship no such binary, so its absence is a prominent **warning**, not an error. On a cluster whose build does ship it, set `-e spur_require_stepd=true` to make a missing `spurstepd` a hard failure in `spur_install` and a reported problem in `healthcheck.yml`.
+
+`teardown.yml` and `remove_nodes.yml` reap supervisors explicitly — "stop `spurd`" does not, by design. See [Tear down](#tear-down).
 
 Omit `spur_binary_src` and the playbook falls back to downloading a published release via upstream `install.sh` instead (see [Build prerequisites](#build-prerequisites)).
 
@@ -372,6 +387,8 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 | `spur_version` | `latest` | Which `install.sh` channel to pull: `latest` / `nightly` / `vX.Y.Z`. |
 | `spur_install_dir` | `/root/.local/bin` | Where binaries and Slurm symlinks land (added to `/etc/environment`). |
 | `spur_home` | `/root/spur` | Per-host root for state, logs, and config. |
+| `spur_agent_state_dir` | `{{ spur_home }}/agent-state` | Each agent's own runtime state — the `spurstepd` sessions a restarted `spurd` re-adopts. Passed to `spurd` as `SPUR_STEPD_STATE_DIR`. Kept out of `{{ spur_home }}/state` (the controller's Raft dir) so a host running both daemons never shares one. |
+| `spur_require_stepd` | `false` | Treat a missing `spurstepd` as a hard failure in `spur_install` and a reported problem in `healthcheck.yml`. Default `false` because builds that predate it ship none; set `true` on a cluster whose build does. |
 | `spur_mpi_plugin_dir` | `/usr/lib/spur` | Where `spur_mpi_pmix.so` is installed on agents (matches `spurd` default). |
 | `spur_mpi_plugin_enabled` | `true` | Install the MPI plugin on agents when a source file is available. |
 | `spur_transport` | `direct` | Network transport: `direct` or `wireguard`. |
@@ -431,14 +448,14 @@ ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_skip_busy_a
 Agents get their own `spur.conf` too — a minimal one with cluster identity and the `[cluster]`/k0s block, not the controller's full file. On both controllers and agents, a missing `spur.conf` is always written; an existing one is left alone unless you pass `-e spur_overwrite_conf=true`.
 
 ```bash
-cargo build --release -p spur-cli -p spurctld -p spurd   # rebuild all three together, see caveat below
+cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd   # rebuild all of them together, see caveat below
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release
 ```
 
 A few things worth knowing:
 
 - **Binaries roll out by content, not version string.** Ansible compares checksums, so an unchanged re-run is a near no-op.
-- **Rebuild all three together.** They share a Raft WAL schema. Mixing binaries from different builds — say, rebuilding only `spurctld` — can leave a controller unable to parse a log a differently-versioned peer wrote.
+- **Rebuild all of them together.** They share a Raft WAL schema. Mixing binaries from different builds — say, rebuilding only `spurctld` — can leave a controller unable to parse a log a differently-versioned peer wrote. `spurd` and `spurstepd` are even tighter: a supervisor written by one build is not adopted by another, so those two must always come from the same build. The role copies them in the same task for that reason.
 - **HA topology changes are guarded.** Adding, removing, or reordering a **controller** needs a reinit. Spur 0.3.0 has no online Raft membership change, so the role fails early with an actionable message if you change the controller set without `-e spur_wipe_state=true`. **Compute agents aren't Raft members** — add or remove them freely, no wipe needed.
 - **Demoting a controller to agent-only leaves a stale `spurctld`.** Moving a host out of `[spur_controllers]`? Run `systemctl disable --now spurctld` on it first. Otherwise the leftover daemon keeps the old membership and can block quorum.
 
@@ -447,7 +464,7 @@ A few things worth knowing:
 This path upgrades one host at a time, so the cluster keeps scheduling and running jobs throughout.
 
 ```bash
-cargo build --release -p spur-cli -p spurctld -p spurd
+cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
 ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release
 ```
 
@@ -458,7 +475,7 @@ It reuses the same `spur_install`/`spur_controller`/`spur_agent`/`spur_verify` r
 3. **Agents, in configurable batches** (`spur_rolling_batch_size`, default `1`). For each node: `spur node drain <node>`, poll until `DRAINED` (once no running jobs are left), force-reinstall, restart `spurd`, wait for re-registration, then `scontrol update NodeName=<node> State=RESUME`.
 4. **Verify** *(opt-in — `-e spur_verify_enabled=true`)*. Submits a real test job at the end to confirm the upgraded cluster actually schedules work. Off by default so routine upgrades don't add job noise; CI enables it.
 
-The same rebuild-all-three caveat from full convergence applies here too.
+The same rebuild-everything-together caveat from full convergence applies here too. `spurstepd` is installed/upgraded on agents the same way `spur`/`spurctld`/`spurd` are — no special handling, though the run prints an informational note (not a refusal) the first time it lands on an agent, since the controllers ahead of it in the batch are already on the new build.
 
 `spur_rolling_batch_size` trades speed for blast radius. The default `1` disrupts at most one agent's capacity at a time; a higher value upgrades faster but drains more capacity concurrently.
 
@@ -544,7 +561,9 @@ On a **WireGuard** cluster it joins the new node to the mesh before starting `sp
 
 ### Decommission compute nodes — `remove_nodes.yml`
 
-Cleanly remove agents from a running cluster. The playbook drains each node, waits until it reaches `DRAINED` so running jobs finish first, stops `spurd` on the node, then runs `spur node remove`. There's no state wipe, since agents aren't Raft members.
+Cleanly remove agents from a running cluster. The playbook drains each node, waits until it reaches `DRAINED` so running jobs finish first, stops `spurd` on the node, reaps any job supervisor and session state still there, then runs `spur node remove`. There's no Raft state wipe, since agents aren't Raft members.
+
+The supervisor reap matters because a `spurstepd` deliberately outlives its agent, so "stop `spurd`" does not stop it. On a cleanly drained node there is nothing left to reap and the step is a no-op; on a forced removal it is what keeps the decommissioned host from running processes for a cluster it no longer belongs to. The node is going away and nothing will ever re-adopt its sessions, so those are deleted too.
 
 ```bash
 ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_remove=gpu-3,gpu-4
@@ -563,7 +582,7 @@ ansible-playbook playbooks/remove_nodes.yml -i inventory/hosts.ini -e nodes_to_r
 
 ### Health check — `healthcheck.yml`
 
-Read-only cluster diagnostics. It checks that daemons are active, the controller is reachable with a leader elected, accounting/Postgres is up, agent ports are listening, and disk/Raft-state size is healthy. It never changes anything. If something's wrong it exits non-zero with a per-host problem list, which makes it usable as a cron or monitoring probe.
+Read-only cluster diagnostics. It checks that daemons are active, the controller is reachable with a leader elected, accounting/Postgres is up, agent ports are listening, and disk/Raft-state size is healthy. With `-e spur_require_stepd=true` it also checks that `spurstepd` is installed beside `spurd` on every agent — off by default so a cluster on a build that predates it isn't reported unhealthy. It never changes anything. If something's wrong it exits non-zero with a per-host problem list, which makes it usable as a cron or monitoring probe.
 
 ```bash
 ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini
@@ -584,7 +603,7 @@ ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e wipe=true  # a
 ansible-playbook playbooks/teardown.yml -i inventory/hosts.ini -e spur_ignore_unreachable_agents=true  # skip unreachable agents instead of aborting
 ```
 
-Either way it stops and disables the systemd services and reaps any stray daemons. On a **WireGuard** cluster it also brings the mesh interface down and disables its `wg-quick@<iface>` boot unit, so a plain (non-wipe) teardown doesn't silently re-establish the mesh on the next reboot; `-e wipe=true` additionally removes the saved `/etc/wireguard/<iface>.conf`. It deliberately leaves PostgreSQL installed and your accounting database intact — so if you want those gone too, drop them by hand on the accounting host.
+Either way it stops and disables the systemd services and reaps any stray daemons — **including the job supervisors**. A `spurstepd` is built to outlive its agent (its own session, reparented to init, and spared by the unit's `KillMode=process`), so stopping `spurd` leaves it running; teardown kills it explicitly, after the job-cgroup sweep and after the daemons are down. That ordering is deliberate: a supervisor whose workload just died reports that exit, so killing it first would throw the completion away. Session state on disk is left alone unless `-e wipe=true`, so a teardown you meant to undo still can be. On a **WireGuard** cluster it also brings the mesh interface down and disables its `wg-quick@<iface>` boot unit, so a plain (non-wipe) teardown doesn't silently re-establish the mesh on the next reboot; `-e wipe=true` additionally removes the saved `/etc/wireguard/<iface>.conf`. It deliberately leaves PostgreSQL installed and your accounting database intact — so if you want those gone too, drop them by hand on the accounting host.
 
 If `spur_k8s_enabled=true`, teardown first tears down any Spur-managed k0s cluster with a full `k0s reset` on every node (`spur k8s down --reset`) and waits for it to finish, before any Spur daemon is stopped — a node's k0s component can only be reset via a controller -> agent RPC, which needs both sides still running. Nothing k0s-related happens when `spur_k8s_enabled` is unset/false. This step targets specifically the first controller in inventory — running with `--limit` in a way that excludes that one host (even if other controllers are included, in HA setups) skips it silently and leaves agents' k0s components un-reset.
 

@@ -6,10 +6,21 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=HOME={{ spur_home }}
+# Where spurd keeps the supervisor sessions it re-adopts after a restart. Set
+# as an environment variable, not spurd's --state-dir flag: a build predating
+# spurstepd ignores an unknown variable but refuses to start on an unknown flag,
+# so this unit stays valid on both. Kept out of the controller's state_dir so a
+# host running both daemons never has them share a directory.
+Environment=SPUR_STEPD_STATE_DIR={{ spur_agent_state_dir }}
 WorkingDirectory={{ spur_home }}
 ExecStart={{ spur_install_dir }}/spurd -f {{ spur_home }}/etc/spur.conf --controller {{ spur_controller_endpoints | join(',') }} --hostname {{ spur_node_name }} --address {{ spur_agent_listen_ip }} --listen 0.0.0.0:{{ spur_agent_port }} --log-level {{ spur_log_level }}
 Restart=on-failure
 RestartSec=3
+# Required for jobs to survive an agent restart. Job supervisors deliberately
+# detach from spurd — own session, reparented to init — but they stay in this
+# unit's cgroup, so systemd's default KillMode (control-group) signals them on
+# every stop/restart and takes the running work with them.
+KillMode=process
 User=root
 LimitNOFILE=65536
 

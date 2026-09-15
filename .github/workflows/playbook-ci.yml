@@ -7,7 +7,10 @@
 #   spur_skip_busy_agents=true opt-out) + spur_controller_upgrade_order
 #   validation + rolling upgrade's default refusal on a busy node, covering
 #   all three agent states, + force upgrade with OS-level kill verification
-#   (bare process AND Docker container)
+#   (bare process AND Docker container), + spurstepd installed beside spurd on
+#   every agent and matching the deployed build, and the spurd unit's
+#   KillMode=process / SPUR_STEPD_STATE_DIR settings that make a supervisor
+#   outlive the agent
 #
 # integration-conf:
 #   deploy + spur.conf preservation on BOTH controller and agent (default:
@@ -19,7 +22,14 @@
 #   teardown.yml's disruptive-by-default/opt-in-drain behavior (no flags:
 #   stops a busy agent immediately and sweeps its job cgroup clean, no wait;
 #   spur_skip_busy_agents=true or spur_force_teardown_busy_agents=true opts
-#   back into draining first)
+#   back into draining first), plus spurstepd restart survival (a running job
+#   stays RUNNING across `systemctl restart spurd`, re-adopted by the SAME
+#   supervisor pids rather than respawned ones) and teardown's explicit reap of
+#   the supervisors that stopping spurd deliberately leaves behind
+#
+# The spurstepd assertions in both jobs are conditional on the fetched build
+# actually shipping the binary — no tagged release does yet — and start
+# enforcing from the first one that does.
 #
 # integration-ha-mesh:
 #   3-controller HA cluster over a real WireGuard mesh (SPUR-195, PR #23) — the
@@ -123,6 +133,12 @@ jobs:
               test -n "$bindir" || { echo "spurctld not found in $tarball"; exit 1; }
               mkdir -p "$GITHUB_WORKSPACE/$dest"
               for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/$dest/$b"; done
+              # spurstepd is newer than the other three, so a release predating
+              # it ships none — copy it only when present, and let the
+              # assertions below start enforcing it once upstream does.
+              if [ -f "$bindir/spurstepd" ]; then
+                cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/$dest/spurstepd"
+              fi
               plugin=$(find . -path '*/lib/spur/spur_mpi_pmix.so' -o -name spur_mpi_pmix.so 2>/dev/null | head -1)
               if [ -n "$plugin" ] && [ -f "$plugin" ]; then
                 cp "$plugin" "$GITHUB_WORKSPACE/$dest/spur_mpi_pmix.so"
@@ -315,6 +331,58 @@ jobs:
             docker exec "$a" test -f /usr/lib/spur/spur_mpi_pmix.so
           done
           echo "MPI plugin present on all agents"
+
+      - name: Assert spurstepd is installed beside spurd on every agent
+        # spurd resolves its supervisor beside its own executable and never
+        # searches $PATH, so "beside spurd" is the property under test, not
+        # "somewhere on the node". Byte-compared against the source, so a stale
+        # binary left by an earlier build can't pass. Conditional only because
+        # no tagged release ships spurstepd yet — this enforces from the first
+        # one that does.
+        run: |
+          set -euo pipefail
+          if [ ! -f "$GITHUB_WORKSPACE/spur-bin/spurstepd" ]; then
+            echo "::notice::deployed build ships no spurstepd — asserting none was installed"
+            for a in gpu-1 gpu-2 gpu-3; do
+              docker exec "$a" test ! -e /usr/local/bin/spurstepd \
+                || { echo "::error::$a has a spurstepd the deployed build never provided"; exit 1; }
+            done
+            exit 0
+          fi
+          want=$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurstepd" | awk '{print $1}')
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" test -x /usr/local/bin/spurstepd \
+              || { echo "::error::$a has no spurstepd beside spurd in /usr/local/bin"; exit 1; }
+            got=$(docker exec "$a" sha256sum /usr/local/bin/spurstepd | awk '{print $1}')
+            [ "$got" = "$want" ] \
+              || { echo "::error::$a spurstepd is not the deployed build ($got != $want)"; exit 1; }
+          done
+          # ctl-0 is a controller only, so it must NOT carry the agent pair.
+          docker exec ctl-0 test ! -e /usr/local/bin/spurstepd \
+            || { echo "::error::ctl-0 is not an agent but carries spurstepd"; exit 1; }
+          echo "spurstepd installed beside spurd, matching the deployed build, on all agents"
+
+      - name: Assert the spurd unit is configured to keep supervisors alive
+        # KillMode=process is the whole reason a job survives `systemctl restart
+        # spurd`: supervisors detach into their own session but stay in this
+        # unit's cgroup, so systemd's default control-group kill mode takes them
+        # down with the agent. Unconditional — this is our own template.
+        run: |
+          set -euo pipefail
+          for a in gpu-1 gpu-2 gpu-3; do
+            docker exec "$a" grep -qx 'KillMode=process' /etc/systemd/system/spurd.service \
+              || { echo "::error::$a spurd.service is missing KillMode=process"; exit 1; }
+            dir=$(docker exec "$a" sed -n 's/^Environment=SPUR_STEPD_STATE_DIR=//p' /etc/systemd/system/spurd.service | tr -d '\r')
+            [ -n "$dir" ] \
+              || { echo "::error::$a spurd.service does not set SPUR_STEPD_STATE_DIR"; exit 1; }
+            # Must not be the controller's Raft state dir, or a hyperconverged
+            # host would have both daemons writing into one directory.
+            [ "$dir" != /opt/spur/state ] \
+              || { echo "::error::$a agent state dir collides with the controller Raft state dir"; exit 1; }
+            docker exec "$a" test -d "$dir" \
+              || { echo "::error::$a agent state dir $dir was not created"; exit 1; }
+            echo "$a: KillMode=process, SPUR_STEPD_STATE_DIR=$dir"
+          done
 
       - name: Assert spur CLI works locally on agents under direct transport
         run: |
@@ -732,6 +800,12 @@ jobs:
               test -n "$bindir" || { echo "spurctld not found in $tarball"; exit 1; }
               mkdir -p "$GITHUB_WORKSPACE/$dest"
               for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/$dest/$b"; done
+              # spurstepd is newer than the other three, so a release predating
+              # it ships none — copy it only when present, and let the
+              # assertions below start enforcing it once upstream does.
+              if [ -f "$bindir/spurstepd" ]; then
+                cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/$dest/spurstepd"
+              fi
               plugin=$(find . -path '*/lib/spur/spur_mpi_pmix.so' -o -name spur_mpi_pmix.so 2>/dev/null | head -1)
               if [ -n "$plugin" ] && [ -f "$plugin" ]; then
                 cp "$plugin" "$GITHUB_WORKSPACE/$dest/spur_mpi_pmix.so"
@@ -1167,6 +1241,11 @@ jobs:
             bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
             mkdir -p "$GITHUB_WORKSPACE/spur-bin"
             for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"; done
+            # spurstepd is newer than the other three, so a release predating it
+            # ships none — copy it only when present.
+            if [ -f "$bindir/spurstepd" ]; then
+              cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/spur-bin/spurstepd"
+            fi
             chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
           )
 
@@ -1252,6 +1331,65 @@ jobs:
             sleep 2
           done
           [ -z "$missing" ] || { echo "agents still missing:$missing"; exit 1; }
+
+      # --- a running job survives `systemctl restart spurd` ------------------
+      - name: Assert a running job survives an spurd restart
+        # The point of spurstepd. Adoption is checked by supervisor IDENTITY,
+        # not count: a supervisor killed with the agent and respawned afterwards
+        # would satisfy any "still one running" check, so the pids must be the
+        # same ones from before the restart. Conditional only because no tagged
+        # release ships spurstepd yet.
+        run: |
+          set -euo pipefail
+          if [ ! -f "$GITHUB_WORKSPACE/spur-bin/spurstepd" ]; then
+            echo "::notice::deployed build ships no spurstepd — skipping restart-survival test"
+            exit 0
+          fi
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=stepd-survive\nsleep 600\n" > /tmp/ci-stepd-survive.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-2 /tmp/ci-stepd-survive.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-stepd-survive.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "job $jid RUNNING on gpu-2"; exit 0; }
+              sleep 1
+            done
+            echo "job $jid never reached RUNNING"; exit 1
+          '
+          jid=$(docker exec ctl-0 cat /tmp/ci-stepd-survive.jid)
+          before=$(docker exec gpu-2 pgrep -x spurstepd | sort | tr '\n' ' ' || true)
+          [ -n "$before" ] || { echo "::error::no spurstepd supervising the running job on gpu-2"; exit 1; }
+          echo "supervisors before restart: $before"
+
+          docker exec gpu-2 systemctl restart spurd
+          for i in $(seq 1 30); do
+            # `cmd && break` would abort the step under set -e on a miss; an if
+            # condition is exempt.
+            if docker exec ctl-0 /usr/local/bin/spur show node gpu-2 2>/dev/null \
+                 | grep -qx "NodeName=gpu-2"; then break; fi
+            sleep 2
+          done
+          docker exec gpu-2 systemctl is-active spurd | grep -qx active \
+            || { echo "::error::spurd did not come back on gpu-2"; exit 1; }
+
+          after=$(docker exec gpu-2 pgrep -x spurstepd | sort | tr '\n' ' ' || true)
+          [ "$after" = "$before" ] \
+            || { echo "::error::supervisors changed across the restart (before: $before / after: $after)"; exit 1; }
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" \
+                 | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] \
+            || { echo "::error::job $jid is $st after the spurd restart, expected RUNNING"; exit 1; }
+          echo "PASS: job $jid still RUNNING and re-adopted by the same supervisors after restart"
+
+          docker exec -u ciuser ctl-0 /usr/local/bin/spur cancel "$jid" || true
+          for i in $(seq 1 30); do
+            st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null \
+                   | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+            case "$st" in CANCELLED|COMPLETED|FAILED) break ;; esac
+            sleep 1
+          done
+          echo "cleanup: job $jid is ${st:-unknown}"
 
       # --- remove_nodes.yml: refuse / skip / force on a busy node -----------
       - name: Submit a busy job on gpu-1 for the remove_nodes.yml tests
@@ -1390,7 +1528,12 @@ jobs:
           orphan_pids=$(docker exec gpu-2 bash -c \
             "find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null | xargs cat 2>/dev/null | sort -u" || true)
           [ -z "$orphan_pids" ] || { echo "FAIL: orphan job PIDs still in spur cgroups on gpu-2: $orphan_pids"; exit 1; }
-          echo "PASS: teardown.yml stopped gpu-2's spurd immediately, no drain/refuse, no orphaned job processes"
+          # A supervisor deliberately outlives its agent, so stopping spurd does
+          # NOT stop it — teardown has to reap it explicitly, and this is what
+          # proves it did.
+          stray=$(docker exec gpu-2 pgrep -x spurstepd | tr '\n' ' ' || true)
+          [ -z "$stray" ] || { echo "FAIL: spurstepd supervisors left running on gpu-2 after teardown: $stray"; exit 1; }
+          echo "PASS: teardown.yml stopped gpu-2's spurd immediately, no drain/refuse, no orphaned job processes or supervisors"
 
       # --- teardown.yml: spur_skip_busy_agents/spur_force_teardown_busy_agents opt back into draining first ---
       - name: Submit a busy job on gpu-3 for the teardown.yml opt-in-drain test
@@ -1559,6 +1702,11 @@ jobs:
             test -n "$bindir" || { echo "spurctld not found in $tarball"; exit 1; }
             mkdir -p "$GITHUB_WORKSPACE/spur-bin"
             for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"; done
+            # spurstepd is newer than the other three, so a release predating it
+            # ships none — copy it only when present.
+            if [ -f "$bindir/spurstepd" ]; then
+              cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/spur-bin/spurstepd"
+            fi
             chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
           )
           # Fail fast + clearly if this nightly predates #719 (missing the new
@@ -1996,6 +2144,11 @@ jobs:
             bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
             mkdir -p "$GITHUB_WORKSPACE/spur-bin"
             for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"; done
+            # spurstepd is newer than the other three, so a release predating it
+            # ships none — copy it only when present.
+            if [ -f "$bindir/spurstepd" ]; then
+              cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/spur-bin/spurstepd"
+            fi
             chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
           )
 

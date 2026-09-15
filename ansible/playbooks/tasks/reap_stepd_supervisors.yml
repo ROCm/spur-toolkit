@@ -1,0 +1,62 @@
+---
+# Reap the per-(job, step) supervisors (spurstepd) a job leaves behind on a
+# host — shared by teardown.yml and remove_nodes.yml.
+#
+# A supervisor is *designed* to outlive its agent: spurd double-forks it into
+# its own session so it reparents to init, and the unit's KillMode=process
+# stops systemd from sweeping it up. So "stop spurd" leaves them running, and
+# nothing else in this repo would ever clean them up.
+#
+# MUST run after tasks/kill_workload_processes.yml and after spurd is stopped:
+#   - workloads first, because killing a supervisor on its own only orphans the
+#     process tree it was holding (the workload is a separate process in the
+#     job's cgroup, which that task sweeps);
+#   - spurd stopped first, so a still-live agent doesn't race this by reacting
+#     to the supervisor exits it is watching for.
+#
+# A supervisor ignores a bare SIGTERM by design, so the SIGKILL below is what
+# actually lands; the SIGTERM is kept only so a future build that does handle
+# it gets the chance to exit cleanly.
+#
+# Include with this var set by the caller:
+#   stepd_purge_sessions  bool — also delete the on-disk session directories.
+#                         Only for a host that is not coming back (a
+#                         decommission, or a wiping teardown): the sessions are
+#                         what a restarted agent re-adopts its jobs from.
+
+- name: Kill supervisors left running after the agent stopped
+  ansible.builtin.shell: |
+    set -uo pipefail
+    pids=$(pgrep -x spurstepd 2>/dev/null | tr '\n' ' ')
+    if [ -z "$pids" ]; then
+      echo "RESULT=NONE"
+      exit 0
+    fi
+    echo "spurstepd supervisors still running: $pids"
+    pkill -x -TERM spurstepd 2>/dev/null || true
+    sleep 2
+    pkill -x -KILL spurstepd 2>/dev/null || true
+    sleep 1
+    # A zombie counts as gone — it holds no resources and init reaps it. Only a
+    # process still in a live state after SIGKILL is a real failure.
+    left=""
+    for pid in $(pgrep -x spurstepd 2>/dev/null); do
+      state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)
+      case "${state:-Z}" in Z|'') continue ;; esac
+      left="$left $pid"
+    done
+    if [ -n "$left" ]; then
+      echo "supervisors survived SIGKILL:$left" >&2
+      exit 1
+    fi
+    echo "RESULT=REAPED"
+  args:
+    executable: /bin/bash
+  register: stepd_reap
+  changed_when: "'RESULT=REAPED' in stepd_reap.stdout"
+
+- name: Remove the agent's supervisor session state
+  ansible.builtin.file:
+    path: "{{ spur_agent_state_dir }}/runtime"
+    state: absent
+  when: stepd_purge_sessions | default(false) | bool

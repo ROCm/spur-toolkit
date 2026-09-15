@@ -52,14 +52,35 @@
     msg: "{{ pf_preflight.stdout_lines | select('match', '^(spurctld|spurd|spurrestd) running') | list | default(['no spur daemons running']) }}"
   when: not (pf_preflight.unreachable | default(false))
 
+# spurstepd only exists in builds from ROCm/spur#754 onward, so it can't be
+# copied unconditionally — an older pinned release has no such file and the
+# copy below would abort the run. Probing the source (rather than assuming)
+# also catches a local build where `-p spur-stepd` was left off the cargo
+# invocation, which is otherwise silent until the first job fails to launch.
+- name: Does the install source ship spurstepd?
+  ansible.builtin.stat:
+    path: "{{ spur_binary_src }}/spurstepd"
+  register: spur_stepd_src
+  delegate_to: localhost
+  become: false
+  when:
+    - spur_needs_agent_bin
+    - spur_binary_src | default('') | length > 0
+
 # Two install sources:
 #   1. spur_binary_src (a directory on the Ansible control node holding pre-built
-#      spur/spurctld/spurd) — used for air-gapped installs and when the
-#      upstream repo has no published GitHub release yet. Takes precedence.
+#      spur/spurctld/spurd, and spurstepd on builds that have it) — used for
+#      air-gapped installs and when the upstream repo has no published GitHub
+#      release yet. Takes precedence.
 #   2. upstream install.sh — downloads the latest published release.
 # Both are unconditional when spur_force_reinstall is set (rolling upgrades need
 # to overwrite an already-installed binary with a newer build of the same name).
 # Only the components this host role needs are copied (see spur_needs_*).
+#
+# spurstepd rides the same copy as spurd so the two always come from one build:
+# a supervisor written by one build is not adopted by another, so the pair must
+# never be rolled independently. copy compares checksums, so an unchanged
+# re-run stays a no-op and a changed binary actually rolls.
 - name: Copy pre-built Spur binaries from control node
   ansible.builtin.copy:
     src: "{{ spur_binary_src }}/{{ item }}"
@@ -68,7 +89,8 @@
   loop: >-
     {{ ['spur']
        + (['spurctld'] if spur_needs_ctld else [])
-       + (['spurd'] if spur_needs_agent_bin else []) }}
+       + (['spurd'] if spur_needs_agent_bin else [])
+       + (['spurstepd'] if (spur_stepd_src.stat.exists | default(false)) else []) }}
   when: spur_binary_src | default('') | length > 0
 
 - name: Install Spur via upstream installer
@@ -94,13 +116,19 @@
 # per-symlink over the wire.
 - name: Remove unneeded binaries, verify needed binaries, symlink Slurm-compatible CLI names
   vars:
+    # spurstepd is only *required* when the operator says this build ships it
+    # (spur_require_stepd) — an older release has none, and a hard requirement
+    # would break those deploys. It's reported either way by the task below.
     spur_needed_bins: >-
       {{ ['spur']
          + (['spurctld'] if spur_needs_ctld else [])
-         + (['spurd'] if spur_needs_agent_bin else []) }}
+         + (['spurd'] if spur_needs_agent_bin else [])
+         + (['spurstepd'] if (spur_needs_agent_bin and (spur_require_stepd | default(false) | bool)) else []) }}
+    # A host moved out of [spur_agents] keeps no agent-side binaries, spurstepd
+    # included — it is useless without the spurd that spawns it.
     spur_unneeded_bins: >-
       {{ (['spurctld'] if not spur_needs_ctld else [])
-         + (['spurd'] if not spur_needs_agent_bin else []) }}
+         + (['spurd', 'spurstepd'] if not spur_needs_agent_bin else []) }}
   ansible.builtin.shell: |
     set -e
     rm -f "{{ spur_install_dir }}/spurdbd"
@@ -110,6 +138,10 @@
     for b in {{ spur_needed_bins | join(' ') }}; do
       [ -f "{{ spur_install_dir }}/$b" ] || { echo "missing binary: $b"; exit 1; }
     done
+    {% if spur_needs_agent_bin %}
+    # Reported (not enforced) so the warning below can name the exact problem.
+    [ -f "{{ spur_install_dir }}/spurstepd" ] && echo STEPD_PRESENT || echo STEPD_MISSING
+    {% endif %}
     changed=0
     for s in sbatch squeue sinfo scancel sacct sacctmgr scontrol salloc srun sattach scrontab sdiag smd sprio sreport sshare sstat strigger; do
       link="{{ spur_install_dir }}/$s"
@@ -124,6 +156,25 @@
   changed_when: "'SYMLINKS_UPDATED' in spur_ver.stdout"
   failed_when: spur_ver.rc != 0
 
+# Loud, because the failure mode it predicts is total and looks unrelated:
+# spurd resolves spurstepd beside its own executable and never searches $PATH,
+# so on a build that expects one, a node without it fails EVERY job launch.
+- name: Warn that this agent has no spurstepd beside spurd
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ inventory_hostname }} has no spurstepd in {{ spur_install_dir }}.
+      That is expected for a build that predates it, and harmless there. If this
+      build DOES expect one — check that the release ships it, or that a local
+      build included `-p spur-stepd` — then every job launch on this node will
+      fail: spurd resolves spurstepd beside its own executable and does not
+      search $PATH. Set -e spur_require_stepd=true to make this a hard failure.
+  when:
+    - spur_needs_agent_bin
+    - not (pf_preflight.unreachable | default(false))
+    - "'STEPD_MISSING' in (spur_ver.stdout | default(''))"
+
 - name: Show install result
   ansible.builtin.debug:
-    msg: "{{ inventory_hostname }}: spur binaries installed in {{ spur_install_dir }}"
+    msg: >-
+      {{ inventory_hostname }}: spur binaries installed in {{ spur_install_dir }}
+      {{ '(with spurstepd)' if ('STEPD_PRESENT' in (spur_ver.stdout | default(''))) else '' }}

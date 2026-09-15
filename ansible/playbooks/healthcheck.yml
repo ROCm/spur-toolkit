@@ -102,6 +102,18 @@
       register: hc_port
       failed_when: false
 
+    # Only probed when the operator has said this build ships spurstepd — a
+    # build that predates it has none, and reporting every such cluster as
+    # unhealthy would be noise. Where it IS expected, its absence fails every
+    # job launch on the node, which is squarely a health problem: spurd
+    # resolves it beside its own executable and never searches $PATH.
+    - name: spurstepd installed beside spurd?
+      ansible.builtin.stat:
+        path: "{{ spur_install_dir }}/spurstepd"
+      register: hc_stepd
+      failed_when: false
+      when: spur_require_stepd | default(false) | bool
+
     - name: Raft/state dir size + free disk under spur_home
       ansible.builtin.shell: |
         set +e
@@ -125,6 +137,7 @@
         hc_problems: >-
           {{ (hc_spurd.stdout | default('') != 'active') | ternary(['spurd not active'], [])
              + (hc_port.failed | default(false)) | ternary(['agent port ' ~ spur_agent_port ~ ' not listening'], [])
+             + ((spur_require_stepd | default(false) | bool) and not (hc_stepd.stat.exists | default(false))) | ternary(['spurstepd missing from ' ~ spur_install_dir ~ ' (every job launch here will fail)'], [])
              + (hc_disk.stdout | default('') is search('LOW_DISK')) | ternary(['low disk (<1GB free) under ' ~ spur_home], []) }}
       when: not (hc_spurd.unreachable | default(false))
 
