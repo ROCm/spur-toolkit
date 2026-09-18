@@ -762,6 +762,43 @@ jobs:
           echo "gpu-3 re-registered after force upgrade"
           docker exec ctl-0 /usr/local/bin/spur show node gpu-3
 
+      # rolling_upgrade.yml --force relies on spurstepd's own normal completion
+      # path to clean itself up (kill_workload_processes.yml deliberately never
+      # touches it — see its header), with spurd's own startup recovery only as
+      # a fallback if a supervisor died before it could report. Either path can
+      # lag a beat behind gpu-3's re-registration, so poll rather than one-shot.
+      - name: Assert no stray spurstepd or leftover session state survives the force upgrade
+        run: |
+          set -euo pipefail
+          if [ ! -f "$GITHUB_WORKSPACE/spur-bin-new/spurstepd" ]; then
+            echo "::notice::upgrade build ships no spurstepd — skipping"
+            exit 0
+          fi
+          docker exec gpu-3 true \
+            || { echo "::error::gpu-3 unreachable — cannot verify cleanup"; exit 1; }
+
+          clean=""
+          for i in $(seq 1 10); do
+            stray=$(docker exec gpu-3 pgrep -x spurstepd | tr '\n' ' ' || true)
+            leftover=""
+            for f in ci-force-bare ci-force-docker; do
+              jid=$(docker exec ctl-0 cat "/tmp/${f}.jid")
+              out=$(docker exec gpu-3 bash -c \
+                "find /opt/spur/agent-state/runtime -maxdepth 1 -type d -name '${jid}.*' 2>/dev/null" || true)
+              [ -n "$out" ] && leftover="$leftover $out"
+            done
+            if [ -z "$stray" ] && [ -z "$leftover" ]; then
+              clean=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$clean" ]; then
+            echo "::error::spurstepd/session state still present on gpu-3 after force upgrade (spurstepd: '${stray:-none}', leftover: '${leftover:-none}')"
+            exit 1
+          fi
+          echo "no stray spurstepd or leftover session state on gpu-3 after force upgrade"
+
       - name: Dump logs on failure
         if: failure()
         run: |
