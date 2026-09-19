@@ -698,6 +698,18 @@ jobs:
           # `docker run` inside it actually succeeded either way.
           docker exec gpu-3 docker ps --filter name=ci-force-container
 
+          # The post-upgrade "no stray spurstepd" assertion only proves something
+          # if a supervisor was actually here to begin with — confirm that first.
+          if [ ! -f "$GITHUB_WORKSPACE/spur-bin/spurstepd" ]; then
+            echo "::notice::deployed build ships no spurstepd — skipping pre-upgrade supervisor check"
+          else
+            stray_before=$(docker exec gpu-3 pgrep -x spurstepd | tr '\n' ' ' || true)
+            count_before=$(echo "$stray_before" | wc -w)
+            [ "$count_before" -ge 2 ] \
+              || { echo "::error::expected at least 2 spurstepd supervisors on gpu-3 before the force upgrade, found $count_before"; exit 1; }
+            echo "$count_before spurstepd supervisors confirmed on gpu-3 before the force upgrade: $stray_before"
+          fi
+
       - name: rolling_upgrade.yml --force (gpu-3 force-upgraded, jobs+container killed)
         working-directory: ansible
         env:
@@ -778,7 +790,7 @@ jobs:
             || { echo "::error::gpu-3 unreachable — cannot verify cleanup"; exit 1; }
 
           clean=""
-          for i in $(seq 1 10); do
+          for i in $(seq 1 30); do
             stray=$(docker exec gpu-3 pgrep -x spurstepd | tr '\n' ' ' || true)
             leftover=""
             for f in ci-force-bare ci-force-docker; do

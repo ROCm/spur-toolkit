@@ -43,9 +43,10 @@
 # spur_agent even gets to restarting spurd below. If a supervisor itself died
 # before it could report, spurd's own startup recovery (not a targeted reap)
 # catches that case on the next restart instead, so the controller never sees
-# a job stuck RUNNING either way. Session state under spur_agent_state_dir is
-# left on disk the same way a non-wiping teardown leaves it — nothing here
-# purges it.
+# a job stuck RUNNING either way. This playbook has no wipe flag (unlike
+# teardown.yml -e wipe=true), so anything else under spur_agent_state_dir is
+# left untouched — but the killed job's own session directory is already
+# gone by then, via the self-cleanup described above.
 #
 # Submit a real test job at the end to verify scheduling still works (default
 # false — off for routine upgrades, on in CI):
