@@ -25,7 +25,10 @@
 #   back into draining first), plus spurstepd restart survival (a running job
 #   stays RUNNING across `systemctl restart spurd`, re-adopted by the SAME
 #   supervisor pids rather than respawned ones) and teardown's explicit reap of
-#   the supervisors that stopping spurd deliberately leaves behind
+#   the supervisors that stopping spurd deliberately leaves behind, plus
+#   rolling_upgrade.yml's spur_trust_stepd_busy_agents=true path (same
+#   restart-survival guarantee, but driven through the playbook's own
+#   drain/guard logic instead of a raw systemctl restart)
 #
 # The spurstepd assertions in both jobs are conditional on the fetched build
 # actually shipping the binary — no tagged release does yet — and start
