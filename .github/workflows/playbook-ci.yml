@@ -698,6 +698,18 @@ jobs:
           # `docker run` inside it actually succeeded either way.
           docker exec gpu-3 docker ps --filter name=ci-force-container
 
+          # The post-upgrade "no stray spurstepd" assertion only proves something
+          # if a supervisor was actually here to begin with — confirm that first.
+          if [ ! -f "$GITHUB_WORKSPACE/spur-bin/spurstepd" ]; then
+            echo "::notice::deployed build ships no spurstepd — skipping pre-upgrade supervisor check"
+          else
+            stray_before=$(docker exec gpu-3 pgrep -x spurstepd | tr '\n' ' ' || true)
+            count_before=$(echo "$stray_before" | wc -w)
+            [ "$count_before" -ge 2 ] \
+              || { echo "::error::expected at least 2 spurstepd supervisors on gpu-3 before the force upgrade, found $count_before"; exit 1; }
+            echo "$count_before spurstepd supervisors confirmed on gpu-3 before the force upgrade: $stray_before"
+          fi
+
       - name: rolling_upgrade.yml --force (gpu-3 force-upgraded, jobs+container killed)
         working-directory: ansible
         env:
@@ -719,7 +731,10 @@ jobs:
           jid=$(docker exec ctl-0 cat /tmp/ci-force-bare.jid)
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
           echo "bare job $jid scheduler state: $st"
-          [ "$st" = RUNNING ] && { echo "FAIL: bare job still RUNNING"; exit 1; }
+          case "$st" in
+            FAILED|CANCELLED) ;;
+            *) echo "FAIL: bare job should be FAILED or CANCELLED after a force upgrade, got $st"; exit 1 ;;
+          esac
           echo "scheduler: bare job ended with $st"
 
           orphan_pids=$(docker exec gpu-3 bash -c \
@@ -737,7 +752,10 @@ jobs:
           jid=$(docker exec ctl-0 cat /tmp/ci-force-docker.jid)
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -1 | cut -d= -f2)
           echo "docker job $jid scheduler state: $st"
-          [ "$st" = RUNNING ] && { echo "FAIL: docker job still RUNNING in scheduler"; exit 1; }
+          case "$st" in
+            FAILED|CANCELLED) ;;
+            *) echo "FAIL: docker job should be FAILED or CANCELLED after a force upgrade, got $st"; exit 1 ;;
+          esac
           echo "scheduler: docker job ended with $st"
 
           # The Docker container must be gone — not running, not even stopped/exited.
@@ -761,6 +779,56 @@ jobs:
           [ -n "$found" ] || { echo "gpu-3 did not re-register after force upgrade"; exit 1; }
           echo "gpu-3 re-registered after force upgrade"
           docker exec ctl-0 /usr/local/bin/spur show node gpu-3
+
+      # rolling_upgrade.yml --force relies on spurstepd's own normal completion
+      # path to clean itself up (kill_workload_processes.yml deliberately never
+      # touches it — see its header), with spurd's own startup recovery only as
+      # a fallback if a supervisor died before it could report. Every artifact
+      # a job can leave on the node — its spool/session directory, the
+      # spurstepd supervising it, the unshare+workload processes that
+      # supervisor held, and any container the job launched — is checked
+      # together here, with retry: any one of them can lag a beat behind
+      # gpu-3's re-registration, and a partial cleanup is as much a failure
+      # as no cleanup at all.
+      - name: Assert full worker-side cleanup after force upgrade (spool, stepd, unshare/workload, container)
+        run: |
+          set -euo pipefail
+          docker exec gpu-3 true \
+            || { echo "::error::gpu-3 unreachable — cannot verify cleanup"; exit 1; }
+
+          clean=""
+          for i in $(seq 1 30); do
+            stray=""
+            leftover=""
+            if [ -f "$GITHUB_WORKSPACE/spur-bin-new/spurstepd" ]; then
+              stray=$(docker exec gpu-3 pgrep -x spurstepd | tr '\n' ' ' || true)
+              for f in ci-force-bare ci-force-docker; do
+                jid=$(docker exec ctl-0 cat "/tmp/${f}.jid")
+                out=$(docker exec gpu-3 bash -c \
+                  "find /opt/spur/agent-state/runtime -maxdepth 1 -type d -name '${jid}.*' 2>/dev/null" || true)
+                [ -n "$out" ] && leftover="$leftover $out"
+              done
+            fi
+
+            # cgroup.procs is the canonical membership list for every process the
+            # supervisor launched (the unshare wrapper and the workload it execs
+            # into both land here — confirmed live, not assumed), so an empty
+            # read here means neither survives, under any name.
+            orphans=$(docker exec gpu-3 bash -c \
+              "find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null | xargs cat 2>/dev/null | sort -u" || true)
+            container=$(docker exec gpu-3 docker ps --filter name=ci-force-container --format '{{.Names}}' || true)
+
+            if [ -z "$stray" ] && [ -z "$leftover" ] && [ -z "$orphans" ] && [ -z "$container" ]; then
+              clean=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$clean" ]; then
+            echo "::error::worker-side cleanup incomplete on gpu-3 — spurstepd: '${stray:-none}', session dirs: '${leftover:-none}', cgroup PIDs (unshare/workload): '${orphans:-none}', container: '${container:-none}'"
+            exit 1
+          fi
+          echo "gpu-3 fully clean after force upgrade: no spurstepd, session state, unshare/workload processes, or container survive"
 
       - name: Dump logs on failure
         if: failure()

@@ -35,6 +35,19 @@
 # know no production work is running, or when jobs are short/re-runnable):
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_force_upgrade_busy_agents=true
 #
+# Unlike teardown.yml/remove_nodes.yml, this playbook never calls
+# tasks/reap_stepd_supervisors.yml on a force-killed job's spurstepd — it
+# doesn't need to. kill_workload_processes.yml deliberately never touches
+# spurstepd (see its header): the supervisor notices its own job die, reports
+# the exit, and cleans up its own session normally — typically well before
+# spur_agent even gets to restarting spurd below. If a supervisor itself died
+# before it could report, spurd's own startup recovery (not a targeted reap)
+# catches that case on the next restart instead, so the controller never sees
+# a job stuck RUNNING either way. This playbook has no wipe flag (unlike
+# teardown.yml -e wipe=true), so anything else under spur_agent_state_dir is
+# left untouched — but the killed job's own session directory is already
+# gone by then, via the self-cleanup described above.
+#
 # Submit a real test job at the end to verify scheduling still works (default
 # false — off for routine upgrades, on in CI):
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_verify_enabled=true
