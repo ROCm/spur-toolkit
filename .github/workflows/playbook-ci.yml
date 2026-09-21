@@ -1303,36 +1303,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download + verify Spur binaries
+      - name: Download + verify Spur binaries (deploy = release, upgrade = nightly)
         env:
           GH_TOKEN: ${{ github.token }}
           DEPLOY_TAG: ""
+          UPGRADE_TAG: ""
         run: |
           set -euo pipefail
+
+          fetch() {
+            local tag="$1" dest="$2" d
+            d="dl-$dest"
+            mkdir -p "$d"
+            ( cd "$d"
+              gh release download "$tag" --repo ROCm/spur \
+                --pattern '*-linux-amd64.tar.gz' \
+                --pattern '*-linux-amd64.tar.gz.sha256'
+              tarball=$(ls *-linux-amd64.tar.gz)
+              hash=$(awk '{print $1}' "${tarball}.sha256")
+              echo "${hash}  ${tarball}" | sha256sum -c -
+              tar xzf "$tarball"
+              bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
+              mkdir -p "$GITHUB_WORKSPACE/$dest"
+              for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/$dest/$b"; done
+              # spurstepd is newer than the other three, so a release predating it
+              # ships none — copy it only when present.
+              if [ -f "$bindir/spurstepd" ]; then
+                cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/$dest/spurstepd"
+              fi
+              chmod +x "$GITHUB_WORKSPACE/$dest"/*
+            )
+          }
+
           deploy_tag="${DEPLOY_TAG:-}"
           if [ -z "$deploy_tag" ]; then
             deploy_tag=$(gh api repos/ROCm/spur/releases --jq \
               'map(select(.tag_name != "nightly"))[0].tag_name')
           fi
-          mkdir -p dl-spur-bin
-          ( cd dl-spur-bin
-            gh release download "$deploy_tag" --repo ROCm/spur \
-              --pattern '*-linux-amd64.tar.gz' \
-              --pattern '*-linux-amd64.tar.gz.sha256'
-            tarball=$(ls *-linux-amd64.tar.gz)
-            hash=$(awk '{print $1}' "${tarball}.sha256")
-            echo "${hash}  ${tarball}" | sha256sum -c -
-            tar xzf "$tarball"
-            bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
-            mkdir -p "$GITHUB_WORKSPACE/spur-bin"
-            for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"; done
-            # spurstepd is newer than the other three, so a release predating it
-            # ships none — copy it only when present.
-            if [ -f "$bindir/spurstepd" ]; then
-              cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/spur-bin/spurstepd"
-            fi
-            chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
-          )
+          upgrade_tag="${UPGRADE_TAG:-nightly}"
+
+          fetch "$deploy_tag"  spur-bin
+          fetch "$upgrade_tag" spur-bin-new
 
       - name: Start systemd containers on a docker network
         env:
