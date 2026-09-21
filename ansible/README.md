@@ -412,6 +412,7 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 | `spur_skip_busy_agents` | `false` | Leave a still-busy node untouched and continue with the rest of the fleet, instead of the playbook's default (refuse, or force for `deploy.yml`). Shared task in `deploy.yml`/`rolling_upgrade.yml`; `remove_nodes.yml` reads the same variable in its own inline logic. On `teardown.yml` (disruptive/no-drain by default), setting this is also what opts back into draining first. |
 | `spur_force_teardown_busy_agents` | `false` | `teardown.yml`-specific: opts into draining first (like `spur_skip_busy_agents` above), then kills a busy node's running job and tears it down anyway. |
 | `spur_force_upgrade_busy_agents` | `false` | `rolling_upgrade.yml`-specific: kill a busy node's running job and upgrade it anyway. |
+| `spur_trust_stepd_busy_agents` | `false` | `rolling_upgrade.yml`-specific: restart a busy node's `spurd` without killing its running job, trusting `spurstepd` to carry it across. Refused if the node has no `spurstepd` yet, or combined with `spur_skip_busy_agents`/`spur_force_upgrade_busy_agents`. |
 | `spur_force_remove_busy_nodes` | `false` | `remove_nodes.yml`-specific: kill a busy node's running job and remove it anyway. |
 
 Override any of these per run with `-e key=value` (repeatable):
@@ -484,9 +485,12 @@ Controllers upgrade in inventory order by default. To upgrade them in a specific
 A still-busy node that doesn't drain within `spur_drain_wait_secs` (default `120s`) aborts the run by default. Opt out per node or force through it:
 
 ```bash
-ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_skip_busy_agents=true         # leave busy agents on the old build, upgrade the rest
+ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_skip_busy_agents=true          # leave busy agents on the old build, upgrade the rest
 ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_force_upgrade_busy_agents=true  # kill the running job and upgrade it anyway
+ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_trust_stepd_busy_agents=true    # restart spurd without killing the job — see below
 ```
+
+**`spur_trust_stepd_busy_agents=true` upgrades a busy node's `spurd` without touching its running job.** `spurstepd` is a detached, double-forked supervisor outside `spurd`'s process lifecycle (see [spurstepd](#spurstepd-the-job-supervisor)) — a job it supervises keeps running, in its own cgroup, across a `spurd` restart, and the restarted agent re-adopts it. This flag skips the wait-then-abort/kill choice entirely for a node whose job is already `spurstepd`-supervised: `spurd` restarts, the new binary discovers and reconciles the live session, and the job is never interrupted. It still refuses on a node with no `spurstepd` installed yet — trusting a supervisor that isn't there would be unsafe — and it's mutually exclusive with `spur_skip_busy_agents`/`spur_force_upgrade_busy_agents` (the guard-rail play fails fast if more than one is set). This does not affect scheduling of *new* jobs: the node is still drained (and only resumed once the upgrade completes), so nothing new lands on it mid-swap.
 
 > A single-controller cluster has no other controller to fail over to during its own restart, so rolling it is still a short outage. Real zero-downtime needs HA — three or more controllers.
 

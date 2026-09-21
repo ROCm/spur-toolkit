@@ -7,14 +7,15 @@
 
 # A skipped busy node was never touched (the caller's role/task didn't run for
 # it), so the daemon never restarted — there's nothing to wait for. A force-
-# disrupted busy node DID have its daemon restarted, so we do wait. Merged
+# disrupted or trusted-stepd busy node DID have its daemon restarted, so we
+# wait for those too. Merged
 # with the resume/undrain below (both delegated to the controller) to cut a
 # round-trip; a drained node stays drained after the daemon restarts —
 # draining is server-side state, not tied to the agent process — so resuming
 # unconditionally here also correctly covers a skipped-busy node.
 - name: Wait for the node to re-register (if it was actually restarted), then resume it
   ansible.builtin.shell: |
-    {% if (not (spur_node_busy | default(false))) or dckj_force_busy %}
+    {% if (not (spur_node_busy | default(false))) or dckj_force_busy or (spur_node_busy_trusted | default(false)) %}
     ok=""
     for i in $(seq 1 30); do
       {{ spur_install_dir }}/spur show node {{ spur_node_name }} >/dev/null 2>&1 && { ok=1; break; }

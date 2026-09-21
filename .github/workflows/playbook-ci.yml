@@ -1473,6 +1473,55 @@ jobs:
           done
           echo "cleanup: job $jid is ${st:-unknown}"
 
+      # --- rolling_upgrade.yml: spur_trust_stepd_busy_agents keeps a busy
+      # node's job alive with NO force/skip flag — the non-disruptive path. ---
+      - name: Submit a busy job on gpu-3 for the rolling_upgrade.yml trust-stepd test
+        run: |
+          set -euo pipefail
+          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=ru-trust-stepd\nsleep 600\n" > /tmp/ci-ru-trust.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-ru-trust.sh | grep -oE "[0-9]+" | head -1)
+            echo "$jid" > /tmp/ci-ru-trust.jid
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "job $jid RUNNING on gpu-3"; exit 0; }
+              sleep 1
+            done
+            echo "job $jid never reached RUNNING"; exit 1
+          '
+          docker exec gpu-3 pgrep -x spurstepd > /tmp/ci-ru-trust.stepd-before
+
+      - name: rolling_upgrade.yml -e spur_trust_stepd_busy_agents=true (must succeed, job survives, no force/skip)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_drain_wait_secs=10 \
+            -e spur_trust_stepd_busy_agents=true
+
+      - name: Assert gpu-3's job survived and gpu-3 is on the new build
+        run: |
+          set -euo pipefail
+          jid=$(docker exec ctl-0 cat /tmp/ci-ru-trust.jid)
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] \
+            || { echo "::error::job $jid is $st after rolling_upgrade.yml --trust-stepd, expected RUNNING"; exit 1; }
+          docker exec gpu-3 systemctl is-active spurd | grep -qx active \
+            || { echo "::error::spurd not active on gpu-3 after the trust-stepd upgrade"; exit 1; }
+          after=$(docker exec gpu-3 pgrep -x spurstepd || true)
+          [ "$after" = "$(cat /tmp/ci-ru-trust.stepd-before)" ] \
+            || { echo "::error::spurstepd identity changed across the trust-stepd upgrade (before: $(cat /tmp/ci-ru-trust.stepd-before) / after: $after)"; exit 1; }
+          old_sum=$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurd" | awk '{print $1}')
+          new_sum=$(docker exec gpu-3 sha256sum /usr/local/bin/spurd | awk '{print $1}')
+          [ "$new_sum" != "$old_sum" ] \
+            || { echo "::error::gpu-3's spurd binary was not actually upgraded"; exit 1; }
+          echo "PASS: job $jid still RUNNING (same spurstepd $after), gpu-3 upgraded, no force/skip flags used"
+          docker exec -u ciuser ctl-0 /usr/local/bin/spur cancel "$jid" || true
+
       # --- remove_nodes.yml: refuse / skip / force on a busy node -----------
       - name: Submit a busy job on gpu-1 for the remove_nodes.yml tests
         run: |
