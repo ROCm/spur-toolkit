@@ -482,15 +482,29 @@ The same rebuild-everything-together caveat from full convergence applies here t
 
 Controllers upgrade in inventory order by default. To upgrade them in a specific order instead — say, a known-stable Raft leader first — pass `-e spur_controller_upgrade_order=ctl-2,ctl-0,ctl-1`. It must name every controller in `[spur_controllers]` exactly once; the guard-rail play fails fast (before touching any host) if a name is missing, misspelled, or duplicated.
 
-A still-busy node that doesn't drain within `spur_drain_wait_secs` (default `120s`) aborts the run by default. Opt out per node or force through it:
+#### Busy-node handling — pick exactly one mode
+
+A still-busy node is one whose running job didn't drain within `spur_drain_wait_secs` (default `120s`). By default the run just aborts there. Three flags change that, **each a full alternative strategy — set at most one; the guard-rail play fails fast if you set more than one**:
+
+| Mode | Flag | What happens to the busy node | What happens to its running job |
+|---|---|---|---|
+| **Refuse** *(default — no flag)* | *(none)* | Left on the old build; the **whole run aborts** | Untouched, keeps running |
+| **Skip** | `spur_skip_busy_agents=true` | Left on the old build; rest of the fleet still upgrades | Untouched, keeps running |
+| **Force** | `spur_force_upgrade_busy_agents=true` | Upgraded to the new build immediately | **Killed** (`NODE_FAIL`) the moment `spurd` restarts |
+| **Trust spurstepd** | `spur_trust_stepd_busy_agents=true` | Upgraded to the new build immediately | Untouched, keeps running (see below) |
 
 ```bash
-ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_skip_busy_agents=true          # leave busy agents on the old build, upgrade the rest
-ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_force_upgrade_busy_agents=true  # kill the running job and upgrade it anyway
-ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_trust_stepd_busy_agents=true    # restart spurd without killing the job — see below
+# Force: kill the running job, upgrade the node anyway
+ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_force_upgrade_busy_agents=true
+
+# Non-disruptive: upgrade the node WITHOUT killing its running job
+ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_trust_stepd_busy_agents=true
+
+# Skip: leave the busy node on its old build, upgrade the rest of the fleet
+ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path -e spur_skip_busy_agents=true
 ```
 
-**`spur_trust_stepd_busy_agents=true` upgrades a busy node's `spurd` without touching its running job.** `spurstepd` is a detached, double-forked supervisor outside `spurd`'s process lifecycle (see [spurstepd](#spurstepd-the-job-supervisor)) — a job it supervises keeps running, in its own cgroup, across a `spurd` restart, and the restarted agent re-adopts it. This flag skips the wait-then-abort/kill choice entirely for a node whose job is already `spurstepd`-supervised: `spurd` restarts, the new binary discovers and reconciles the live session, and the job is never interrupted. It still refuses on a node with no `spurstepd` installed yet — trusting a supervisor that isn't there would be unsafe — and it's mutually exclusive with `spur_skip_busy_agents`/`spur_force_upgrade_busy_agents` (the guard-rail play fails fast if more than one is set). This does not affect scheduling of *new* jobs: the node is still drained (and only resumed once the upgrade completes), so nothing new lands on it mid-swap.
+**`spur_trust_stepd_busy_agents=true` (non-disruptive) upgrades a busy node's `spurd` without touching its running job.** `spurstepd` is a detached, double-forked supervisor outside `spurd`'s process lifecycle (see [spurstepd](#spurstepd-the-job-supervisor)) — a job it supervises keeps running, in its own cgroup, across a `spurd` restart, and the restarted agent re-adopts it. This flag skips the wait-then-abort/kill choice entirely for a node whose job is already `spurstepd`-supervised: `spurd` restarts, the new binary discovers and reconciles the live session, and the job is never interrupted. It still falls back to the default refusal on a node with no `spurstepd` installed yet — trusting a supervisor that isn't there would be unsafe. This does not affect scheduling of *new* jobs: the node is still drained (and only resumed once the upgrade completes), so nothing new lands on it mid-swap.
 
 > A single-controller cluster has no other controller to fail over to during its own restart, so rolling it is still a short outage. Real zero-downtime needs HA — three or more controllers.
 
