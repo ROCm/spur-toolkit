@@ -1492,18 +1492,22 @@ jobs:
       - name: Submit a busy job on gpu-3 for the rolling_upgrade.yml trust-stepd test
         run: |
           set -euo pipefail
-          docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+          jid=$(docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
             set -e
             printf "#!/bin/bash\n#SBATCH --job-name=ru-trust-stepd\nsleep 600\n" > /tmp/ci-ru-trust.sh
             jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-ru-trust.sh | grep -oE "[0-9]+" | head -1)
-            echo "$jid" > /tmp/ci-ru-trust.jid
             for i in $(seq 1 30); do
               st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
-              [ "$st" = RUNNING ] && { echo "job $jid RUNNING on gpu-3"; exit 0; }
+              [ "$st" = RUNNING ] && { echo "job $jid RUNNING on gpu-3" >&2; break; }
               sleep 1
+              [ "$i" -lt 30 ] || { echo "job $jid never reached RUNNING" >&2; exit 1; }
             done
-            echo "job $jid never reached RUNNING"; exit 1
-          '
+            echo "$jid"
+          ')
+          # Passed via $GITHUB_ENV, not a file inside the ctl-0 container — the
+          # rolling_upgrade.yml run in between restarts spurd there and isn't
+          # guaranteed to leave an unrelated /tmp file in place across that.
+          echo "CI_RU_TRUST_JID=$jid" >> "$GITHUB_ENV"
           docker exec gpu-3 pgrep -x spurstepd > /tmp/ci-ru-trust.stepd-before
 
       - name: rolling_upgrade.yml -e spur_trust_stepd_busy_agents=true (must succeed, job survives, no force/skip)
@@ -1521,7 +1525,7 @@ jobs:
       - name: Assert gpu-3's job survived and gpu-3 is on the new build
         run: |
           set -euo pipefail
-          jid=$(docker exec ctl-0 cat /tmp/ci-ru-trust.jid)
+          jid="$CI_RU_TRUST_JID"
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
           [ "$st" = RUNNING ] \
             || { echo "::error::job $jid is $st after rolling_upgrade.yml --trust-stepd, expected RUNNING"; exit 1; }
