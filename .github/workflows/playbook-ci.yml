@@ -25,7 +25,10 @@
 #   back into draining first), plus spurstepd restart survival (a running job
 #   stays RUNNING across `systemctl restart spurd`, re-adopted by the SAME
 #   supervisor pids rather than respawned ones) and teardown's explicit reap of
-#   the supervisors that stopping spurd deliberately leaves behind
+#   the supervisors that stopping spurd deliberately leaves behind, plus
+#   rolling_upgrade.yml's spur_trust_stepd_busy_agents=true path (same
+#   restart-survival guarantee, but driven through the playbook's own
+#   drain/guard logic instead of a raw systemctl restart)
 #
 # The spurstepd assertions in both jobs are conditional on the fetched build
 # actually shipping the binary — no tagged release does yet — and start
@@ -1300,36 +1303,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download + verify Spur binaries
+      - name: Download + verify Spur binaries (deploy = release, upgrade = nightly)
         env:
           GH_TOKEN: ${{ github.token }}
           DEPLOY_TAG: ""
+          UPGRADE_TAG: ""
         run: |
           set -euo pipefail
+
+          fetch() {
+            local tag="$1" dest="$2" d
+            d="dl-$dest"
+            mkdir -p "$d"
+            ( cd "$d"
+              gh release download "$tag" --repo ROCm/spur \
+                --pattern '*-linux-amd64.tar.gz' \
+                --pattern '*-linux-amd64.tar.gz.sha256'
+              tarball=$(ls *-linux-amd64.tar.gz)
+              hash=$(awk '{print $1}' "${tarball}.sha256")
+              echo "${hash}  ${tarball}" | sha256sum -c -
+              tar xzf "$tarball"
+              bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
+              mkdir -p "$GITHUB_WORKSPACE/$dest"
+              for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/$dest/$b"; done
+              # spurstepd is newer than the other three, so a release predating it
+              # ships none — copy it only when present.
+              if [ -f "$bindir/spurstepd" ]; then
+                cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/$dest/spurstepd"
+              fi
+              chmod +x "$GITHUB_WORKSPACE/$dest"/*
+            )
+          }
+
           deploy_tag="${DEPLOY_TAG:-}"
           if [ -z "$deploy_tag" ]; then
             deploy_tag=$(gh api repos/ROCm/spur/releases --jq \
               'map(select(.tag_name != "nightly"))[0].tag_name')
           fi
-          mkdir -p dl-spur-bin
-          ( cd dl-spur-bin
-            gh release download "$deploy_tag" --repo ROCm/spur \
-              --pattern '*-linux-amd64.tar.gz' \
-              --pattern '*-linux-amd64.tar.gz.sha256'
-            tarball=$(ls *-linux-amd64.tar.gz)
-            hash=$(awk '{print $1}' "${tarball}.sha256")
-            echo "${hash}  ${tarball}" | sha256sum -c -
-            tar xzf "$tarball"
-            bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
-            mkdir -p "$GITHUB_WORKSPACE/spur-bin"
-            for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"; done
-            # spurstepd is newer than the other three, so a release predating it
-            # ships none — copy it only when present.
-            if [ -f "$bindir/spurstepd" ]; then
-              cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/spur-bin/spurstepd"
-            fi
-            chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
-          )
+          upgrade_tag="${UPGRADE_TAG:-nightly}"
+
+          fetch "$deploy_tag"  spur-bin
+          fetch "$upgrade_tag" spur-bin-new
 
       - name: Start systemd containers on a docker network
         env:
@@ -1472,6 +1486,60 @@ jobs:
             sleep 1
           done
           echo "cleanup: job $jid is ${st:-unknown}"
+
+      # --- rolling_upgrade.yml: spur_trust_stepd_busy_agents keeps a busy
+      # node's job alive with NO force/skip flag — the non-disruptive path. ---
+      - name: Submit a busy job on gpu-3 for the rolling_upgrade.yml trust-stepd test
+        run: |
+          set -euo pipefail
+          jid=$(docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=ru-trust-stepd\nsleep 600\n" > /tmp/ci-ru-trust.sh
+            jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-ru-trust.sh | grep -oE "[0-9]+" | head -1)
+            for i in $(seq 1 30); do
+              st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+              [ "$st" = RUNNING ] && { echo "job $jid RUNNING on gpu-3" >&2; break; }
+              sleep 1
+              [ "$i" -lt 30 ] || { echo "job $jid never reached RUNNING" >&2; exit 1; }
+            done
+            echo "$jid"
+          ')
+          # Passed via $GITHUB_ENV, not a file inside the ctl-0 container — the
+          # rolling_upgrade.yml run in between restarts spurd there and isn't
+          # guaranteed to leave an unrelated /tmp file in place across that.
+          echo "CI_RU_TRUST_JID=$jid" >> "$GITHUB_ENV"
+          docker exec gpu-3 pgrep -x spurstepd > /tmp/ci-ru-trust.stepd-before
+
+      - name: rolling_upgrade.yml -e spur_trust_stepd_busy_agents=true (must succeed, job survives, no force/skip)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_drain_wait_secs=10 \
+            -e spur_trust_stepd_busy_agents=true
+
+      - name: Assert gpu-3's job survived and gpu-3 is on the new build
+        run: |
+          set -euo pipefail
+          jid="$CI_RU_TRUST_JID"
+          st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
+          [ "$st" = RUNNING ] \
+            || { echo "::error::job $jid is $st after rolling_upgrade.yml --trust-stepd, expected RUNNING"; exit 1; }
+          docker exec gpu-3 systemctl is-active spurd | grep -qx active \
+            || { echo "::error::spurd not active on gpu-3 after the trust-stepd upgrade"; exit 1; }
+          after=$(docker exec gpu-3 pgrep -x spurstepd || true)
+          [ "$after" = "$(cat /tmp/ci-ru-trust.stepd-before)" ] \
+            || { echo "::error::spurstepd identity changed across the trust-stepd upgrade (before: $(cat /tmp/ci-ru-trust.stepd-before) / after: $after)"; exit 1; }
+          old_sum=$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurd" | awk '{print $1}')
+          new_sum=$(docker exec gpu-3 sha256sum /usr/local/bin/spurd | awk '{print $1}')
+          [ "$new_sum" != "$old_sum" ] \
+            || { echo "::error::gpu-3's spurd binary was not actually upgraded"; exit 1; }
+          echo "PASS: job $jid still RUNNING (same spurstepd $after), gpu-3 upgraded, no force/skip flags used"
+          docker exec -u ciuser ctl-0 /usr/local/bin/spur cancel "$jid" || true
 
       # --- remove_nodes.yml: refuse / skip / force on a busy node -----------
       - name: Submit a busy job on gpu-1 for the remove_nodes.yml tests

@@ -35,6 +35,13 @@
 # know no production work is running, or when jobs are short/re-runnable):
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_force_upgrade_busy_agents=true
 #
+# Upgrade a busy node's spurd WITHOUT killing its running job, trusting that
+# job's spurstepd supervisor (a detached, double-forked process outside
+# spurd's lifecycle) to carry it across the restart unharmed. Refused if the
+# node has no spurstepd yet, or combined with spur_skip_busy_agents /
+# spur_force_upgrade_busy_agents:
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_trust_stepd_busy_agents=true
+#
 # Unlike teardown.yml/remove_nodes.yml, this playbook never calls
 # tasks/reap_stepd_supervisors.yml on a force-killed job's spurstepd — it
 # doesn't need to. kill_workload_processes.yml deliberately never touches
@@ -108,6 +115,17 @@
       changed_when: false
       failed_when: spur_pre_upgrade_health.rc != 0
 
+    - name: Fail if more than one busy-node handling flag is set (ambiguous intent)
+      ansible.builtin.fail:
+        msg: >-
+          spur_skip_busy_agents, spur_force_upgrade_busy_agents, and
+          spur_trust_stepd_busy_agents are mutually exclusive — pick one
+          busy-node strategy per run.
+      when: >-
+        [spur_skip_busy_agents | default(false) | bool,
+         spur_force_upgrade_busy_agents | default(false) | bool,
+         spur_trust_stepd_busy_agents | default(false) | bool] | select | list | length > 1
+
 # spur_controller re-renders spur.conf on every controller it touches, which
 # needs ansible_hostname for every agent (the [[nodes]] block) — gather facts
 # for the whole cluster up front rather than only as each play's hosts are
@@ -168,6 +186,7 @@
     dckj_skip_busy: "{{ spur_skip_busy_agents | default(false) | bool }}"
     dckj_force_busy: "{{ spur_force_upgrade_busy_agents | default(false) | bool }}"
     dckj_force_flag: spur_force_upgrade_busy_agents
+    dckj_trust_stepd: "{{ spur_trust_stepd_busy_agents | default(false) | bool }}"
   pre_tasks:
     - name: Drain + guard this node against job loss before touching its binaries
       ansible.builtin.include_tasks: tasks/drain_and_guard_agent.yml
@@ -203,6 +222,8 @@
     # under its own job is unsafe regardless of how the drain wait turned out.
     # When spur_force_upgrade_busy_agents=true the operator has explicitly
     # accepted that running jobs will be killed, so we proceed regardless.
+    # spur_node_busy_trusted proceeds too, without killing anything — set only
+    # when spur_trust_stepd_busy_agents=true and the job is already stepd-supervised.
     # Still attempted for an unreachable node; every task inside will itself
     # fail (ignored, not counted, via the play's ignore_unreachable) since
     # there's no connection to reach it.
@@ -211,11 +232,13 @@
         spur_force_reinstall: true
       when: >-
         not (spur_node_busy | default(false)) or
-        (spur_force_upgrade_busy_agents | default(false) | bool)
+        (spur_force_upgrade_busy_agents | default(false) | bool) or
+        (spur_node_busy_trusted | default(false))
     - role: spur_agent
       when: >-
         not (spur_node_busy | default(false)) or
-        (spur_force_upgrade_busy_agents | default(false) | bool)
+        (spur_force_upgrade_busy_agents | default(false) | bool) or
+        (spur_node_busy_trusted | default(false))
 
   post_tasks:
     - name: Re-register + undrain the node now that it's back

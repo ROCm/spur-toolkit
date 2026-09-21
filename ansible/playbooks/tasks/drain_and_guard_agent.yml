@@ -14,6 +14,9 @@
 #                    reachable when dckj_force_busy can be false (i.e. proceeding
 #                    isn't already the default) — see deploy.yml, where force is
 #                    the default and this branch never fires.
+#   dckj_trust_stepd bool — a busy node may proceed untouched-job-wise if its
+#                    running work is spurstepd-supervised (rolling_upgrade.yml
+#                    only; other callers leave this false). See spur_node_busy_trusted.
 
 - name: Probe agent reachability
   ansible.builtin.ping:
@@ -80,7 +83,22 @@
       {{ ('RESULT=BUSY' in spur_drain_cmd.stdout)
          and not (spur_agent_ping.unreachable | default(false)) }}
 
-- name: Refuse to disrupt a busy node unless skip or force is set
+# Only checked when a trust decision is actually needed — a busy node whose
+# supervisor is unproven (no spurstepd on disk yet) must still fall through
+# to the strict refusal below, not be silently trusted.
+- name: Check whether this busy node already has a spurstepd supervisor
+  ansible.builtin.stat:
+    path: "{{ spur_install_dir }}/spurstepd"
+  register: dckj_stepd_stat
+  when: spur_node_busy and (dckj_trust_stepd | default(false))
+
+- name: Determine whether it's safe to trust spurstepd across this restart
+  ansible.builtin.set_fact:
+    spur_node_busy_trusted: >-
+      {{ spur_node_busy and (dckj_trust_stepd | default(false))
+         and (dckj_stepd_stat.stat.exists | default(false)) }}
+
+- name: Refuse to disrupt a busy node unless skip, force, or a trusted supervisor covers it
   ansible.builtin.fail:
     msg: >-
       {{ spur_node_name }} still has a running job and did not drain within
@@ -91,6 +109,7 @@
       proceed immediately and accept that the running job will be killed.
   when: >-
     spur_node_busy and not dckj_skip_busy and not dckj_force_busy
+    and not spur_node_busy_trusted
 
 - name: Note busy node is being left untouched
   ansible.builtin.debug:
@@ -98,6 +117,14 @@
       {{ spur_node_name }} still has a running job — leaving it untouched
       (spur_skip_busy_agents=true).
   when: spur_node_busy and dckj_skip_busy and not dckj_force_busy
+
+- name: Note busy node's job is trusted to spurstepd across this restart
+  ansible.builtin.debug:
+    msg: >-
+      {{ spur_node_name }} still has a running job, but it's supervised by an
+      already-installed spurstepd — proceeding with {{ dckj_action }} without
+      waiting for it to finish or killing it (spur_trust_stepd_busy_agents=true).
+  when: spur_node_busy_trusted and not dckj_skip_busy
 
 - name: Warn that the running job WILL be killed
   ansible.builtin.debug:
