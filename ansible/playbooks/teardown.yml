@@ -150,6 +150,7 @@
         - spurd
         - spurctld
         - spurdbd
+        - spurauthd
       failed_when: false
       when: spur_ok_to_disrupt
 
@@ -159,11 +160,13 @@
         pkill -x spurctld 2>/dev/null || true
         pkill -x spurdbd 2>/dev/null || true
         pkill -x spurrestd 2>/dev/null || true
+        pkill -x spurauthd 2>/dev/null || true
         sleep 1
         pgrep -x spurd || true
         pgrep -x spurctld || true
         pgrep -x spurdbd || true
         pgrep -x spurrestd || true
+        pgrep -x spurauthd || true
       args:
         executable: /bin/bash
       changed_when: false
@@ -203,6 +206,22 @@
         - "/etc/wireguard/{{ spur_wg_interface }}.conf"
       when: (wipe | default(false) | bool) and spur_ok_to_disrupt
 
+    # Native-auth key material + CLI config live outside spur_home (under
+    # {{ spur_auth_conf_dir }}), so the spur_home wipe above misses them. Remove
+    # them on a wipe teardown too. Only the auth files, not the whole dir, in
+    # case an operator keeps other things under /etc/spur.
+    - name: Remove native-auth keys + CLI config (only when -e wipe=true)
+      ansible.builtin.shell: |
+        rm -f {{ spur_auth_conf_dir }}/*.jwks {{ spur_auth_conf_dir }}/spur.conf
+      args:
+        executable: /bin/bash
+      changed_when: true
+      failed_when: false
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - (wipe | default(false) | bool)
+        - spur_ok_to_disrupt
+
     - name: Remove SPUR_CONTROLLER_ADDR from /etc/environment (only when -e wipe=true)
       # Otherwise a stale/wrong endpoint (e.g. a node's own underlay IP left by a prior run)
       # persists and the CLI on this host talks to the wrong place after a fresh deploy.
@@ -210,6 +229,16 @@
         path: /etc/environment
         regexp: '^SPUR_CONTROLLER_ADDR='
         state: absent
+      when: (wipe | default(false) | bool) and spur_ok_to_disrupt
+
+    - name: Remove native-auth env vars from /etc/environment (only when -e wipe=true)
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: "{{ item }}"
+        state: absent
+      loop:
+        - '^SPUR_AUTH_PLUGIN='
+        - '^SPUR_CLUSTER_NAME='
       when: (wipe | default(false) | bool) and spur_ok_to_disrupt
 
     - name: Note SPUR_CONTROLLER_ADDR is left in place on a non-wipe teardown

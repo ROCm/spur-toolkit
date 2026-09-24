@@ -1,0 +1,18 @@
+# Managed by Ansible (spur_auth role) — CLI-facing config only.
+#
+# The `spur` CLI (and its Slurm symlinks / srun / sattach) read /etc/spur/spur.conf
+# or $SPUR_CONF by default; this file is what makes them present native
+# credentials on this host — for root's automation calls and for login-node
+# users alike — without depending on /etc/environment propagation mid-run.
+#
+# The DAEMONS do NOT read this file: spurctld/spurd are launched with
+# `-f {{ spur_home }}/etc/spur.conf`, which carries its own [auth] block. Both
+# are rendered from the same spur_auth_* variables, so they stay consistent.
+cluster_name = "{{ spur_cluster_name }}"
+
+[auth]
+plugin = "spur"
+mode = "{{ spur_auth_mode | default('permissive') }}"
+
+[admission]
+mode = "{{ spur_auth_admission_mode | default('open') }}"

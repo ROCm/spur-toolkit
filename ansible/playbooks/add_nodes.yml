@@ -140,6 +140,15 @@
   roles:
     - role: spur_install
       when: an_registered.rc != 0
+    # A new agent joining an auth-enabled cluster needs its keys + spurauthd
+    # before spurd starts (spurd mints its register call). Keys come from the
+    # control-node spur_auth_keys_dir (already the source of truth), so nothing
+    # is regenerated. Gated on spur_auth_enabled and the same not-already-
+    # registered guard as the roles around it.
+    - role: spur_auth
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - an_registered.rc != 0
     - role: spur_agent
       when: an_registered.rc != 0
 

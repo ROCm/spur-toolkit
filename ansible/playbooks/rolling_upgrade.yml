@@ -119,6 +119,50 @@
       changed_when: false
       failed_when: spur_pre_upgrade_health.rc != 0
 
+    # Auth carry-forward guard. rolling_upgrade only *upgrades* a cluster already
+    # on plugin="spur". First-time enablement (jwt->spur) on HA needs every
+    # controller restarted together — a switched leader rejects a request
+    # forwarded by an unswitched peer, so a serial rolling switch would break the
+    # cluster. Read the live plugin from the first controller's daemon spur.conf.
+    - name: Read the live [auth] plugin from spur.conf (auth-switch guard)
+      ansible.builtin.shell: |
+        awk '/^[ \t]*\[/{a=($0 ~ /^[ \t]*\[auth\][ \t]*$/)} a && /^[ \t]*plugin[ \t]*=/{gsub(/[" \t]/,"");sub(/plugin=/,"");print;exit}' {{ spur_home }}/etc/spur.conf 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: ru_live_auth_plugin
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse a first-time jwt->spur switch through rolling_upgrade on an HA cluster
+      ansible.builtin.fail:
+        msg: >-
+          spur_auth_enabled=true but this cluster is not yet on plugin="spur"
+          (live plugin: '{{ (ru_live_auth_plugin.stdout | trim) or "jwt" }}') and has
+          {{ groups['spur_controllers'] | length }} controllers. Switching the native
+          auth plugin on an HA cluster requires restarting all controllers together,
+          which rolling_upgrade.yml cannot do one-at-a-time (serial: 1). Enable auth
+          with deploy.yml (-e spur_auth_enabled=true -e spur_overwrite_conf=true)
+          during a maintenance window; rolling_upgrade.yml then carries it forward on
+          later binary bumps.
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - (ru_live_auth_plugin.stdout | trim) != 'spur'
+        - (groups['spur_controllers'] | length) > 1
+
+    - name: Warn on single-controller first-time auth enablement via rolling_upgrade
+      ansible.builtin.debug:
+        msg: >-
+          Enabling auth on a single-controller cluster via rolling_upgrade: the
+          daemon spur.conf [auth] block only renders when you ALSO pass
+          -e spur_overwrite_conf=true, otherwise spurctld/spurd stay on the old
+          plugin while the CLI switches to native creds (which the old plugin then
+          rejects). Prefer deploy.yml for first-time enablement.
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - (ru_live_auth_plugin.stdout | trim) != 'spur'
+        - (groups['spur_controllers'] | length) == 1
+        - not (spur_overwrite_conf | default(false) | bool)
+
     - name: Fail if more than one busy-node handling flag is set (ambiguous intent)
       ansible.builtin.fail:
         msg: >-
@@ -159,6 +203,13 @@
     - role: spur_install
       vars:
         spur_force_reinstall: true
+    # Carry auth forward: reinstall + restart spurauthd (the mint) with the new
+    # binary and re-assert keys/CLI conf BEFORE spurctld restarts, so this
+    # controller's own root CLI health checks below can still mint. Idempotent;
+    # keys already exist so nothing is regenerated. Preserves the daemon [auth]
+    # block (spur_controller handles that, preserve-by-default).
+    - role: spur_auth
+      when: spur_auth_enabled | default(false) | bool
     - role: spur_controller
       vars:
         # rolling_upgrade preserves the existing spur.conf by default — the cluster
@@ -238,6 +289,15 @@
         not (spur_node_busy | default(false)) or
         (spur_force_upgrade_busy_agents | default(false) | bool) or
         (spur_node_busy_trusted | default(false))
+    # Carry auth forward on the agent: new spurauthd + keys/CLI conf before spurd
+    # restarts (spurd Wants=spurauthd and mints its register call). Same busy-node
+    # gate as the roles around it, plus spur_auth_enabled.
+    - role: spur_auth
+      when: >-
+        (spur_auth_enabled | default(false) | bool)
+        and (not (spur_node_busy | default(false))
+             or (spur_force_upgrade_busy_agents | default(false) | bool)
+             or (spur_node_busy_trusted | default(false)))
     - role: spur_agent
       when: >-
         not (spur_node_busy | default(false)) or

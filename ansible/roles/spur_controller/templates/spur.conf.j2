@@ -16,6 +16,30 @@ peers = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['spur_controll
 plugin = "backfill"
 interval_secs = 1
 
+{% if spur_auth_enabled | default(false) | bool %}
+# Native authentication + RBAC. Read at startup only — a change here needs a
+# controller restart (scontrol reconfigure will not apply it). Because this
+# block is templated, -e spur_overwrite_conf=true safely re-renders it rather
+# than dropping it. See the spur_auth role for key distribution + spurauthd.
+[auth]
+plugin = "spur"
+mode = "{{ spur_auth_mode | default('permissive') }}"
+{% if spur_cluster_admins | default([]) | length > 0 %}
+cluster_admins = [{% for u in spur_cluster_admins %}"{{ u }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+{% if spur_admin_groups | default([]) | length > 0 %}
+admin_groups = [{% for g in spur_admin_groups %}"{{ g }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+{% if spur_operator_groups | default([]) | length > 0 %}
+operator_groups = [{% for g in spur_operator_groups %}"{{ g }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+allow_uid_zero_administrator = {{ spur_allow_uid_zero_administrator | default(true) | string | lower }}
+allow_root_jobs = {{ spur_allow_root_jobs | default(false) | string | lower }}
+
+[admission]
+mode = "{{ spur_auth_admission_mode | default('open') }}"
+
+{% endif %}
 {% if spur_accounting_enabled | default(true) | bool %}
 [accounting]
 # Accounting runs in-process inside spurctld (served on the same port as the

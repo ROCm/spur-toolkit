@@ -1,0 +1,21 @@
+[Unit]
+Description=Spur credential mint (spurauthd)
+After=network-online.target
+Wants=network-online.target
+# Ordering hint only (no dependency): on a host that also runs spurd, start the
+# mint first so spurd's first register/heartbeat can authenticate. Harmless on a
+# controller/login host where spurd.service does not exist.
+Before=spurd.service
+
+[Service]
+Type=simple
+# spurauthd verifies nothing; it only mints user-RPC credentials from auth.jwks
+# for local callers over the unix socket /run/spur/<cluster>/auth.sock. Keep the
+# default socket path so no spurd/CLI needs SPUR_AUTH_SOCKET set.
+ExecStart={{ spur_install_dir }}/spurauthd --cluster {{ spur_cluster_name }} --jwks {{ spur_auth_conf_dir }}/auth.jwks --lifetime-secs {{ spur_authd_lifetime_secs | default(30) }}
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

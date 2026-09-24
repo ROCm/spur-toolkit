@@ -180,6 +180,18 @@
       when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
       failed_when: false
 
+    # The decommissioned host no longer belongs to any cluster, so its credential
+    # mint should stop too. No-op (ignored) if auth was never enabled here.
+    - name: Stop + disable spurauthd on nodes being removed (native auth)
+      ansible.builtin.systemd:
+        name: spurauthd
+        state: stopped
+        enabled: false
+      failed_when: false
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
+
     # A job supervisor is built to outlive its agent (own session, reparented
     # to init, spared by the unit's KillMode=process), so stopping spurd above
     # leaves one running on a host that is no longer part of any cluster. The

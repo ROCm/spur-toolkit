@@ -16,3 +16,26 @@ control_plane_replicas = {{ _k8s_cp_list | length }}
 {% endif %}
 k0s_version = "{{ spur_k8s_version }}"
 {% endif %}
+{% if spur_auth_enabled | default(false) | bool %}
+# Native authentication + RBAC. spurd reads this at startup to verify controller
+# and job/step credentials and to gate uid-0 job execution (allow_root_jobs).
+# Kept identical to the controller's block (same spur_auth_* vars) so both sides
+# of the plugin switch agree. Read at startup only — needs a spurd restart.
+[auth]
+plugin = "spur"
+mode = "{{ spur_auth_mode | default('permissive') }}"
+{% if spur_cluster_admins | default([]) | length > 0 %}
+cluster_admins = [{% for u in spur_cluster_admins %}"{{ u }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+{% if spur_admin_groups | default([]) | length > 0 %}
+admin_groups = [{% for g in spur_admin_groups %}"{{ g }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+{% if spur_operator_groups | default([]) | length > 0 %}
+operator_groups = [{% for g in spur_operator_groups %}"{{ g }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+allow_uid_zero_administrator = {{ spur_allow_uid_zero_administrator | default(true) | string | lower }}
+allow_root_jobs = {{ spur_allow_root_jobs | default(false) | string | lower }}
+
+[admission]
+mode = "{{ spur_auth_admission_mode | default('open') }}"
+{% endif %}

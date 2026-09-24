@@ -15,7 +15,7 @@ Run everything from this repo's `ansible/` directory.
 
 `spur` (the upstream source) is a separate repo. Clone and build it wherever's convenient, then point `spur_binary_src` straight at the build output — no need to copy it anywhere.
 
-> The role only ever reads the named files `spur`/`spurctld`/`spurd`/`spurstepd` out of that directory — `spurstepd` only when the build provides one, since builds before it shipped none. The MPI PMIx plugin (`spur_mpi_pmix.so`) is installed separately on agents by the `spur_agent` role (see [Build prerequisites](#build-prerequisites)).
+> The role only ever reads the named files `spur`/`spurctld`/`spurd`/`spurstepd`/`spurauthd` out of that directory — `spurstepd` and `spurauthd` only when the build provides them (older builds shipped neither), and `spurauthd` is needed only if you enable [authentication](#authentication--rbac). The MPI PMIx plugin (`spur_mpi_pmix.so`) is installed separately on agents by the `spur_agent` role (see [Build prerequisites](#build-prerequisites)).
 
 ```bash
 # 1. Build spur (picks up mainline changes not yet in a tagged release; see Build prerequisites)
@@ -23,6 +23,8 @@ git clone https://github.com/ROCm/spur.git && cd spur
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
 sudo apt install -y protobuf-compiler build-essential
 cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
+# Enabling authentication + RBAC (opt-in)? Also build spurauthd (see "Authentication & RBAC"):
+#   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd -p spurauthd
 SPUR_BUILD="$(pwd)/target/release"
 cd -
 
@@ -36,6 +38,9 @@ ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=
 
 # Without PostgreSQL accounting (jobs still run, sacct/fairshare unavailable):
 ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD" -e spur_accounting_enabled=false
+
+# With authentication + RBAC (opt-in; the build must include spurauthd; roll out permissive first — see Authentication & RBAC):
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD" -e spur_auth_enabled=true -e spur_overwrite_conf=true
 ```
 
 > **Dedicated accounting node:** to run PostgreSQL on its own host (not a controller or agent), just add that host to a `[spur_accounting_node]` group in your inventory — the playbook auto-detects it, so the deploy command is unchanged (no `-e` needed). That host runs only Postgres (no spur daemons), and every controller connects to it remotely. See [Accounting](#accounting-postgresql-embedded-in-spurctld) for the inventory layout.
@@ -56,7 +61,7 @@ A few things to know:
 
 `deploy.yml` is idempotent — re-running it on a healthy cluster restarts daemons but preserves each host's existing `spur.conf` (see [below](#variables-defaults-in-inventorygroup_varsallyml)), unless you pass `-e spur_overwrite_conf=true`.
 
-**Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Login nodes](#login-submission-nodes) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Admin operations](#admin-operations) · [Tear down](#tear-down) · [Troubleshooting](#troubleshooting)
+**Details below:** [Build prerequisites](#build-prerequisites) · [Ansible control node](#ansible-control-node) · [Example commands](#example-commands-per-scenario) · [Inventory examples](#inventory-examples) · [Login nodes](#login-submission-nodes) · [Accounting](#accounting-postgresql-embedded-in-spurctld) · [Authentication & RBAC](#authentication--rbac) · [Variables](#variables-defaults-in-inventorygroup_varsallyml) · [Upgrading](#upgrading) · [Managing the cluster](#managing-the-cluster-after-deploy) · [Admin operations](#admin-operations) · [Tear down](#tear-down) · [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -70,7 +75,7 @@ You have two options: use a published release, or build the binaries yourself.
 
 > Already have Rust from somewhere other than rustup (distro package, asdf, …)? Compare `rustc --version` against `rust-toolchain.toml`'s `channel`. A mismatch can fail the build in ways that don't look version-related.
 
-A local build produces four binaries under `target/release/`:
+A local build produces these binaries under `target/release/` — the first four always, and `spurauthd` only when you add `-p spurauthd` for authentication:
 
 | Binary | Role |
 |---|---|
@@ -78,8 +83,11 @@ A local build produces four binaries under `target/release/`:
 | `spurctld` | controller / scheduler / Raft — also serves accounting in-process on the same gRPC port when `[accounting].database_url` is set |
 | `spurd` | node agent |
 | `spurstepd` | per-(job, step) supervisor the agent spawns — see [spurstepd](#spurstepd-the-job-supervisor) |
+| `spurauthd` | credential mint for native authentication — built only with `-p spurauthd`, needed only when `spur_auth_enabled=true`. See [Authentication & RBAC](#authentication--rbac) |
 
 > `spurstepd` is newer than the other three. A pinned older release ships none, which is fine; what is **not** fine is a build that expects one where the binary is missing. Don't drop `-p spur-stepd` from the `cargo build` above.
+
+> `spurauthd` (the native-auth mint) is newer still and **optional** — build it only if you'll enable [authentication](#authentication--rbac). Upstream `install.sh` and release/nightly tarballs include it as of [ROCm/spur#919](https://github.com/ROCm/spur/pull/919); a local build must add `-p spurauthd`. `spur_install` copies it whenever the source provides it, and the `spur_auth` role runs it as a systemd service on every host when `spur_auth_enabled=true`.
 
 Release and nightly tarballs from [ROCm/spur](https://github.com/ROCm/spur/releases) also ship `lib/spur/spur_mpi_pmix.so`. The playbooks install it on **agents only** at `/usr/lib/spur/` (matches `spurd`'s default plugin path). For a local build, also run `cargo build --release -p spur-mpi-pmix` and stage `target/release/libspur_mpi_pmix.so` (or rename to `spur_mpi_pmix.so`) in `spur_binary_src`. PMIx jobs (`--mpi=pmix`) additionally require `libpmix` and Open MPI on agent hosts — the playbooks do not install those packages.
 
@@ -378,6 +386,67 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 
 ---
 
+## Authentication & RBAC
+
+**Optional, off by default.** Spur can authenticate every RPC with its native `plugin = "spur"` credential mint and enforce role-based access — **Administrator**, **Operator**, **User**. Set `spur_auth_enabled=true` and the toolkit provisions all of it: the `spurauthd` mint, the JWKS keys, and the `[auth]` config. Leave it unset and behavior is exactly as before.
+
+> **Build requirement.** Native auth needs a build that ships `spurauthd` (ROCm/spur#919 onward — upstream `install.sh`, release/nightly tarballs, and images now include it; a local `spur_binary_src` build must add `-p spurauthd` to the `cargo build`). Native auth targets **native-host (systemd)** clusters — it is not usable for *Spur-on-Kubernetes* yet. The toolkit's own SPUR-managed k0s feature is unaffected (it's controller-driven, and `root` stays admin).
+
+### What gets deployed
+
+- **`spurauthd`** — a systemd service on every controller, agent, and login node: the per-host mint that issues short-lived credentials to local callers over `/run/spur/<cluster>/auth.sock`. Controllers run it so `root`'s CLI can mint; agents so `spurd` (and `srun` inside jobs) can; login nodes for their users.
+- **Four JWKS key sets** distributed per role into `/etc/spur/` (mode `0600`): controllers get the signing keys (`auth`, `controller-signing`, `cred-signing`, `node-signing`); agents get the verification keys (`auth`, `controller-verification`, `cred-verification`); login nodes get `auth.jwks`.
+- **An `[auth]`/`[admission]` block** rendered into each daemon's `spur.conf`, plus a CLI-facing `/etc/spur/spur.conf` (and `SPUR_AUTH_PLUGIN`/`SPUR_CLUSTER_NAME` in `/etc/environment`) so the CLI — `root`'s automation calls and login-node users alike — presents credentials.
+
+### Keys — generated once, reused (hybrid)
+
+On first enable, the key sets are generated on the first controller and fetched to `spur_auth_keys_dir` on the control node (default `ansible/keys/`, **git-ignored** — these files *are* the cluster's auth secrets, so protect the control node). Every later run (rolling upgrade, add-nodes) reuses them. **Bring your own** by pre-populating that directory with the seven `*.jwks` files before the first run; generation is then skipped.
+
+### Enable it (permissive first, then required)
+
+Enabling auth is a plugin switch, and on an HA cluster every controller must cross together (a switched leader rejects a request forwarded by an unswitched peer). So **first-time enablement goes through `deploy.yml`** during a maintenance window (drain the cluster; `deploy.yml` restarts all controllers together). Roll out in `permissive` first — RBAC is already enforced for authenticated callers, but a caller sending *no* credential is still accepted and logged, so nothing locks out mid-switch.
+
+```bash
+# 1. Enable in permissive mode (build must include spurauthd):
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini \
+  -e spur_binary_src="$SPUR_BUILD" -e spur_auth_enabled=true -e spur_overwrite_conf=true
+
+# 2. Verify (below), watch the controller/agent logs for
+#    'unauthenticated request accepted', then flip to required:
+ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini \
+  -e spur_binary_src="$SPUR_BUILD" -e spur_auth_enabled=true -e spur_auth_mode=required -e spur_overwrite_conf=true
+```
+
+`-e spur_overwrite_conf=true` is needed on these runs so the `[auth]` block is (re)rendered. Because that block is templated now, overwriting is **safe** — it re-renders `[auth]` from your vars rather than dropping it (the old hazard). After enablement, **`rolling_upgrade.yml` carries auth forward** on later binary bumps (it reinstalls + restarts `spurauthd` alongside the daemons and preserves `[auth]`); it refuses a first-time jwt→spur switch on an HA cluster and points you back to `deploy.yml`.
+
+### RBAC roles
+
+Bind roles by username or NSS group (empty by default — everyone is a plain User with access to their own jobs only):
+
+```yaml
+spur_cluster_admins: [alice]          # Administrator, by username
+spur_admin_groups: [spur-admins]      # Administrator, by group
+spur_operator_groups: [spur-ops]      # Operator, by group
+```
+
+Principals must resolve via NSS — users on login/compute nodes, groups on the controller and compute nodes; the `spur_auth` role warns at deploy time if one doesn't (and if the clock isn't NTP-synced, since credentials live ~30s).
+
+> **`root` stays Administrator.** Every playbook drives the cluster as `root` (drain/resume/remove/add/verify), so `spur_allow_uid_zero_administrator` defaults to `true` when auth is on — otherwise those calls would be denied the moment a controller switches. Per Spur's own docs this is not a real security boundary (root on any host that can mint can read `auth.jwks` and forge an admin identity), so it's safe to keep on and necessary for the automation. Only set it `false` (and add a named admin) if you also stop running the playbooks as `root`.
+
+### Verify
+
+```bash
+ansible-playbook playbooks/healthcheck.yml -i inventory/hosts.ini   # now also checks spurauthd, the mint socket, and auth.jwks
+```
+
+As a normal user, `sbatch` / `srun hostname` / `srun --pty bash` should work and `spur node drain <node>` should be refused ("requires cluster admin"); as an admin the drain should succeed. The opt-in verify job (`-e spur_verify_enabled=true`) must submit as a real user under auth — set `-e spur_verify_submit_user=<user>` (root job execution is refused unless `-e spur_allow_root_jobs=true`).
+
+### Not covered here
+
+Node **token admission** (`[admission] mode = "token"`) is deliberately left `open`. It adds a hard requirement to restart every `spurd` at least weekly (node tokens expire 7 days after each registration and nothing renews them) — an operational commitment to opt into separately, not wired up by this toolkit.
+
+---
+
 ## Variables (defaults in `inventory/group_vars/all.yml`)
 
 | Variable | Default | What it does |
@@ -415,6 +484,14 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 | `spur_force_upgrade_busy_agents` | `false` | `rolling_upgrade.yml`-specific: kill a busy node's running job and upgrade it anyway. |
 | `spur_trust_stepd_busy_agents` | `false` | `rolling_upgrade.yml`-specific: restart a busy node's `spurd` without killing its running job, trusting `spurstepd` to carry it across. Refused if the node has no `spurstepd` yet, or combined with `spur_skip_busy_agents`/`spur_force_upgrade_busy_agents`. |
 | `spur_force_remove_busy_nodes` | `false` | `remove_nodes.yml`-specific: kill a busy node's running job and remove it anyway. |
+| `spur_auth_enabled` | `false` | Provision + enable native-plugin authentication and RBAC (`spurauthd`, keys, `[auth]`). Off by default. See [Authentication & RBAC](#authentication--rbac). |
+| `spur_auth_mode` | `permissive` | `permissive` (verify-if-present; accept + log uncredentialed) or `required` (reject uncredentialed). Roll out permissive, then flip. |
+| `spur_auth_admission_mode` | `open` | Node admission: `open` or `token`. Left `open` — `token` adds a weekly `spurd`-restart requirement. |
+| `spur_auth_keys_dir` | `ansible/keys` | Control-node dir holding the generated JWKS sets (git-ignored). Reused across runs; pre-populate to bring your own. |
+| `spur_cluster_admins` / `spur_admin_groups` / `spur_operator_groups` | `[]` | RBAC bindings — Administrator by username/group, Operator by group. Must resolve via NSS. |
+| `spur_allow_uid_zero_administrator` | `true` | Keep `root` an Administrator when auth is on (the playbooks run as root). Not a real security boundary per Spur docs. |
+| `spur_allow_root_jobs` | `false` | Allow jobs to execute as uid 0 (distinct from the RBAC role). The verify role submits as `spur_verify_submit_user` instead. |
+| `spur_require_authd` | `false` | Treat a missing `spurauthd` binary as a hard failure in `spur_install` (like `spur_require_stepd`) instead of a warning. |
 
 Override any of these per run with `-e key=value` (repeatable):
 
@@ -472,7 +549,7 @@ ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_bi
 
 It reuses the same `spur_install`/`spur_controller`/`spur_agent`/`spur_verify` roles that `deploy.yml` uses, so there's no duplicated install, config, or health-check logic. Here's what it does, in order:
 
-1. **Guard rail.** Refuses to start if `spur_wipe_state=true`, if `spur_transport=wireguard` (this playbook doesn't support it yet), or if the cluster isn't already healthy (leader elected, `spur nodes` reachable).
+1. **Guard rail.** Refuses to start if `spur_wipe_state=true`, if `spur_transport=wireguard` (this playbook doesn't support it yet), or if the cluster isn't already healthy (leader elected, `spur nodes` reachable). With `spur_auth_enabled=true` it also refuses a first-time jwt→spur switch on an HA cluster (that needs `deploy.yml`; see [Authentication & RBAC](#authentication--rbac)) and only carries forward auth on a cluster already running `plugin="spur"`.
 2. **Controllers, one at a time** (`serial: 1`; the whole run aborts on the first failure). For each: force-reinstall, restart `spurctld`, then wait on the existing HA-aware "wait for Raft leader" task as the health gate before moving to the next controller. Client-side failover keeps the rest serving while one is down, since every agent and CLI is pointed at *every* controller.
 3. **Agents, in configurable batches** (`spur_rolling_batch_size`, default `1`). For each node: `spur node drain <node>`, poll until `DRAINED` (once no running jobs are left), force-reinstall, restart `spurd`, wait for re-registration, then `scontrol update NodeName=<node> State=RESUME`.
 4. **Verify** *(opt-in — `-e spur_verify_enabled=true`)*. Submits a real test job at the end to confirm the upgraded cluster actually schedules work. Off by default so routine upgrades don't add job noise; CI enables it.

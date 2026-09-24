@@ -2,6 +2,14 @@
 Description=Spur Node Agent (spurd)
 After=network-online.target
 Wants=network-online.target
+{% if spur_auth_enabled | default(false) | bool %}
+# Native auth: spurd mints its own register/heartbeat/completion credentials via
+# the local spurauthd, so the mint must be up first. Wants (not Requires) so a
+# mint blip doesn't take spurd down — a switched spurd that can't mint fails its
+# registration and is reported, which is the intended loud failure.
+Wants=spurauthd.service
+After=spurauthd.service
+{% endif %}
 
 [Service]
 Type=simple

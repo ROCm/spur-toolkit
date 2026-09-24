@@ -200,3 +200,62 @@ spur_rolling_batch_size: 1
 # rolling_upgrade.yml instead of [spur_controllers]'s inventory order. Must
 # name every controller exactly once; left empty, inventory order is used.
 spur_controller_upgrade_order: ""
+
+# --- Authentication & RBAC (native "spur" plugin). OPT-IN, off by default. ---
+# When false, nothing below is rendered or installed and behavior is identical
+# to a pre-auth deployment. Enabling flips every host to plugin = "spur":
+# spurauthd (the credential mint) runs on controllers, agents, and login nodes;
+# an [auth] block is rendered into spur.conf; and JWKS keys are distributed per
+# role. See ansible/README.md ("Authentication & RBAC") for the full flow.
+spur_auth_enabled: false
+
+# Enforcement mode. "permissive" verifies a credential when one is presented and
+# rejects a bad one, but still accepts a caller that sends none (logging it) —
+# the safe first step, since RBAC already applies to authenticated callers.
+# "required" rejects every uncredentialed request. Roll out permissive first,
+# watch the logs, then re-run with spur_auth_mode=required.
+spur_auth_mode: permissive          # permissive | required
+
+# Node admission control. Left "open" deliberately: "token" brings a hard weekly
+# spurd-restart requirement (node tokens expire 7 days after each registration
+# and nothing renews them) and is out of scope for this toolkit for now.
+spur_auth_admission_mode: open      # open | token
+
+# Control-node directory that holds the generated JWKS key sets — the source of
+# truth reused across every run (deploy, rolling upgrade, add_nodes). Auto-
+# generated on the first controller and fetched here on first enable; pre-
+# populate it yourself to bring your own keys. GIT-IGNORED (see ansible/.gitignore)
+# because these files ARE the cluster's auth secrets.
+spur_auth_keys_dir: "{{ playbook_dir }}/../keys"
+
+# Where key files and the CLI-facing spur.conf live on managed hosts. These are
+# the daemons' built-in defaults, so keeping them here means no per-key env vars
+# are needed in the unit files.
+spur_auth_conf_dir: /etc/spur
+
+# RBAC role bindings (all site-specific, empty by default). Usernames must
+# resolve via NSS on login/compute nodes; groups on the controller + compute.
+spur_cluster_admins: []             # usernames -> Administrator
+spur_admin_groups: []               # NSS groups -> Administrator
+spur_operator_groups: []            # NSS groups -> Operator
+
+# Keep root an Administrator once auth is on. Every playbook drives the cluster
+# as root via the CLI (drain/resume/remove/add/verify), so without this those
+# calls would be denied the moment a controller switches to plugin = "spur".
+# Per the enablement doc this is not a real security boundary anyway (root on
+# any mint host can read auth.jwks and forge an admin identity), so it is safe
+# to default on and necessary for the automation to keep working.
+spur_allow_uid_zero_administrator: true
+
+# Allow jobs to EXECUTE as uid 0 (distinct from the RBAC role above). Default
+# false; the verify role submits as spur_verify_submit_user instead.
+spur_allow_root_jobs: false
+
+# Credential lifetime spurauthd mints (seconds). Matches the binary default.
+spur_authd_lifetime_secs: 30
+
+# Like spur_require_stepd: when true, a missing spurauthd binary is a hard
+# failure in spur_install (and a reported problem in healthcheck.yml) instead of
+# a warning. Default false because a pinned release predating ROCm/spur#919
+# ships none.
+spur_require_authd: false
