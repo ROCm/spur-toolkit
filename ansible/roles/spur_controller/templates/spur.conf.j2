@@ -40,6 +40,27 @@ allow_root_jobs = {{ spur_allow_root_jobs | default(false) | string | lower }}
 mode = "{{ spur_auth_admission_mode | default('open') }}"
 
 {% endif %}
+{% if spur_cgroup_manage | default(true) | bool %}
+# cgroup-v2 job resource enforcement (applied by spurd to native-host jobs;
+# spurctld ignores it). Rendered on controllers too so a hyperconverged host
+# (controller+agent sharing this file) gets it. These fields already default ON
+# in the binary; they're explicit here so they're visible and tunable. Read at
+# spurd startup only — a change needs a spurd restart, not scontrol reconfigure.
+[cgroup]
+enabled = {{ spur_cgroup_enabled | default(true) | string | lower }}
+required = {{ spur_cgroup_required | default(false) | string | lower }}
+constrain_cores = {{ spur_cgroup_constrain_cores | default(true) | string | lower }}
+cpu_quota = {{ spur_cgroup_cpu_quota | default(false) | string | lower }}
+constrain_ram_space = {{ spur_cgroup_constrain_ram_space | default(true) | string | lower }}
+allowed_ram_percent = {{ spur_cgroup_allowed_ram_percent | default(100) | int }}
+constrain_swap = {{ spur_cgroup_constrain_swap | default(false) | string | lower }}
+allowed_swap_percent = {{ spur_cgroup_allowed_swap_percent | default(0) | int }}
+min_ram_mb = {{ spur_cgroup_min_ram_mb | default(30) | int }}
+oom_kill_job = {{ spur_cgroup_oom_kill_job | default(true) | string | lower }}
+constrain_devices = {{ spur_cgroup_constrain_devices | default(true) | string | lower }}
+extra_device_paths = [{% for p in spur_cgroup_extra_device_paths | default([]) %}"{{ p }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+
+{% endif %}
 {% if spur_accounting_enabled | default(true) | bool %}
 [accounting]
 # Accounting runs in-process inside spurctld (served on the same port as the

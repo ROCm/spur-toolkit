@@ -146,6 +146,24 @@
       failed_when: false
       when: spur_auth_enabled | default(false) | bool
 
+    - name: cgroup v2 ready? (native-host job enforcement)
+      ansible.builtin.shell: |
+        set +e
+        probs=""
+        [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ] || probs="not-cgroup2"
+        if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
+          grep -qw memory /sys/fs/cgroup/cgroup.controllers || probs="$probs no-memory-controller"
+        fi
+        echo "${probs:-OK}"
+      args:
+        executable: /bin/bash
+      register: hc_cgroup
+      changed_when: false
+      failed_when: false
+      when:
+        - spur_cgroup_manage | default(true) | bool
+        - spur_cgroup_enabled | default(true) | bool
+
     # Only probed when the operator has said this build ships spurstepd — a
     # build that predates it has none, and reporting every such cluster as
     # unhealthy would be noise. Where it IS expected, its absence fails every
@@ -184,7 +202,8 @@
              + ((spur_require_stepd | default(false) | bool) and not (hc_stepd.stat.exists | default(false))) | ternary(['spurstepd missing from ' ~ spur_install_dir ~ ' (every job launch here will fail)'], [])
              + (hc_disk.stdout | default('') is search('LOW_DISK')) | ternary(['low disk (<1GB free) under ' ~ spur_home], [])
              + ((spur_auth_enabled | default(false) | bool) and ((hc_authd.stdout | default('')) != 'active')) | ternary(['spurauthd not active'], [])
-             + ((spur_auth_enabled | default(false) | bool) and ((hc_agent_auth.stdout | default('') | trim) | length > 0)) | ternary(['auth:' ~ (hc_agent_auth.stdout | default('') | trim)], []) }}
+             + ((spur_auth_enabled | default(false) | bool) and ((hc_agent_auth.stdout | default('') | trim) | length > 0)) | ternary(['auth:' ~ (hc_agent_auth.stdout | default('') | trim)], [])
+             + (((spur_cgroup_manage | default(true) | bool) and (spur_cgroup_enabled | default(true) | bool)) and ((hc_cgroup.stdout | default('OK') | trim) != 'OK')) | ternary(['cgroup:' ~ (hc_cgroup.stdout | default('') | trim)], []) }}
       when: not (hc_spurd.unreachable | default(false))
 
     - name: Per-host status

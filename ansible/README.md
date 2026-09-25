@@ -447,6 +447,20 @@ Node **token admission** (`[admission] mode = "token"`) is deliberately left `op
 
 ---
 
+## cgroup resource enforcement
+
+`spurd` confines every native-host job under `/sys/fs/cgroup/spur/job_<id>_<attempt>` using cgroup v2 — pinning cores (`cpuset.cpus`), capping memory (`memory.max`/`memory.high`), and applying a default-deny device filter — all sized from the **per-node budget the controller allocated** (not the user's `--mem`/`--cpus-per-task`). Kubernetes jobs are unaffected: the kubelet owns those cgroups.
+
+**It's already on.** Every `[cgroup]` field defaults on in the `spurd` binary, so enforcement happens even with no `[cgroup]` section. What the toolkit adds is an **explicit, tunable** block (`spur_cgroup_manage`, default `true`) rendered into `spur.conf` from `spur_cgroup_*` variables, plus a compute-node readiness preflight and a health check.
+
+- **Host requirements:** the cgroup v2 unified hierarchy (default on Ubuntu 22.04) with the `memory`/`cpuset` controllers, and `spurd` running as root (it does). The device filter needs `CAP_BPF`+`CAP_NET_ADMIN` (root has them). The `spur_agent` preflight warns if a node isn't v2-ready; set `spur_cgroup_require_v2=true` (or `spur_cgroup_required=true`) to make that a hard failure.
+- **Read at startup only.** Like `[auth]`, `[cgroup]` is read when `spurd` starts — a change needs a `spurd` restart, not `scontrol reconfigure`. `deploy.yml`/`rolling_upgrade.yml` both restart `spurd`, so a run with `-e spur_overwrite_conf=true` re-renders and applies it.
+- **Tuning:** turn on `spur_cgroup_constrain_swap` or `spur_cgroup_cpu_quota`, raise `spur_cgroup_allowed_ram_percent` (e.g. `125`) for reclaim headroom, or list site device nodes in `spur_cgroup_extra_device_paths`.
+
+> **Upgrade caveat (important).** Upgrading `spurd` to a cgroup-capable build changes enforcement for a cluster whose `spur.conf` has no `[cgroup]` section: `--mem-per-cpu` jobs that ran unbounded get memory-capped (OOM on overrun), and the **default-deny device filter** can block host device nodes an allocation never covered — notably `/dev/infiniband/*` for MPI/NCCL/RCCL, which reaches **non-GPU** jobs, and `/dev/nvidiactl` etc. on GRES-configured GPU nodes (add them to `spur_cgroup_extra_device_paths`). `rolling_upgrade.yml` prints this warning when it finds no live `[cgroup]` and you haven't passed `-e spur_overwrite_conf=true`. To roll it out deliberately, re-run with `-e spur_overwrite_conf=true` and tuned `spur_cgroup_*` so the block is in place before `spurd` restarts. Rolling back is safe — older binaries ignore `[cgroup]`.
+
+---
+
 ## Variables (defaults in `inventory/group_vars/all.yml`)
 
 | Variable | Default | What it does |
@@ -492,6 +506,16 @@ Node **token admission** (`[admission] mode = "token"`) is deliberately left `op
 | `spur_allow_uid_zero_administrator` | `true` | Keep `root` an Administrator when auth is on (the playbooks run as root). Not a real security boundary per Spur docs. |
 | `spur_allow_root_jobs` | `false` | Allow jobs to execute as uid 0 (distinct from the RBAC role). The verify role submits as `spur_verify_submit_user` instead. |
 | `spur_require_authd` | `false` | Treat a missing `spurauthd` binary as a hard failure in `spur_install` (like `spur_require_stepd`) instead of a warning. |
+| `spur_cgroup_manage` | `true` | Render a `[cgroup]` block into `spur.conf` (from the `spur_cgroup_*` vars). `false` omits it and `spurd` uses its built-in defaults (still on). See [cgroup resource enforcement](#cgroup-resource-enforcement). |
+| `spur_cgroup_enabled` | `true` | `[cgroup].enabled` master switch — `false` means `spurd` creates no cgroup and applies no limits. |
+| `spur_cgroup_required` | `false` | Fail closed: refuse a job when a constraint can't be applied (needs root + cgroup v2), instead of running it unconstrained. |
+| `spur_cgroup_constrain_cores` / `spur_cgroup_cpu_quota` | `true` / `false` | Pin to allocated cores (`cpuset.cpus`); optionally also cap CPU time (`cpu.max`). |
+| `spur_cgroup_constrain_ram_space` / `spur_cgroup_allowed_ram_percent` | `true` / `100` | Cap memory (`memory.max`/`memory.high`) at this % of the allocation (must be ≥ 1; `125` opens a reclaim band). |
+| `spur_cgroup_constrain_swap` / `spur_cgroup_allowed_swap_percent` | `false` / `0` | Bound swap (`memory.swap.max`) at this % of the memory budget. |
+| `spur_cgroup_min_ram_mb` | `30` | Floor for the memory ceilings (MiB), so a tiny `--mem` can't make an unstartable cgroup. |
+| `spur_cgroup_oom_kill_job` | `true` | On OOM kill the whole job (`memory.oom.group`), not one process. |
+| `spur_cgroup_constrain_devices` / `spur_cgroup_extra_device_paths` | `true` / `[]` | Default-deny BPF device filter; list extra device nodes every job may open (e.g. `/dev/infiniband/*`, `/dev/nvidiactl` on GRES GPU nodes). |
+| `spur_cgroup_require_v2` | `false` | Make the `spur_agent` preflight hard-fail (not warn) when a node isn't cgroup-v2 ready. |
 
 Override any of these per run with `-e key=value` (repeatable):
 

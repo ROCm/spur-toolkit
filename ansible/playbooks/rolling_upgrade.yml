@@ -163,6 +163,36 @@
         - (groups['spur_controllers'] | length) == 1
         - not (spur_overwrite_conf | default(false) | bool)
 
+    # cgroup enforcement change on upgrade. If the live spur.conf has no [cgroup]
+    # section and we're not re-rendering it, the upgraded spurd starts enforcing
+    # cgroup-v2 DEFAULTS — memory caps on --mem-per-cpu jobs, and a default-deny
+    # device filter that can block /dev/infiniband/* (MPI/NCCL/RCCL, incl. NON-GPU
+    # jobs) and needs extra_device_paths on GRES GPU nodes. [cgroup] is read only
+    # at spurd startup, so a tuned block must be in place BEFORE spurd restarts.
+    - name: Does the live spur.conf already have a [cgroup] section?
+      ansible.builtin.shell: |
+        grep -q '^\[cgroup\]' {{ spur_home }}/etc/spur.conf 2>/dev/null && echo present || echo absent
+      args:
+        executable: /bin/bash
+      register: ru_live_cgroup
+      changed_when: false
+      failed_when: false
+
+    - name: Warn that this upgrade will start enforcing cgroups with defaults
+      ansible.builtin.debug:
+        msg: >-
+          Heads up: spur.conf here has no [cgroup] section and you are not
+          re-rendering it (spur_overwrite_conf=false), so the upgraded spurd will
+          enforce cgroup-v2 DEFAULTS — memory.max on --mem-per-cpu jobs (OOM on
+          overrun) and a default-deny device filter that can block host nodes like
+          /dev/infiniband/* (MPI/NCCL/RCCL, incl. NON-GPU jobs) and, on GRES GPU
+          nodes, /dev/nvidiactl etc. To place a tuned block first (it's read only at
+          spurd startup), re-run with -e spur_overwrite_conf=true and set
+          spur_cgroup_* (e.g. spur_cgroup_extra_device_paths). See ansible/README.md.
+      when:
+        - (ru_live_cgroup.stdout | default('absent') | trim) == 'absent'
+        - not (spur_overwrite_conf | default(false) | bool)
+
     - name: Fail if more than one busy-node handling flag is set (ambiguous intent)
       ansible.builtin.fail:
         msg: >-
