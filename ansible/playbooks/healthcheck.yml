@@ -53,7 +53,7 @@
         set +e
         probs=""
         [ -S "/run/spur/{{ spur_cluster_name }}/auth.sock" ] || probs="$probs no-mint-socket"
-        [ -f "{{ spur_auth_conf_dir }}/auth.jwks" ] || probs="$probs no-auth.jwks"
+        [ -f "{{ spur_auth_key_dir }}/auth.jwks" ] || probs="$probs no-auth.jwks"
         echo "$probs"
       args:
         executable: /bin/bash
@@ -137,7 +137,7 @@
         set +e
         probs=""
         [ -S "/run/spur/{{ spur_cluster_name }}/auth.sock" ] || probs="$probs no-mint-socket"
-        [ -f "{{ spur_auth_conf_dir }}/auth.jwks" ] || probs="$probs no-auth.jwks"
+        [ -f "{{ spur_auth_key_dir }}/auth.jwks" ] || probs="$probs no-auth.jwks"
         echo "$probs"
       args:
         executable: /bin/bash

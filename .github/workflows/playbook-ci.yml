@@ -2142,13 +2142,16 @@ jobs:
       - name: Assert worker-1 re-registered and its NEW key is consistent on ALL members incl. worker-0 + login-0
         run: |
           set -euo pipefail
+          found=""
           for i in $(seq 1 30); do
-            docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null \
-              | grep -qx "NodeName=worker-1" && break
+            out=$(docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null || true)
+            printf '%s\n' "$out" | grep -qx "NodeName=worker-1" && { found=1; break; }
             sleep 2
           done
-          docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null | grep -qx "NodeName=worker-1" \
-            || { echo "::error::worker-1 did not re-register after add_nodes.yml"; exit 1; }
+          # capture-then-grep, not `spur show node | grep -q`: under pipefail, grep -q
+          # closes the pipe on match and SIGPIPEs the still-writing producer (exit 141),
+          # which pipefail turns into a false failure even though the node IS present.
+          [ -n "$found" ] || { echo "::error::worker-1 did not re-register after add_nodes.yml"; exit 1; }
           # The re-added worker mints a fresh key (net join on a wiped conf). It
           # must be refreshed on EVERY surviving member — controllers AND the
           # pre-existing worker-0 AND login-0 (the add_nodes mesh play now targets
@@ -2242,11 +2245,15 @@ jobs:
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
             -e new_nodes=worker-1 -e spur_ignore_unreachable_agents=true || exit 1
+          found=""
           for i in $(seq 1 30); do
-            docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null | grep -qx "NodeName=worker-1" && break
+            out=$(docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null || true)
+            printf '%s\n' "$out" | grep -qx "NodeName=worker-1" && { found=1; break; }
             sleep 2
           done
-          docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null | grep -qx "NodeName=worker-1" \
+          # capture-then-grep (see the re-register step above): avoids the pipefail +
+          # grep -q SIGPIPE race that can fail a real match on `spur show node | grep -q`.
+          [ -n "$found" ] \
             && echo "PASS: add_nodes succeeded with an unrelated member (worker-0) down" \
             || { echo "::error::worker-1 did not register — add_nodes aborted on the unreachable member"; exit 1; }
 

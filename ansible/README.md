@@ -395,12 +395,14 @@ Job submission still works without accounting — pass `-e spur_accounting_enabl
 ### What gets deployed
 
 - **`spurauthd`** — a systemd service on every controller, agent, and login node: the per-host mint that issues short-lived credentials to local callers over `/run/spur/<cluster>/auth.sock`. Controllers run it so `root`'s CLI can mint; agents so `spurd` (and `srun` inside jobs) can; login nodes for their users.
-- **Four JWKS key sets** distributed per role into `/etc/spur/` (mode `0600`): controllers get the signing keys (`auth`, `controller-signing`, `cred-signing`, `node-signing`); agents get the verification keys (`auth`, `controller-verification`, `cred-verification`); login nodes get `auth.jwks`.
+- **Four JWKS key sets** distributed per role into `spur_auth_key_dir` (default `/etc/spur/`, mode `0600`): controllers get the signing keys (`auth`, `controller-signing`, `cred-signing`, `node-signing`); agents get the verification keys (`auth`, `controller-verification`, `cred-verification`); login nodes get `auth.jwks`. Point `spur_auth_key_dir` at a shared path (e.g. an NFS mount) to centralize keys — see [Keys](#keys--generated-once-reused-hybrid).
 - **An `[auth]`/`[admission]` block** rendered into each daemon's `spur.conf`, plus a CLI-facing `/etc/spur/spur.conf` (and `SPUR_AUTH_PLUGIN`/`SPUR_CLUSTER_NAME` in `/etc/environment`) so the CLI — `root`'s automation calls and login-node users alike — presents credentials.
 
 ### Keys — generated once, reused (hybrid)
 
 On first enable, the key sets are generated on the first controller and fetched to `spur_auth_keys_dir` on the control node (default `ansible/keys/`, **git-ignored** — these files *are* the cluster's auth secrets, so protect the control node). Every later run (rolling upgrade, add-nodes) reuses them. **Bring your own** by pre-populating that directory with the seven `*.jwks` files before the first run; generation is then skipped.
+
+**On-host key location (`spur_auth_key_dir`).** By default the `*.jwks` files land in `/etc/spur` on each node (`spur_auth_key_dir` defaults to `spur_auth_conf_dir`). To store them on shared storage instead — e.g. an NFS mount every node mounts at the **same path** — set `spur_auth_key_dir` to that path: the `spurctld`/`spurd`/`spurauthd` units are then rendered with `SPUR_*_JWKS` pointing there, while only the CLI's `spur.conf` stays local at `spur_auth_conf_dir`. The mount must already exist (writable where the playbook writes) — the toolkit manages the key files, not the mount. **Security:** a shared, broadly-readable key location exposes the controller **signing** keys (`controller-signing`/`cred-signing`/`node-signing`) — normally controller-only — to every node that can read it, which is enough to forge controller/admin/job credentials. Restrict the export (root-only perms, `no_root_squash`, ideally a controllers-only export for the signing set) and use a shared location only on a trusted single-tenant cluster.
 
 ### Enable it (permissive first, then required)
 
@@ -502,6 +504,7 @@ Node **token admission** (`[admission] mode = "token"`) is deliberately left `op
 | `spur_auth_mode` | `permissive` | `permissive` (verify-if-present; accept + log uncredentialed) or `required` (reject uncredentialed). Roll out permissive, then flip. |
 | `spur_auth_admission_mode` | `open` | Node admission: `open` or `token`. Left `open` — `token` adds a weekly `spurd`-restart requirement. |
 | `spur_auth_keys_dir` | `ansible/keys` | Control-node dir holding the generated JWKS sets (git-ignored). Reused across runs; pre-populate to bring your own. |
+| `spur_auth_conf_dir` / `spur_auth_key_dir` | `/etc/spur` / `= conf_dir` | On-host dirs for the CLI `spur.conf` and the `*.jwks` keys. Set `spur_auth_key_dir` to a shared path (e.g. an NFS mount) to centralize keys; the daemons read it via `SPUR_*_JWKS`. Shared keys expose the controller signing keys to every reader — restrict the export. |
 | `spur_cluster_admins` / `spur_admin_groups` / `spur_operator_groups` | `[]` | RBAC bindings — Administrator by username/group, Operator by group. Must resolve via NSS. |
 | `spur_allow_uid_zero_administrator` | `true` | Keep `root` an Administrator when auth is on (the playbooks run as root). Not a real security boundary per Spur docs. |
 | `spur_allow_root_jobs` | `false` | Allow jobs to execute as uid 0 (distinct from the RBAC role). The verify role submits as `spur_verify_submit_user` instead. |

@@ -228,10 +228,26 @@ spur_auth_admission_mode: open      # open | token
 # because these files ARE the cluster's auth secrets.
 spur_auth_keys_dir: "{{ playbook_dir }}/../keys"
 
-# Where key files and the CLI-facing spur.conf live on managed hosts. These are
-# the daemons' built-in defaults, so keeping them here means no per-key env vars
-# are needed in the unit files.
+# Where the CLI-facing spur.conf lives on managed hosts (the path the `spur` CLI
+# reads by default). Keep at /etc/spur so the CLI needs no $SPUR_CONF.
 spur_auth_conf_dir: /etc/spur
+
+# On-host directory for the JWKS KEY files (*.jwks). Defaults to spur_auth_conf_dir
+# (/etc/spur) — local, per-node. Point it at a shared path (e.g. an NFS mount every
+# node mounts at the SAME path) to centralize keys: the daemons are told to read
+# from here via SPUR_*_JWKS env in their systemd units (spurctld: auth + controller/
+# cred/node signing; spurd: auth + controller/cred verification; spurauthd: auth via
+# --jwks). The CLI's spur.conf stays at spur_auth_conf_dir (local).
+#
+# SECURITY: a shared/broadly-readable key location exposes the controller SIGNING
+# keys (controller-signing / cred-signing / node-signing) to every node that can
+# read it — anyone with read access can forge controller/admin/job credentials
+# (normally these live only on controllers). Restrict the export (root-only perms,
+# no_root_squash; ideally a controllers-only export for the signing set) and only
+# use a shared location on a trusted single-tenant cluster. The NFS must also be
+# mounted (rw where the playbook writes) BEFORE running — the toolkit does not
+# manage the mount, only the key files under this path.
+spur_auth_key_dir: "{{ spur_auth_conf_dir }}"
 
 # RBAC role bindings (all site-specific, empty by default). Usernames must
 # resolve via NSS on login/compute nodes; groups on the controller + compute.

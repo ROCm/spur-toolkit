@@ -206,13 +206,14 @@
         - "/etc/wireguard/{{ spur_wg_interface }}.conf"
       when: (wipe | default(false) | bool) and spur_ok_to_disrupt
 
-    # Native-auth key material + CLI config live outside spur_home (under
-    # {{ spur_auth_conf_dir }}), so the spur_home wipe above misses them. Remove
-    # them on a wipe teardown too. Only the auth files, not the whole dir, in
-    # case an operator keeps other things under /etc/spur.
+    # Native-auth key material lives under spur_auth_key_dir and the CLI config
+    # under spur_auth_conf_dir (both /etc/spur by default), outside spur_home, so
+    # the spur_home wipe above misses them. Remove them on a wipe teardown too —
+    # only the auth files, not the whole dir. NOTE: if spur_auth_key_dir is a
+    # shared mount (e.g. NFS), this removes the shared keys for the whole cluster.
     - name: Remove native-auth keys + CLI config (only when -e wipe=true)
       ansible.builtin.shell: |
-        rm -f {{ spur_auth_conf_dir }}/*.jwks {{ spur_auth_conf_dir }}/spur.conf
+        rm -f {{ spur_auth_key_dir }}/*.jwks {{ spur_auth_conf_dir }}/spur.conf
       args:
         executable: /bin/bash
       changed_when: true

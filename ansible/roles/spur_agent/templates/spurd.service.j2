@@ -14,6 +14,14 @@ After=spurauthd.service
 [Service]
 Type=simple
 Environment=HOME={{ spur_home }}
+{% if spur_auth_enabled | default(false) | bool %}
+# Native auth: verify user creds (auth.jwks) and the controller/cred credentials
+# the agent receives. Set explicitly from spur_auth_key_dir so keys can live
+# outside the built-in /etc/spur default — e.g. a shared NFS mount.
+Environment=SPUR_AUTH_JWKS={{ spur_auth_key_dir }}/auth.jwks
+Environment=SPUR_CONTROLLER_VERIFICATION_JWKS={{ spur_auth_key_dir }}/controller-verification.jwks
+Environment=SPUR_CRED_VERIFICATION_JWKS={{ spur_auth_key_dir }}/cred-verification.jwks
+{% endif %}
 # Where spurd keeps the supervisor sessions it re-adopts after a restart. Set
 # as an environment variable, not spurd's --state-dir flag: a build predating
 # spurstepd ignores an unknown variable but refuses to start on an unknown flag,

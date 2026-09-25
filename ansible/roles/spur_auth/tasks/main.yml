@@ -75,13 +75,18 @@
     - spur_auth_nss is defined
     - "'UNRESOLVED' in (spur_auth_nss.stdout | default(''))"
 
-- name: Ensure the auth config/key directory exists
+- name: Ensure the auth config + key directories exist
+  # spur_auth_conf_dir holds the CLI spur.conf; spur_auth_key_dir holds the *.jwks
+  # (they're the same /etc/spur by default; unique collapses that to one op). When
+  # spur_auth_key_dir is an NFS mount, it must already be mounted — this only
+  # ensures the directory under it, it does not manage the mount.
   ansible.builtin.file:
-    path: "{{ spur_auth_conf_dir }}"
+    path: "{{ item }}"
     state: directory
     owner: root
     group: root
     mode: "0755"
+  loop: "{{ [spur_auth_conf_dir, spur_auth_key_dir] | unique }}"
 
 # spurauthd is mandatory once auth is enabled — fail with a clear message here
 # rather than letting the socket wait below time out cryptically.
@@ -176,7 +181,7 @@
   # re-tightened here (nothing checks the mode when the daemon loads it).
   ansible.builtin.copy:
     src: "{{ spur_auth_keys_dir }}/{{ item }}"
-    dest: "{{ spur_auth_conf_dir }}/{{ item }}"
+    dest: "{{ spur_auth_key_dir }}/{{ item }}"
     owner: root
     group: root
     mode: "0600"
