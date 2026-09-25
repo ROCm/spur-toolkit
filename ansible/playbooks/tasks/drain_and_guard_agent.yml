@@ -63,7 +63,7 @@
     }
     if [ "{{ dckj_force_busy | default(false) | bool | lower }}" = "true" ] \
        || [ "{{ dckj_trust_stepd | default(false) | bool | lower }}" = "true" ]; then
-      for i in $(seq 1 {{ [spur_drain_wait_secs | default(120), spur_force_drain_settle_secs | default(15)] | min }}); do
+      for i in $(seq 1 {{ [spur_drain_wait_secs | default(120) | int, spur_force_drain_settle_secs | default(15) | int] | min }}); do
         st=$(check_state)
         case "$st" in
           DRAINED|DOWN) echo "RESULT=DRAINED"; exit 0 ;;
