@@ -1360,16 +1360,15 @@ jobs:
 
           # nightly can legitimately be the same commit as the latest release
           # right after a release is cut — the binaries are then byte-identical
-          # by construction, not a bug. Detect it and let the "was it actually
-          # upgraded" assertion downstream treat that as expected, not a failure.
+          # by construction, not a bug. Detect it directly by content (a release
+          # tag's target_commitish is a real SHA, but "nightly"'s resolves to the
+          # floating branch name "main", so comparing those isn't reliable) and
+          # let the "was it actually upgraded" assertion downstream treat that as
+          # expected, not a failure.
           if [ "$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurd" | awk '{print $1}')" \
                = "$(sha256sum "$GITHUB_WORKSPACE/spur-bin-new/spurd" | awk '{print $1}')" ]; then
-            deploy_commit=$(gh api "repos/ROCm/spur/releases/tags/$deploy_tag" --jq .target_commitish)
-            upgrade_commit=$(gh api "repos/ROCm/spur/releases/tags/$upgrade_tag" --jq .target_commitish)
-            if [ "$deploy_commit" = "$upgrade_commit" ]; then
-              echo "::notice::$deploy_tag and $upgrade_tag are both built from $deploy_commit — no new commit since the release was cut, binaries are identical by construction"
-              echo "SPUR_BUILD_IDENTICAL=true" >> "$GITHUB_ENV"
-            fi
+            echo "::notice::$deploy_tag and $upgrade_tag ship byte-identical spurd binaries — no new commit since the release was cut"
+            echo "SPUR_BUILD_IDENTICAL=true" >> "$GITHUB_ENV"
           fi
 
       - name: Start systemd containers on a docker network
