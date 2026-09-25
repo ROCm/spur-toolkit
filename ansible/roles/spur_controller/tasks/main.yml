@@ -214,6 +214,7 @@
 - name: Stop spurctld before wiping state
   ansible.builtin.systemd:
     name: spurctld
+    daemon_reload: true
     state: stopped
   failed_when: false
   when:
