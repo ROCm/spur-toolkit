@@ -200,3 +200,105 @@ spur_rolling_batch_size: 1
 # rolling_upgrade.yml instead of [spur_controllers]'s inventory order. Must
 # name every controller exactly once; left empty, inventory order is used.
 spur_controller_upgrade_order: ""
+
+# --- Authentication & RBAC (native "spur" plugin). OPT-IN, off by default. ---
+# When false, nothing below is rendered or installed and behavior is identical
+# to a pre-auth deployment. Enabling flips every host to plugin = "spur":
+# spurauthd (the credential mint) runs on controllers, agents, and login nodes;
+# an [auth] block is rendered into spur.conf; and JWKS keys are distributed per
+# role. See ansible/README.md ("Authentication & RBAC") for the full flow.
+spur_auth_enabled: false
+
+# Enforcement mode. "permissive" verifies a credential when one is presented and
+# rejects a bad one, but still accepts a caller that sends none (logging it) —
+# the safe first step, since RBAC already applies to authenticated callers.
+# "required" rejects every uncredentialed request. Roll out permissive first,
+# watch the logs, then re-run with spur_auth_mode=required.
+spur_auth_mode: permissive          # permissive | required
+
+# Node admission control. Left "open" deliberately: "token" brings a hard weekly
+# spurd-restart requirement (node tokens expire 7 days after each registration
+# and nothing renews them) and is out of scope for this toolkit for now.
+spur_auth_admission_mode: open      # open | token
+
+# Control-node directory that holds the generated JWKS key sets — the source of
+# truth reused across every run (deploy, rolling upgrade, add_nodes). Auto-
+# generated on the first controller and fetched here on first enable; pre-
+# populate it yourself to bring your own keys. GIT-IGNORED (see ansible/.gitignore)
+# because these files ARE the cluster's auth secrets.
+spur_auth_keys_dir: "{{ playbook_dir }}/../keys"
+
+# Where the CLI-facing spur.conf lives on managed hosts (the path the `spur` CLI
+# reads by default). Keep at /etc/spur so the CLI needs no $SPUR_CONF.
+spur_auth_conf_dir: /etc/spur
+
+# On-host directory for the JWKS KEY files (*.jwks). Defaults to spur_auth_conf_dir
+# (/etc/spur) — local, per-node. Point it at a shared path (e.g. an NFS mount every
+# node mounts at the SAME path) to centralize keys: the daemons are told to read
+# from here via SPUR_*_JWKS env in their systemd units (spurctld: auth + controller/
+# cred/node signing; spurd: auth + controller/cred verification; spurauthd: auth via
+# --jwks). The CLI's spur.conf stays at spur_auth_conf_dir (local).
+#
+# SECURITY: a shared/broadly-readable key location exposes the controller SIGNING
+# keys (controller-signing / cred-signing / node-signing) to every node that can
+# read it — anyone with read access can forge controller/admin/job credentials
+# (normally these live only on controllers). Restrict the export (root-only perms,
+# no_root_squash; ideally a controllers-only export for the signing set) and only
+# use a shared location on a trusted single-tenant cluster. The NFS must also be
+# mounted (rw where the playbook writes) BEFORE running — the toolkit does not
+# manage the mount, only the key files under this path.
+spur_auth_key_dir: "{{ spur_auth_conf_dir }}"
+
+# RBAC role bindings (all site-specific, empty by default). Usernames must
+# resolve via NSS on login/compute nodes; groups on the controller + compute.
+spur_cluster_admins: []             # usernames -> Administrator
+spur_admin_groups: []               # NSS groups -> Administrator
+spur_operator_groups: []            # NSS groups -> Operator
+
+# Keep root an Administrator once auth is on. Every playbook drives the cluster
+# as root via the CLI (drain/resume/remove/add/verify), so without this those
+# calls would be denied the moment a controller switches to plugin = "spur".
+# Per the enablement doc this is not a real security boundary anyway (root on
+# any mint host can read auth.jwks and forge an admin identity), so it is safe
+# to default on and necessary for the automation to keep working.
+spur_allow_uid_zero_administrator: true
+
+# Allow jobs to EXECUTE as uid 0 (distinct from the RBAC role above). Default
+# false; the verify role submits as spur_verify_submit_user instead.
+spur_allow_root_jobs: false
+
+# Credential lifetime spurauthd mints (seconds). Matches the binary default.
+spur_authd_lifetime_secs: 30
+
+# Like spur_require_stepd: when true, a missing spurauthd binary is a hard
+# failure in spur_install (and a reported problem in healthcheck.yml) instead of
+# a warning. Default false because a pinned release predating ROCm/spur#919
+# ships none.
+spur_require_authd: false
+
+# --- cgroup v2 job resource enforcement (spurd, native-host jobs). ---
+# spurd ALREADY enforces these by default (every field below defaults on in the
+# binary); the toolkit renders an explicit, tunable [cgroup] block so the posture
+# is visible and adjustable. Read at spurd startup only — a change needs a spurd
+# restart (scontrol reconfigure won't apply it). See ansible/README.md (cgroups).
+# Needs the cgroup-v2 unified hierarchy (default on Ubuntu 22.04) and spurd as
+# root (it is); the device filter needs CAP_BPF+CAP_NET_ADMIN (root has them).
+spur_cgroup_manage: true              # render a [cgroup] block at all (false -> omit; spurd uses its built-in defaults)
+spur_cgroup_enabled: true             # [cgroup].enabled master switch (false -> spurd creates no cgroup, applies no limits)
+spur_cgroup_required: false           # fail closed: refuse a job when a constraint can't be applied (needs root + v2)
+spur_cgroup_constrain_cores: true     # pin to allocated cores via cpuset.cpus
+spur_cgroup_cpu_quota: false          # also cap CPU time via cpu.max CFS quota (off: cpuset already bounds whole cores)
+spur_cgroup_constrain_ram_space: true # cap memory via memory.max + memory.high
+spur_cgroup_allowed_ram_percent: 100  # hard ceiling as % of the allocation (MUST be >= 1; upstream rejects 0)
+spur_cgroup_constrain_swap: false     # bound swap via memory.swap.max
+spur_cgroup_allowed_swap_percent: 0   # swap allowance as % of the memory budget (0 = none)
+spur_cgroup_min_ram_mb: 30            # floor for the memory ceilings (MiB)
+spur_cgroup_oom_kill_job: true        # on OOM kill the whole job (memory.oom.group), not one process
+spur_cgroup_constrain_devices: true   # default-deny cgroup-v2 BPF device filter
+# Extra device nodes EVERY job on a node may open, on top of its allocation and
+# the built-in implicit set — the escape hatch for GRES-configured GPU nodes
+# (e.g. /dev/nvidiactl, /dev/nvidia-uvm) or site devices the defaults miss.
+spur_cgroup_extra_device_paths: []
+# Agent preflight posture: warn (default) or hard-fail when a compute node isn't
+# cgroup-v2 ready. Auto-escalates to fail when spur_cgroup_required=true.
+spur_cgroup_require_v2: false

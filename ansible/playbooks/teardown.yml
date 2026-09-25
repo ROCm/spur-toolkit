@@ -150,6 +150,7 @@
         - spurd
         - spurctld
         - spurdbd
+        - spurauthd
       failed_when: false
       when: spur_ok_to_disrupt
 
@@ -159,11 +160,13 @@
         pkill -x spurctld 2>/dev/null || true
         pkill -x spurdbd 2>/dev/null || true
         pkill -x spurrestd 2>/dev/null || true
+        pkill -x spurauthd 2>/dev/null || true
         sleep 1
         pgrep -x spurd || true
         pgrep -x spurctld || true
         pgrep -x spurdbd || true
         pgrep -x spurrestd || true
+        pgrep -x spurauthd || true
       args:
         executable: /bin/bash
       changed_when: false
@@ -203,6 +206,47 @@
         - "/etc/wireguard/{{ spur_wg_interface }}.conf"
       when: (wipe | default(false) | bool) and spur_ok_to_disrupt
 
+    # Native-auth CLI config lives under spur_auth_conf_dir (/etc/spur by default),
+    # outside spur_home, so the spur_home wipe above misses it. Always host-local
+    # (per spur_auth's own docs), so safe to remove regardless of --limit scope.
+    - name: Remove native-auth CLI config (only when -e wipe=true)
+      ansible.builtin.file:
+        path: "{{ spur_auth_conf_dir }}/spur.conf"
+        state: absent
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - (wipe | default(false) | bool)
+        - spur_ok_to_disrupt
+
+    # Unlike a whole-cluster teardown, `--limit` can narrow this to a subset of
+    # hosts — so only wipe *.jwks when key_dir is still the per-host default;
+    # a relocated (likely shared, e.g. NFS) dir is left alone so a --limit'd
+    # teardown can't wipe keys the rest of the (still-live) cluster needs.
+    - name: Remove native-auth keys (only when -e wipe=true; skipped on a shared key dir)
+      ansible.builtin.shell: |
+        rm -f {{ spur_auth_key_dir }}/*.jwks
+      args:
+        executable: /bin/bash
+      changed_when: true
+      failed_when: false
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - (wipe | default(false) | bool)
+        - spur_ok_to_disrupt
+        - spur_auth_key_dir == spur_auth_conf_dir
+
+    - name: Note native-auth keys were left in place (spur_auth_key_dir looks shared)
+      ansible.builtin.debug:
+        msg: >-
+          {{ spur_auth_key_dir }} differs from spur_auth_conf_dir — treating it as a
+          shared/relocated key location and leaving its *.jwks files in place. Wipe it
+          manually only once you're sure no surviving host still needs those keys.
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - (wipe | default(false) | bool)
+        - spur_ok_to_disrupt
+        - spur_auth_key_dir != spur_auth_conf_dir
+
     - name: Remove SPUR_CONTROLLER_ADDR from /etc/environment (only when -e wipe=true)
       # Otherwise a stale/wrong endpoint (e.g. a node's own underlay IP left by a prior run)
       # persists and the CLI on this host talks to the wrong place after a fresh deploy.
@@ -210,6 +254,16 @@
         path: /etc/environment
         regexp: '^SPUR_CONTROLLER_ADDR='
         state: absent
+      when: (wipe | default(false) | bool) and spur_ok_to_disrupt
+
+    - name: Remove native-auth env vars from /etc/environment (only when -e wipe=true)
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: "{{ item }}"
+        state: absent
+      loop:
+        - '^SPUR_AUTH_PLUGIN='
+        - '^SPUR_CLUSTER_NAME='
       when: (wipe | default(false) | bool) and spur_ok_to_disrupt
 
     - name: Note SPUR_CONTROLLER_ADDR is left in place on a non-wipe teardown

@@ -78,6 +78,20 @@
   roles:
     - role: spur_wireguard
 
+- name: Provision native authentication (keys + spurauthd) on every host
+  # Distributes JWKS keys per role, installs+starts the spurauthd mint, and drops
+  # the CLI-facing /etc/spur/spur.conf — all BEFORE any daemon (re)starts on
+  # plugin="spur" in the plays below. Same host union as the install plays.
+  # Gated on spur_auth_enabled: off (default) -> the pattern matches no hosts and
+  # the whole play is skipped. Runs after the WireGuard play so key distribution
+  # (control node -> hosts over ordinary SSH) is unaffected by the mesh.
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if (spur_auth_enabled | default(false) | bool) else ':!all' }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  roles:
+    - role: spur_auth
+
 - name: Deploy accounting, start controllers, configure login nodes
   # Merged into one play: a play runs its role list as a sequence of tasks
   # across ALL matching hosts (role N finishes on every host before role N+1
@@ -94,6 +108,23 @@
   gather_facts: yes
   gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   any_errors_fatal: true
+  pre_tasks:
+    # Native auth plugin switch (jwt->spur) or a mode flip must not leave a
+    # switched leader forwarding to / deciding for an unswitched peer, so on an
+    # HA cluster every controller must cross together. deploy.yml already
+    # restarts controllers in parallel; this explicit stop-all barrier (pre_tasks
+    # finish on ALL hosts before any role starts) guarantees none is briefly
+    # serving the old plugin while another serves the new one. No-op on a fresh
+    # install (nothing running yet). Controllers only; login/accounting hosts in
+    # this play's union are skipped by the when.
+    - name: Stop spurctld on all controllers together before an auth plugin switch
+      ansible.builtin.systemd:
+        name: spurctld
+        state: stopped
+      failed_when: false
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - inventory_hostname in groups['spur_controllers']
   roles:
     # No role-level `when` on spur_accounting itself here: its pre-merge
     # spurdbd cleanup tasks are intentionally unconditional (see the role's

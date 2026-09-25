@@ -2,10 +2,26 @@
 Description=Spur Node Agent (spurd)
 After=network-online.target
 Wants=network-online.target
+{% if spur_auth_enabled | default(false) | bool %}
+# Native auth: spurd mints its own register/heartbeat/completion credentials via
+# the local spurauthd, so the mint must be up first. Wants (not Requires) so a
+# mint blip doesn't take spurd down — a switched spurd that can't mint fails its
+# registration and is reported, which is the intended loud failure.
+Wants=spurauthd.service
+After=spurauthd.service
+{% endif %}
 
 [Service]
 Type=simple
 Environment=HOME={{ spur_home }}
+{% if spur_auth_enabled | default(false) | bool %}
+# Native auth: verify user creds (auth.jwks) and the controller/cred credentials
+# the agent receives. Set explicitly from spur_auth_key_dir so keys can live
+# outside the built-in /etc/spur default — e.g. a shared NFS mount.
+Environment=SPUR_AUTH_JWKS={{ spur_auth_key_dir }}/auth.jwks
+Environment=SPUR_CONTROLLER_VERIFICATION_JWKS={{ spur_auth_key_dir }}/controller-verification.jwks
+Environment=SPUR_CRED_VERIFICATION_JWKS={{ spur_auth_key_dir }}/cred-verification.jwks
+{% endif %}
 # Where spurd keeps the supervisor sessions it re-adopts after a restart. Set
 # as an environment variable, not spurd's --state-dir flag: a build predating
 # spurstepd ignores an unknown variable but refuses to start on an unknown flag,

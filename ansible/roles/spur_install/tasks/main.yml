@@ -67,6 +67,21 @@
     - spur_needs_agent_bin
     - spur_binary_src | default('') | length > 0
 
+# spurauthd (native auth mint) is needed on EVERY host when auth is enabled —
+# controllers (so root's CLI can mint), agents (spurd/srun mint), and login
+# nodes (users mint) — so it's probed regardless of role, unlike spurstepd.
+# install.sh already ships it (ROCm/spur#919); a spur_binary_src build must add
+# `-p spurauthd`, which this probe catches instead of failing silently later.
+- name: Does the install source ship spurauthd? (native auth)
+  ansible.builtin.stat:
+    path: "{{ spur_binary_src }}/spurauthd"
+  register: spur_authd_src
+  delegate_to: localhost
+  become: false
+  when:
+    - spur_auth_enabled | default(false) | bool
+    - spur_binary_src | default('') | length > 0
+
 # Two install sources:
 #   1. spur_binary_src (a directory on the Ansible control node holding pre-built
 #      spur/spurctld/spurd, and spurstepd on builds that have it) — used for
@@ -90,7 +105,8 @@
     {{ ['spur']
        + (['spurctld'] if spur_needs_ctld else [])
        + (['spurd'] if spur_needs_agent_bin else [])
-       + (['spurstepd'] if (spur_stepd_src.stat.exists | default(false)) else []) }}
+       + (['spurstepd'] if (spur_stepd_src.stat.exists | default(false)) else [])
+       + (['spurauthd'] if (spur_authd_src.stat.exists | default(false)) else []) }}
   when: spur_binary_src | default('') | length > 0
 
 - name: Install Spur via upstream installer
@@ -123,7 +139,8 @@
       {{ ['spur']
          + (['spurctld'] if spur_needs_ctld else [])
          + (['spurd'] if spur_needs_agent_bin else [])
-         + (['spurstepd'] if (spur_needs_agent_bin and (spur_require_stepd | default(false) | bool)) else []) }}
+         + (['spurstepd'] if (spur_needs_agent_bin and (spur_require_stepd | default(false) | bool)) else [])
+         + (['spurauthd'] if ((spur_auth_enabled | default(false) | bool) and (spur_require_authd | default(false) | bool)) else []) }}
     # A host moved out of [spur_agents] keeps no agent-side binaries, spurstepd
     # included — it is useless without the spurd that spawns it.
     spur_unneeded_bins: >-
@@ -141,6 +158,10 @@
     {% if spur_needs_agent_bin %}
     # Reported (not enforced) so the warning below can name the exact problem.
     [ -f "{{ spur_install_dir }}/spurstepd" ] && echo STEPD_PRESENT || echo STEPD_MISSING
+    {% endif %}
+    {% if spur_auth_enabled | default(false) | bool %}
+    # Reported (not enforced) too — the native-auth mint, needed on every host.
+    [ -f "{{ spur_install_dir }}/spurauthd" ] && echo AUTHD_PRESENT || echo AUTHD_MISSING
     {% endif %}
     changed=0
     for s in sbatch squeue sinfo scancel sacct sacctmgr scontrol salloc srun sattach scrontab sdiag smd sprio sreport sshare sstat strigger; do
@@ -172,6 +193,22 @@
     - spur_needs_agent_bin
     - not (pf_preflight.unreachable | default(false))
     - "'STEPD_MISSING' in (spur_ver.stdout | default(''))"
+
+# Loud for the same reason as spurstepd: with auth enabled, a host with no
+# spurauthd can't mint, so the spur_auth role's socket wait (or the daemon's
+# first credentialed call) fails. Name it here at install time.
+- name: Warn that this host has no spurauthd (native auth needs it)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ inventory_hostname }} has no spurauthd in {{ spur_install_dir }}.
+      spur_auth_enabled=true needs the credential mint on every host. Build it
+      with `cargo build --release -p spurauthd` into spur_binary_src, or use a
+      release/nightly that includes ROCm/spur#919. Set -e spur_require_authd=true
+      to make this a hard failure instead of a warning.
+  when:
+    - spur_auth_enabled | default(false) | bool
+    - not (pf_preflight.unreachable | default(false))
+    - "'AUTHD_MISSING' in (spur_ver.stdout | default(''))"
 
 - name: Show install result
   ansible.builtin.debug:

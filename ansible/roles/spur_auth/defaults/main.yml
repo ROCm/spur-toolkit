@@ -1,0 +1,15 @@
+---
+# The seven JWKS files `spur auth-keys` produces: one HMAC set (auth.jwks) plus
+# three Ed25519 signing/verification pairs (controller, cred, node).
+# node-verification.jwks isn't consumed anywhere (the controller signs node
+# tokens, agents verify them only under token admission via a different path),
+# but the ed25519 pair generates it, so it's fetched too to keep the
+# generate/fetch loops uniform. Distribution is per role (see tasks/main.yml).
+spur_auth_key_files:
+  - auth.jwks
+  - controller-signing.jwks
+  - controller-verification.jwks
+  - cred-signing.jwks
+  - cred-verification.jwks
+  - node-signing.jwks
+  - node-verification.jwks

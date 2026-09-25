@@ -74,6 +74,23 @@
 # [auth] allow_root_jobs=true, so anything that runs this role as root needs
 # either that config set or a real unprivileged submitter — set this var to
 # the latter. Left unset, behavior is unchanged (submits as the play's user).
+- name: Warn if verifying under native auth without a submit user or allow_root_jobs
+  # Under plugin="spur", root authenticates as the plain user "root"; submitting
+  # its own job is allowed, but spurd still refuses to EXECUTE a uid-0 job unless
+  # allow_root_jobs=true. So a root-submitted verify job fails at launch. Point
+  # the operator at a real submitter instead (that user needs a resolvable NSS
+  # entry on the compute nodes and a local spurauthd to mint — controllers have one).
+  ansible.builtin.debug:
+    msg: >-
+      spur_auth_enabled=true but spur_verify would submit as this play's user (root)
+      with spur_verify_submit_user unset and spur_allow_root_jobs=false — spurd will
+      reject the uid-0 job. Set -e spur_verify_submit_user=<user> (resolvable on the
+      agents) or -e spur_allow_root_jobs=true.
+  when:
+    - spur_auth_enabled | default(false) | bool
+    - spur_verify_submit_user is not defined
+    - not (spur_allow_root_jobs | default(false) | bool)
+
 - name: Submit single-node test job
   ansible.builtin.shell: |
     cd {{ spur_home }}

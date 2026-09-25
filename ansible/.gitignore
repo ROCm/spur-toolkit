@@ -5,3 +5,8 @@ inventory/*.ini
 
 # Ansible runtime artifacts
 *.retry
+
+# Native-auth JWKS key sets fetched to the control node (spur_auth_keys_dir).
+# These files ARE the cluster's auth secrets (auth.jwks is a shared HMAC key) —
+# never commit them.
+keys/

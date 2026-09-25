@@ -6,6 +6,57 @@
          else (ansible_host | default(ansible_default_ipv4.address)) }}
     spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
 
+# cgroup-v2 readiness: spurd enforces [cgroup] limits by creating cgroups under
+# /sys/fs/cgroup/spur, which needs the unified (v2) hierarchy and the memory/
+# cpuset controllers available at the root. Missing either means spurd runs jobs
+# with reduced/no enforcement (or, with required=true, refuses every launch).
+# Warn by default; hard-fail when spur_cgroup_require_v2 or spur_cgroup_required.
+- name: Preflight — cgroup v2 hierarchy + controllers (for [cgroup] enforcement)
+  ansible.builtin.shell: |
+    set +e
+    probs=""
+    [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ] || probs="not-cgroup2"
+    if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
+      for c in memory cpuset; do
+        grep -qw "$c" /sys/fs/cgroup/cgroup.controllers || probs="$probs no-$c-controller"
+      done
+    fi
+    echo "${probs:-OK}"
+  args:
+    executable: /bin/bash
+  register: spur_cgroup_v2_probe
+  changed_when: false
+  failed_when: false
+  when:
+    - spur_cgroup_manage | default(true) | bool
+    - spur_cgroup_enabled | default(true) | bool
+
+- name: Fail when cgroup v2 is unavailable and enforcement is required
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} is not cgroup-v2 ready ({{ spur_cgroup_v2_probe.stdout | trim }}),
+      but cgroup enforcement is required here (spur_cgroup_require_v2 or
+      spur_cgroup_required). Boot with systemd.unified_cgroup_hierarchy=1 (default
+      on Ubuntu 22.04) and enable the memory/cpuset controllers, or relax the flag.
+  when:
+    - spur_cgroup_manage | default(true) | bool
+    - spur_cgroup_enabled | default(true) | bool
+    - (spur_cgroup_v2_probe.stdout | default('OK') | trim) != 'OK'
+    - (spur_cgroup_require_v2 | default(false) | bool) or (spur_cgroup_required | default(false) | bool)
+
+- name: Warn when cgroup v2 / controllers are missing (enforcement will degrade)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ inventory_hostname }} — {{ spur_cgroup_v2_probe.stdout | trim }}.
+      spurd will run jobs with reduced or no cgroup enforcement (cpuset/memory
+      limits and the device filter may not apply). Enable cgroup v2 + the
+      memory/cpuset controllers, or set spur_cgroup_required=true to fail closed.
+  when:
+    - spur_cgroup_manage | default(true) | bool
+    - spur_cgroup_enabled | default(true) | bool
+    - (spur_cgroup_v2_probe.stdout | default('OK') | trim) != 'OK'
+    - not ((spur_cgroup_require_v2 | default(false) | bool) or (spur_cgroup_required | default(false) | bool))
+
 - name: Resolve controller endpoint(s) agents will talk to
   # spurd --controller accepts a comma-separated endpoint list and rotates past a
   # dead one (spur-client endpoint rotation), so every controller is listed here —

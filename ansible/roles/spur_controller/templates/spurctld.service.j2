@@ -6,6 +6,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=HOME={{ spur_home }}
+{% if spur_auth_enabled | default(false) | bool %}
+# Native auth: verify user creds (auth.jwks) and sign controller/cred/node tokens.
+# Set explicitly from spur_auth_key_dir so the keys can live outside the built-in
+# /etc/spur default — e.g. a shared NFS mount. Defaults to /etc/spur/*.jwks.
+Environment=SPUR_AUTH_JWKS={{ spur_auth_key_dir }}/auth.jwks
+Environment=SPUR_CONTROLLER_SIGNING_JWKS={{ spur_auth_key_dir }}/controller-signing.jwks
+Environment=SPUR_CRED_SIGNING_JWKS={{ spur_auth_key_dir }}/cred-signing.jwks
+Environment=SPUR_NODE_SIGNING_JWKS={{ spur_auth_key_dir }}/node-signing.jwks
+{% endif %}
 WorkingDirectory={{ spur_home }}
 ExecStart={{ spur_install_dir }}/spurctld -f {{ spur_home }}/etc/spur.conf --state-dir {{ spur_home }}/state --log-level {{ spur_log_level }}
 Restart=on-failure

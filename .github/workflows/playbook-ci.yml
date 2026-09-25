@@ -164,7 +164,7 @@ jobs:
 
       - name: Start systemd containers on a docker network
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci
@@ -600,7 +600,7 @@ jobs:
             cat > /tmp/ci-force-docker.sh <<EOF
           #!/bin/bash
           #SBATCH --job-name=force-docker
-          docker run -d --name ci-force-container ubuntu:22.04 sleep 600
+          docker run -d --name ci-force-container ubuntu:24.04 sleep 600
           sleep 600
           EOF
             jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-docker.sh | grep -oE "[0-9]+" | head -1)
@@ -924,7 +924,7 @@ jobs:
 
       - name: Start systemd containers on a docker network
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci
@@ -1243,7 +1243,7 @@ jobs:
       # inventory alias to close that gap.
       - name: Start gpu-4 with a hostname that deliberately differs from its inventory alias
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker run -d --name gpu-4 --hostname gpu-4-real-hostname \
@@ -1373,7 +1373,7 @@ jobs:
 
       - name: Start systemd containers on a docker network
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci
@@ -1900,7 +1900,7 @@ jobs:
 
       - name: Start systemd containers on a docker network (with /lib/modules for wireguard)
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci
@@ -2142,13 +2142,16 @@ jobs:
       - name: Assert worker-1 re-registered and its NEW key is consistent on ALL members incl. worker-0 + login-0
         run: |
           set -euo pipefail
+          found=""
           for i in $(seq 1 30); do
-            docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null \
-              | grep -qx "NodeName=worker-1" && break
+            out=$(docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null || true)
+            printf '%s\n' "$out" | grep -qx "NodeName=worker-1" && { found=1; break; }
             sleep 2
           done
-          docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null | grep -qx "NodeName=worker-1" \
-            || { echo "::error::worker-1 did not re-register after add_nodes.yml"; exit 1; }
+          # capture-then-grep, not `spur show node | grep -q`: under pipefail, grep -q
+          # closes the pipe on match and SIGPIPEs the still-writing producer (exit 141),
+          # which pipefail turns into a false failure even though the node IS present.
+          [ -n "$found" ] || { echo "::error::worker-1 did not re-register after add_nodes.yml"; exit 1; }
           # The re-added worker mints a fresh key (net join on a wiped conf). It
           # must be refreshed on EVERY surviving member — controllers AND the
           # pre-existing worker-0 AND login-0 (the add_nodes mesh play now targets
@@ -2242,11 +2245,15 @@ jobs:
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
             -e new_nodes=worker-1 -e spur_ignore_unreachable_agents=true || exit 1
+          found=""
           for i in $(seq 1 30); do
-            docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null | grep -qx "NodeName=worker-1" && break
+            out=$(docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null || true)
+            printf '%s\n' "$out" | grep -qx "NodeName=worker-1" && { found=1; break; }
             sleep 2
           done
-          docker exec ctl-0 /usr/local/bin/spur show node worker-1 2>/dev/null | grep -qx "NodeName=worker-1" \
+          # capture-then-grep (see the re-register step above): avoids the pipefail +
+          # grep -q SIGPIPE race that can fail a real match on `spur show node | grep -q`.
+          [ -n "$found" ] \
             && echo "PASS: add_nodes succeeded with an unrelated member (worker-0) down" \
             || { echo "::error::worker-1 did not register — add_nodes aborted on the unreachable member"; exit 1; }
 
@@ -2331,7 +2338,7 @@ jobs:
 
       - name: Start systemd containers on a docker network
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci-ts
@@ -2521,3 +2528,199 @@ jobs:
         run: |
           for n in $NODES; do docker rm -f "$n" || true; done
           docker network rm spur-ci-ts || true
+
+  # ---------------------------------------------------------------------------
+  # Job: native authentication + RBAC (spur_auth_enabled), permissive -> required
+  #
+  # Builds Spur from source because a pinned release/nightly may predate
+  # ROCm/spur#919 (which first shipped spurauthd); the deploy path needs that
+  # binary. Deploys a 1-ctl + 1-agent cluster with auth on, then asserts:
+  #   * spurauthd active + the mint socket + auth.jwks on every host,
+  #   * both daemons switched to plugin = "spur",
+  #   * a normal user's job runs but that user is DENIED `spur node drain`
+  #     while root (Administrator via allow_uid_zero_administrator) is allowed,
+  # then flips the whole cluster to mode=required and re-verifies a user job.
+  # ---------------------------------------------------------------------------
+  integration-auth:
+    # Builds spur from source, then runs it in the same jrei/systemd-ubuntu:24.04
+    # containers the other jobs use. ubuntu-latest is 24.04, so the build host and
+    # the container share a glibc and the compiled binaries run cleanly inside them.
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      NODES: "ctl-0 gpu-1"
+      AUTH_INV: "../.github/workflows/ci-techsupport.ini"   # lean 1-ctl + 1-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out ROCm/spur (for a spurauthd-capable build)
+        uses: actions/checkout@v4
+        with:
+          repository: ROCm/spur
+          path: spur-src
+          fetch-depth: 1
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler build-essential
+
+      - name: Cache cargo + build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            spur-src/target
+          key: spur-auth-cargo-${{ runner.os }}-${{ hashFiles('spur-src/Cargo.lock') }}
+          restore-keys: |
+            spur-auth-cargo-${{ runner.os }}-
+
+      - name: Build spur (incl. spurauthd) and stage binaries
+        working-directory: spur-src
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          # rust-toolchain.toml pins the toolchain; rustup auto-installs it on first use.
+          cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd -p spurauthd
+          mkdir -p "$GITHUB_WORKSPACE/spur-bin"
+          for b in spur spurctld spurd spurstepd spurauthd; do
+            cp "target/release/$b" "$GITHUB_WORKSPACE/spur-bin/$b"
+          done
+          chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
+          ls -l "$GITHUB_WORKSPACE/spur-bin"
+
+      - name: Start systemd containers on a docker network
+        env:
+          IMG: jrei/systemd-ubuntu:24.04
+        run: |
+          set -euo pipefail
+          docker network create spur-ci-auth
+          docker pull "$IMG"
+          for n in $NODES; do
+            docker run -d --name "$n" --hostname "$n" \
+              --network spur-ci-auth \
+              --privileged --cgroupns=host \
+              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+              "$IMG"
+          done
+
+      - name: Wait for systemd to be ready in every container
+        run: |
+          set -uo pipefail
+          for n in $NODES; do
+            ok=""
+            for i in $(seq 1 30); do
+              st=$(docker exec "$n" systemctl is-system-running 2>/dev/null || true)
+              case "$st" in running|degraded) ok=1; break ;; esac
+              sleep 2
+            done
+            [ -n "$ok" ] || { echo "::error::systemd never became ready in $n"; docker exec "$n" systemctl status --no-pager || true; exit 1; }
+            echo "$n: systemd ready"
+          done
+
+      - name: Install in-container deps + a non-root submit user
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
+            docker exec "$n" useradd -m -s /bin/bash ciuser
+          done
+
+      - name: Install ansible + docker connection plugin
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ansible-core
+          ansible-galaxy collection install community.docker
+
+      - name: deploy.yml with auth enabled (permissive)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i "$AUTH_INV" playbooks/deploy.yml \
+            -e @inventory/group_vars/all.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_accounting_enabled=false \
+            -e spur_auth_enabled=true \
+            -e spur_overwrite_conf=true \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
+
+      - name: Assert spurauthd active + mint socket + auth.jwks on every host
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" systemctl is-active --quiet spurauthd || { echo "::error::spurauthd not active on $n"; exit 1; }
+            docker exec "$n" test -S /run/spur/spur-cluster/auth.sock || { echo "::error::no mint socket on $n"; exit 1; }
+            docker exec "$n" test -f /etc/spur/auth.jwks || { echo "::error::no auth.jwks on $n"; exit 1; }
+          done
+          # Role-specific keys: controller has the signing set, agent the verification set.
+          docker exec ctl-0 test -f /etc/spur/controller-signing.jwks || { echo "::error::ctl-0 missing controller-signing.jwks"; exit 1; }
+          docker exec gpu-1 test -f /etc/spur/cred-verification.jwks   || { echo "::error::gpu-1 missing cred-verification.jwks"; exit 1; }
+          echo "PASS: spurauthd + socket + per-role keys present"
+
+      - name: Assert both daemons switched to plugin = "spur"
+        run: |
+          set -euo pipefail
+          docker exec ctl-0 grep -q 'plugin = "spur"' /opt/spur/etc/spur.conf || { echo "::error::controller not on native plugin"; exit 1; }
+          docker exec gpu-1 grep -q 'plugin = "spur"' /opt/spur/etc/spur.conf || { echo "::error::agent not on native plugin"; exit 1; }
+          echo "PASS: both daemons on plugin=spur"
+
+      - name: Assert RBAC — normal user denied drain, admin (root) allowed
+        run: |
+          set -euo pipefail
+          # RBAC applies to authenticated callers even in permissive. ciuser mints via
+          # the local spurauthd and is a plain User, so drain must be refused.
+          if docker exec -u ciuser ctl-0 /usr/local/bin/spur node drain gpu-1 --reason ci-user-denied; then
+            echo "::error::normal user was allowed to drain a node (RBAC not enforced)"; exit 1
+          fi
+          echo "PASS: normal user denied drain"
+          # root is Administrator (allow_uid_zero_administrator defaults true) -> allowed.
+          docker exec ctl-0 /usr/local/bin/spur node drain gpu-1 --reason ci-admin-ok \
+            || { echo "::error::admin (root) drain was refused"; exit 1; }
+          docker exec ctl-0 /usr/local/bin/scontrol update NodeName=gpu-1 State=RESUME \
+            || { echo "::error::admin resume failed"; exit 1; }
+          echo "PASS: admin drain allowed + node resumed"
+
+      - name: Flip to required (coordinated, via deploy.yml) and re-verify a user job
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i "$AUTH_INV" playbooks/deploy.yml \
+            -e @inventory/group_vars/all.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_accounting_enabled=false \
+            -e spur_auth_enabled=true \
+            -e spur_auth_mode=required \
+            -e spur_overwrite_conf=true \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
+
+      - name: Assert required mode active
+        run: |
+          set -euo pipefail
+          docker exec ctl-0 grep -q 'mode = "required"' /opt/spur/etc/spur.conf || { echo "::error::controller not in required mode"; exit 1; }
+          docker exec gpu-1 grep -q 'mode = "required"' /opt/spur/etc/spur.conf || { echo "::error::agent not in required mode"; exit 1; }
+          echo "PASS: required mode active; a ciuser verify job completed under it"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          for n in $NODES; do
+            echo "===== $n journal (spur*) ====="
+            docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -80' || true
+          done
+
+      - name: Teardown containers
+        if: always()
+        run: |
+          for n in $NODES; do docker rm -f "$n" || true; done
+          docker network rm spur-ci-auth || true

@@ -16,3 +16,45 @@ control_plane_replicas = {{ _k8s_cp_list | length }}
 {% endif %}
 k0s_version = "{{ spur_k8s_version }}"
 {% endif %}
+{% if spur_auth_enabled | default(false) | bool %}
+# Native authentication + RBAC. spurd reads this at startup to verify controller
+# and job/step credentials and to gate uid-0 job execution (allow_root_jobs).
+# Kept identical to the controller's block (same spur_auth_* vars) so both sides
+# of the plugin switch agree. Read at startup only — needs a spurd restart.
+[auth]
+plugin = "spur"
+mode = "{{ spur_auth_mode | default('permissive') }}"
+{% if spur_cluster_admins | default([]) | length > 0 %}
+cluster_admins = [{% for u in spur_cluster_admins %}"{{ u }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+{% if spur_admin_groups | default([]) | length > 0 %}
+admin_groups = [{% for g in spur_admin_groups %}"{{ g }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+{% if spur_operator_groups | default([]) | length > 0 %}
+operator_groups = [{% for g in spur_operator_groups %}"{{ g }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+allow_uid_zero_administrator = {{ spur_allow_uid_zero_administrator | default(true) | string | lower }}
+allow_root_jobs = {{ spur_allow_root_jobs | default(false) | string | lower }}
+
+[admission]
+mode = "{{ spur_auth_admission_mode | default('open') }}"
+{% endif %}
+{% if spur_cgroup_manage | default(true) | bool %}
+# cgroup-v2 job resource enforcement. spurd reads this at startup and confines
+# every job process under /sys/fs/cgroup/spur/job_<id>_<attempt> with these
+# limits + a default-deny device filter. Identical block to the controller
+# template (same spur_cgroup_* vars). Read at startup only — needs a spurd restart.
+[cgroup]
+enabled = {{ spur_cgroup_enabled | default(true) | string | lower }}
+required = {{ spur_cgroup_required | default(false) | string | lower }}
+constrain_cores = {{ spur_cgroup_constrain_cores | default(true) | string | lower }}
+cpu_quota = {{ spur_cgroup_cpu_quota | default(false) | string | lower }}
+constrain_ram_space = {{ spur_cgroup_constrain_ram_space | default(true) | string | lower }}
+allowed_ram_percent = {{ spur_cgroup_allowed_ram_percent | default(100) | int }}
+constrain_swap = {{ spur_cgroup_constrain_swap | default(false) | string | lower }}
+allowed_swap_percent = {{ spur_cgroup_allowed_swap_percent | default(0) | int }}
+min_ram_mb = {{ spur_cgroup_min_ram_mb | default(30) | int }}
+oom_kill_job = {{ spur_cgroup_oom_kill_job | default(true) | string | lower }}
+constrain_devices = {{ spur_cgroup_constrain_devices | default(true) | string | lower }}
+extra_device_paths = [{% for p in spur_cgroup_extra_device_paths | default([]) %}"{{ p }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
