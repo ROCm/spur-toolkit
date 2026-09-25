@@ -88,3 +88,10 @@
     echo "kill sequence complete"
   args:
     executable: /bin/bash
+  # Transport-level flake seen in CI: the exec session itself can be torn down
+  # (empty stdout/stderr, rc=143) before the script produces any output. Retry
+  # rather than fail the whole run over what looks like a connection hiccup.
+  register: dckj_kill_result
+  retries: 2
+  delay: 3
+  until: dckj_kill_result is success
