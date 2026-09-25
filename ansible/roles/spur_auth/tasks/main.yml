@@ -131,43 +131,56 @@
     spur_auth_keys_missing: "{{ spur_auth_local_keys.results | rejectattr('stat.exists') | list | length > 0 }}"
   run_once: true
 
-- name: Generate JWKS on the first controller (only if any are missing)
-  # auth-keys writes 0600 files; its own log goes to stderr, so stdout is just
-  # the temp dir path we echo (captured for the fetch below).
-  ansible.builtin.shell: |
-    set -euo pipefail
-    tmp="$(mktemp -d)"
-    S="{{ spur_install_dir }}/spur"
-    "$S" auth-keys hmac    --kid auth-1 --out     "$tmp/auth.jwks"                                                   1>&2
-    "$S" auth-keys ed25519 --kid ctrl-1 --signing "$tmp/controller-signing.jwks" --verify "$tmp/controller-verification.jwks" 1>&2
-    "$S" auth-keys ed25519 --kid cred-1 --signing "$tmp/cred-signing.jwks"       --verify "$tmp/cred-verification.jwks"       1>&2
-    "$S" auth-keys ed25519 --kid node-1 --signing "$tmp/node-signing.jwks"       --verify "$tmp/node-verification.jwks"       1>&2
-    echo "$tmp"
-  args:
-    executable: /bin/bash
-  register: spur_auth_gen
-  changed_when: true
-  delegate_to: "{{ groups['spur_controllers'][0] }}"
+- name: Refuse to auto-regenerate over a partially-populated keys dir
+  # 1-6 of 7 present (vs. a genuine 0-of-7 fresh install) would otherwise mint a
+  # new trust root while hosts outside this run keep the old keys.
+  ansible.builtin.fail:
+    msg: >-
+      {{ spur_auth_keys_dir }} has some but not all of the expected *.jwks files
+      (missing: {{ spur_auth_local_keys.results | rejectattr('stat.exists') | map(attribute='item') | list }}).
+      Restore the missing file(s) from backup, or empty the dir entirely to force
+      a genuine fresh generation, then re-run.
+  when:
+    - spur_auth_keys_missing
+    - spur_auth_local_keys.results | selectattr('stat.exists') | list | length > 0
   run_once: true
-  when: spur_auth_keys_missing
 
-- name: Fetch the generated keys back to the control node (becomes the source of truth)
-  ansible.builtin.fetch:
-    src: "{{ spur_auth_gen.stdout | trim }}/{{ item }}"
-    dest: "{{ spur_auth_keys_dir }}/{{ item }}"
-    flat: true
-  loop: "{{ spur_auth_key_files }}"
+- name: Generate + fetch JWKS on the first controller (only on a genuinely empty keys dir)
   delegate_to: "{{ groups['spur_controllers'][0] }}"
   run_once: true
   when: spur_auth_keys_missing
+  block:
+    - name: Generate JWKS on the first controller
+      # auth-keys writes 0600 files; its own log goes to stderr. $tmp is echoed
+      # FIRST so a later auth-keys failure still leaves it in stdout for cleanup.
+      ansible.builtin.shell: |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        echo "$tmp"
+        S="{{ spur_install_dir }}/spur"
+        "$S" auth-keys hmac    --kid auth-1 --out     "$tmp/auth.jwks"                                                   1>&2
+        "$S" auth-keys ed25519 --kid ctrl-1 --signing "$tmp/controller-signing.jwks" --verify "$tmp/controller-verification.jwks" 1>&2
+        "$S" auth-keys ed25519 --kid cred-1 --signing "$tmp/cred-signing.jwks"       --verify "$tmp/cred-verification.jwks"       1>&2
+        "$S" auth-keys ed25519 --kid node-1 --signing "$tmp/node-signing.jwks"       --verify "$tmp/node-verification.jwks"       1>&2
+      args:
+        executable: /bin/bash
+      register: spur_auth_gen
+      changed_when: true
 
-- name: Remove the temporary key dir on the controller
-  ansible.builtin.file:
-    path: "{{ spur_auth_gen.stdout | trim }}"
-    state: absent
-  delegate_to: "{{ groups['spur_controllers'][0] }}"
-  run_once: true
-  when: spur_auth_keys_missing
+    - name: Fetch the generated keys back to the control node (becomes the source of truth)
+      ansible.builtin.fetch:
+        src: "{{ spur_auth_gen.stdout | trim }}/{{ item }}"
+        dest: "{{ spur_auth_keys_dir }}/{{ item }}"
+        flat: true
+      loop: "{{ spur_auth_key_files }}"
+  always:
+    # Runs even on a partial fetch failure, so private keys never leak in this mktemp dir.
+    # (Still gated by the block's own when: spur_auth_keys_missing, inherited here too.)
+    - name: Remove the temporary key dir on the controller
+      ansible.builtin.file:
+        path: "{{ spur_auth_gen.stdout | trim }}"
+        state: absent
+      when: spur_auth_gen is defined and (spur_auth_gen.stdout | default('') | length > 0)
 
 - name: Compute the key files this host needs (per role; union for a dual-role host)
   ansible.builtin.set_fact:

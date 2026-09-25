@@ -149,14 +149,15 @@
         - (ru_live_auth_plugin.stdout | trim) != 'spur'
         - (groups['spur_controllers'] | length) > 1
 
-    - name: Warn on single-controller first-time auth enablement via rolling_upgrade
-      ansible.builtin.debug:
+    - name: Refuse single-controller first-time auth enablement without spur_overwrite_conf
+      ansible.builtin.fail:
         msg: >-
-          Enabling auth on a single-controller cluster via rolling_upgrade: the
-          daemon spur.conf [auth] block only renders when you ALSO pass
+          spur_auth_enabled=true on a first-time enable but spur_overwrite_conf is
+          not set: the daemon spur.conf [auth] block only renders when you ALSO pass
           -e spur_overwrite_conf=true, otherwise spurctld/spurd stay on the old
           plugin while the CLI switches to native creds (which the old plugin then
-          rejects). Prefer deploy.yml for first-time enablement.
+          rejects — including root's own CLI calls later in this run). Re-run with
+          -e spur_overwrite_conf=true, or use deploy.yml for first-time enablement.
       when:
         - spur_auth_enabled | default(false) | bool
         - (ru_live_auth_plugin.stdout | trim) != 'spur'

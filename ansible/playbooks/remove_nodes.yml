@@ -192,6 +192,56 @@
         - spur_auth_enabled | default(false) | bool
         - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
 
+    # CLI conf is always host-local (per spur_auth's own doc), so safe to remove
+    # on any single node regardless of where spur_auth_key_dir points.
+    - name: Remove native-auth CLI config on nodes being removed
+      ansible.builtin.file:
+        path: "{{ spur_auth_conf_dir }}/spur.conf"
+        state: absent
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
+
+    # Unlike teardown.yml (whole cluster coming down), this playbook removes ONE
+    # node from an otherwise-live cluster — so only wipe *.jwks when key_dir is
+    # still the per-host default; a relocated (likely shared) dir is left alone
+    # to avoid deleting keys the surviving cluster still needs.
+    - name: Remove native-auth keys on nodes being removed (skipped on a shared key dir)
+      ansible.builtin.shell: |
+        rm -f {{ spur_auth_key_dir }}/*.jwks
+      args:
+        executable: /bin/bash
+      changed_when: true
+      failed_when: false
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
+        - spur_auth_key_dir == spur_auth_conf_dir
+
+    - name: Note native-auth keys were left in place (spur_auth_key_dir looks shared)
+      ansible.builtin.debug:
+        msg: >-
+          {{ spur_auth_key_dir }} differs from spur_auth_conf_dir — treating it as a
+          shared/relocated key location and leaving its *.jwks files in place to avoid
+          deleting keys the surviving cluster still needs. Clean them up manually if
+          this host truly had its own local copy.
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
+        - spur_auth_key_dir != spur_auth_conf_dir
+
+    - name: Remove native-auth env vars from /etc/environment on nodes being removed
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: "{{ item }}"
+        state: absent
+      loop:
+        - '^SPUR_AUTH_PLUGIN='
+        - '^SPUR_CLUSTER_NAME='
+      when:
+        - spur_auth_enabled | default(false) | bool
+        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
+
     # A job supervisor is built to outlive its agent (own session, reparented
     # to init, spared by the unit's KillMode=process), so stopping spurd above
     # leaves one running on a host that is no longer part of any cluster. The
