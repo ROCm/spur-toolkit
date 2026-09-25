@@ -164,7 +164,7 @@ jobs:
 
       - name: Start systemd containers on a docker network
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci
@@ -600,7 +600,7 @@ jobs:
             cat > /tmp/ci-force-docker.sh <<EOF
           #!/bin/bash
           #SBATCH --job-name=force-docker
-          docker run -d --name ci-force-container ubuntu:22.04 sleep 600
+          docker run -d --name ci-force-container ubuntu:24.04 sleep 600
           sleep 600
           EOF
             jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-force-docker.sh | grep -oE "[0-9]+" | head -1)
@@ -924,7 +924,7 @@ jobs:
 
       - name: Start systemd containers on a docker network
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci
@@ -1243,7 +1243,7 @@ jobs:
       # inventory alias to close that gap.
       - name: Start gpu-4 with a hostname that deliberately differs from its inventory alias
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker run -d --name gpu-4 --hostname gpu-4-real-hostname \
@@ -1373,7 +1373,7 @@ jobs:
 
       - name: Start systemd containers on a docker network
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci
@@ -1900,7 +1900,7 @@ jobs:
 
       - name: Start systemd containers on a docker network (with /lib/modules for wireguard)
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci
@@ -2331,7 +2331,7 @@ jobs:
 
       - name: Start systemd containers on a docker network
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci-ts
@@ -2535,6 +2535,9 @@ jobs:
   # then flips the whole cluster to mode=required and re-verifies a user job.
   # ---------------------------------------------------------------------------
   integration-auth:
+    # Builds spur from source, then runs it in the same jrei/systemd-ubuntu:24.04
+    # containers the other jobs use. ubuntu-latest is 24.04, so the build host and
+    # the container share a glibc and the compiled binaries run cleanly inside them.
     runs-on: ubuntu-latest
     needs: lint
     env:
@@ -2583,7 +2586,7 @@ jobs:
 
       - name: Start systemd containers on a docker network
         env:
-          IMG: jrei/systemd-ubuntu:22.04
+          IMG: jrei/systemd-ubuntu:24.04
         run: |
           set -euo pipefail
           docker network create spur-ci-auth
