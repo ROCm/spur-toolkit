@@ -10,6 +10,12 @@ WorkingDirectory={{ spur_home }}
 ExecStart={{ spur_install_dir }}/spurctld -f {{ spur_home }}/etc/spur.conf --state-dir {{ spur_home }}/state --log-level {{ spur_log_level }}
 Restart=on-failure
 RestartSec=3
+# spurctld has no bounded timeout of its own around draining an active srun step
+# on shutdown (SPUR-304) — it can block SIGTERM handling for as long as that step
+# runs. Without this, systemd's own default TimeoutStopSec (~90s) is what finally
+# kills it, stalling every stop/restart/rolling-upgrade behind a live job. Bound it
+# here instead so a stuck shutdown gets SIGKILL'd quickly.
+TimeoutStopSec={{ spur_controller_stop_timeout_secs | default(15) }}
 User=root
 LimitNOFILE=65536
 

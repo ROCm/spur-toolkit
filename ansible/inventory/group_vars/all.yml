@@ -151,6 +151,13 @@ spur_ssh_server_alive_count_max: 3
 # Logging
 spur_log_level: info
 
+# spurctld systemd unit's TimeoutStopSec — bounds how long systemd waits for a
+# stuck/slow shutdown (e.g. a live srun step, see SPUR-304) before SIGKILL'ing
+# it, instead of falling back to systemd's own ~90s default. Applies to every
+# stop/restart/rolling-upgrade of spurctld. Override with -e for a cluster that
+# needs more slack.
+spur_controller_stop_timeout_secs: 15
+
 # Wipe Raft state on (re)deploy. Default false so re-runs/upgrades are non-destructive; set true for a fresh install.
 spur_wipe_state: false
 

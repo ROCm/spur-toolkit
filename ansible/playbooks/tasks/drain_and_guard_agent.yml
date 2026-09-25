@@ -39,6 +39,10 @@
 # nothing left to protect. Also accepts DOWN as a fully-drained outcome: a
 # genuinely unreachable agent may independently cross its heartbeat timeout.
 - name: Drain this node and wait for it to fully drain
+  # Force/trust-stepd modes check once, no wait: both already commit to a
+  # specific outcome for a busy node regardless of how much longer its job
+  # runs, and the controller flips Draining->Drain synchronously off job
+  # completion (no reconciliation lag to wait out either).
   ansible.builtin.shell: |
     set -o pipefail
     drain_out=$({{ spur_install_dir }}/spur node drain {{ spur_node_name }} --reason "ansible {{ dckj_action }}" 2>&1)
@@ -51,10 +55,22 @@
       echo "$drain_out" >&2
       exit 1
     fi
+    check_state() {
+      {{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
+        | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
+        | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2
+    }
+    if [ "{{ dckj_force_busy | default(false) | bool | lower }}" = "true" ] \
+       || [ "{{ dckj_trust_stepd | default(false) | bool | lower }}" = "true" ]; then
+      st=$(check_state)
+      case "$st" in
+        DRAINED|DOWN) echo "RESULT=DRAINED"; exit 0 ;;
+      esac
+      echo "RESULT=BUSY (force/trust-stepd mode — proceeding immediately instead of waiting up to {{ spur_drain_wait_secs | default(120) }}s)"
+      exit 0
+    fi
     for i in $(seq 1 {{ spur_drain_wait_secs | default(120) }}); do
-      st=$({{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
-           | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
-           | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
+      st=$(check_state)
       case "$st" in
         DRAINED|DOWN) echo "RESULT=DRAINED"; exit 0 ;;
       esac
@@ -133,8 +149,9 @@
       Killing job processes now, then proceeding with {{ dckj_action }}.
   when: spur_node_busy and dckj_force_busy
 
-# Same kill mechanism (raw processes + containers) used everywhere a busy
-# node can be force-disrupted — see kill_workload_processes.yml.
+# Same kill mechanism used everywhere a busy node can be force-disrupted (see
+# kill_workload_processes.yml) — a plain un-salloc'd srun step can still end
+# up stuck RUNNING at the controller afterward; see the PR's known limitations.
 - name: Kill workloads still running on this node
   ansible.builtin.include_tasks: kill_workload_processes.yml
   when: spur_node_busy and dckj_force_busy
