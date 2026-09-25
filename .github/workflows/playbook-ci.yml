@@ -519,11 +519,24 @@ jobs:
           jid=$(docker exec ctl-0 cat /tmp/ci-deploy-skip.jid)
           docker exec ctl-0 /usr/local/bin/spur scancel "$jid" || true
           docker exec ctl-0 /usr/local/bin/scontrol update NodeName=gpu-1 State=RESUME || true
+          found=""
           for i in $(seq 1 30); do
             st=$(docker exec ctl-0 /usr/local/bin/spur show node gpu-1 2>/dev/null | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
-            [ "$st" = IDLE ] && break
+            [ "$st" = IDLE ] && { found=1; break; }
             sleep 2
           done
+          [ -n "$found" ] || { echo "FAIL: gpu-1 never reached IDLE after scancel (last state: ${st:-none})"; exit 1; }
+          # Scheduler-idle doesn't guarantee the OS-level process is reaped yet
+          # (see kill_workload_processes.yml's own cgroup sweep) — confirm gpu-1's
+          # cgroup is actually empty too, so a later step never races this cleanup.
+          clean=""
+          for i in $(seq 1 15); do
+            pids=$(docker exec gpu-1 bash -c \
+              "find /sys/fs/cgroup/spur -name cgroup.procs 2>/dev/null | xargs cat 2>/dev/null | sort -u" || true)
+            [ -z "$pids" ] && { clean=1; break; }
+            sleep 1
+          done
+          [ -n "$clean" ] || { echo "FAIL: gpu-1's cgroup still has PIDs after scancel: $pids"; exit 1; }
 
       - name: rolling_upgrade.yml spur_controller_upgrade_order validation (must fail fast on an unknown controller name)
         working-directory: ansible

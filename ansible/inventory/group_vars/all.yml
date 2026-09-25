@@ -183,9 +183,6 @@ spur_controller_runs_agent: "{{ inventory_hostname in groups.get('spur_agents', 
 spur_skip_busy_agents: false
 # How long to wait for a node to reach DRAINED/DOWN before treating it as busy.
 spur_drain_wait_secs: 120
-# rolling_upgrade.yml's force/trust-stepd modes only: short cap on the wait
-# above, just enough for the drain state transition itself to settle.
-spur_force_drain_settle_secs: 15
 # Per-playbook force flags: kill a busy node's running job and proceed anyway.
 spur_force_teardown_busy_agents: false
 spur_force_upgrade_busy_agents: false

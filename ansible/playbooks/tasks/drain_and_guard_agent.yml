@@ -39,11 +39,10 @@
 # nothing left to protect. Also accepts DOWN as a fully-drained outcome: a
 # genuinely unreachable agent may independently cross its heartbeat timeout.
 - name: Drain this node and wait for it to fully drain
-  # Force/trust-stepd modes cap the wait at min(spur_drain_wait_secs,
-  # spur_force_drain_settle_secs) instead of the full spur_drain_wait_secs —
-  # they don't need to wait out an actually-running job, only give the node's
-  # own drain-state reconciliation a chance to land (an immediate single check
-  # races it and can misclassify an already-idle node as busy).
+  # Force/trust-stepd modes check once, no wait: both already commit to a
+  # specific outcome for a busy node regardless of how much longer its job
+  # runs, and the controller flips Draining->Drain synchronously off job
+  # completion (no reconciliation lag to wait out either).
   ansible.builtin.shell: |
     set -o pipefail
     drain_out=$({{ spur_install_dir }}/spur node drain {{ spur_node_name }} --reason "ansible {{ dckj_action }}" 2>&1)
@@ -63,14 +62,11 @@
     }
     if [ "{{ dckj_force_busy | default(false) | bool | lower }}" = "true" ] \
        || [ "{{ dckj_trust_stepd | default(false) | bool | lower }}" = "true" ]; then
-      for i in $(seq 1 {{ [spur_drain_wait_secs | default(120) | int, spur_force_drain_settle_secs | default(15) | int] | min }}); do
-        st=$(check_state)
-        case "$st" in
-          DRAINED|DOWN) echo "RESULT=DRAINED"; exit 0 ;;
-        esac
-        sleep 1
-      done
-      echo "RESULT=BUSY (force/trust-stepd mode — proceeding after a short settle instead of waiting up to {{ spur_drain_wait_secs | default(120) }}s)"
+      st=$(check_state)
+      case "$st" in
+        DRAINED|DOWN) echo "RESULT=DRAINED"; exit 0 ;;
+      esac
+      echo "RESULT=BUSY (force/trust-stepd mode — proceeding immediately instead of waiting up to {{ spur_drain_wait_secs | default(120) }}s)"
       exit 0
     fi
     for i in $(seq 1 {{ spur_drain_wait_secs | default(120) }}); do
