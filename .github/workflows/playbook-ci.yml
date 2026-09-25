@@ -2631,6 +2631,7 @@ jobs:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
           ansible-playbook -i "$AUTH_INV" playbooks/deploy.yml \
+            -e @inventory/group_vars/all.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
@@ -2682,6 +2683,7 @@ jobs:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
           ansible-playbook -i "$AUTH_INV" playbooks/deploy.yml \
+            -e @inventory/group_vars/all.yml \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
