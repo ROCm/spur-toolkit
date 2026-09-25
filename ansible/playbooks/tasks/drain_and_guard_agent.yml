@@ -39,6 +39,17 @@
 # nothing left to protect. Also accepts DOWN as a fully-drained outcome: a
 # genuinely unreachable agent may independently cross its heartbeat timeout.
 - name: Drain this node and wait for it to fully drain
+  # Force and trust-stepd modes both already commit to a specific outcome for
+  # a busy node regardless of how much longer its job runs — force kills it
+  # either way, trust-stepd restarts spurd either way (that's the whole point:
+  # the supervisor carries the job through unharmed). So for both, polling for
+  # up to spur_drain_wait_secs (120s default) before proceeding is pure
+  # overhead with no safety benefit — a job that would finish inside the wait
+  # window would also just finish fine under an immediate single check. Only
+  # default (fail-if-busy) and skip modes genuinely want to give a job a
+  # chance to finish naturally first, since the busy/not-busy result changes
+  # what they actually do (abort vs. proceed, touch vs. leave untouched) — so
+  # they keep the full drain-wait loop.
   ansible.builtin.shell: |
     set -o pipefail
     drain_out=$({{ spur_install_dir }}/spur node drain {{ spur_node_name }} --reason "ansible {{ dckj_action }}" 2>&1)
@@ -51,10 +62,22 @@
       echo "$drain_out" >&2
       exit 1
     fi
+    check_state() {
+      {{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
+        | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
+        | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2
+    }
+    if [ "{{ dckj_force_busy | default(false) | bool | lower }}" = "true" ] \
+       || [ "{{ dckj_trust_stepd | default(false) | bool | lower }}" = "true" ]; then
+      st=$(check_state)
+      case "$st" in
+        DRAINED|DOWN) echo "RESULT=DRAINED"; exit 0 ;;
+      esac
+      echo "RESULT=BUSY (force/trust-stepd mode — proceeding immediately instead of waiting up to {{ spur_drain_wait_secs | default(120) }}s)"
+      exit 0
+    fi
     for i in $(seq 1 {{ spur_drain_wait_secs | default(120) }}); do
-      st=$({{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
-           | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
-           | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
+      st=$(check_state)
       case "$st" in
         DRAINED|DOWN) echo "RESULT=DRAINED"; exit 0 ;;
       esac
@@ -135,6 +158,20 @@
 
 # Same kill mechanism (raw processes + containers) used everywhere a busy
 # node can be force-disrupted — see kill_workload_processes.yml.
+#
+# Note: this only kills the OS-level process. A plain, un-salloc'd `srun`
+# step has no server-side (spurstepd) supervision, so its completion is
+# normally reported by the srun client process — which may not still be
+# around, or able to reach the controller, by the time this runs. Left alone,
+# such a step can stay stuck RUNNING at the controller with no path to a
+# terminal state until an operator manually `scancel`s it. Deliberately not
+# addressed here: explicitly cancelling on the job's behalf would need to run
+# as the job's actual owner (Spur correctly refuses to let one user cancel
+# another's job), and doing that from this playbook would mean either
+# granting the deploy account OS-level impersonation of arbitrary users
+# (become_user) or a pre-provisioned admin association — both a bigger
+# privilege/deployment footprint than this playbook should take on. Left as
+# a known, documented limitation of force-upgrading a busy `srun` step.
 - name: Kill workloads still running on this node
   ansible.builtin.include_tasks: kill_workload_processes.yml
   when: spur_node_busy and dckj_force_busy
