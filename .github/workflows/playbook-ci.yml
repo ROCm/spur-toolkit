@@ -517,7 +517,7 @@ jobs:
         run: |
           set -euo pipefail
           jid=$(docker exec ctl-0 cat /tmp/ci-deploy-skip.jid)
-          docker exec ctl-0 /usr/local/bin/spur scancel "$jid" || true
+          docker exec -u ciuser ctl-0 /usr/local/bin/spur scancel "$jid" || true
           docker exec ctl-0 /usr/local/bin/scontrol update NodeName=gpu-1 State=RESUME || true
           found=""
           for i in $(seq 1 30); do
@@ -1358,6 +1358,20 @@ jobs:
           fetch "$deploy_tag"  spur-bin
           fetch "$upgrade_tag" spur-bin-new
 
+          # nightly can legitimately be the same commit as the latest release
+          # right after a release is cut — the binaries are then byte-identical
+          # by construction, not a bug. Detect it and let the "was it actually
+          # upgraded" assertion downstream treat that as expected, not a failure.
+          if [ "$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurd" | awk '{print $1}')" \
+               = "$(sha256sum "$GITHUB_WORKSPACE/spur-bin-new/spurd" | awk '{print $1}')" ]; then
+            deploy_commit=$(gh api "repos/ROCm/spur/releases/tags/$deploy_tag" --jq .target_commitish)
+            upgrade_commit=$(gh api "repos/ROCm/spur/releases/tags/$upgrade_tag" --jq .target_commitish)
+            if [ "$deploy_commit" = "$upgrade_commit" ]; then
+              echo "::notice::$deploy_tag and $upgrade_tag are both built from $deploy_commit — no new commit since the release was cut, binaries are identical by construction"
+              echo "SPUR_BUILD_IDENTICAL=true" >> "$GITHUB_ENV"
+            fi
+          fi
+
       - name: Start systemd containers on a docker network
         env:
           IMG: jrei/systemd-ubuntu:22.04
@@ -1549,9 +1563,10 @@ jobs:
             || { echo "::error::spurstepd identity changed across the trust-stepd upgrade (before: $(cat /tmp/ci-ru-trust.stepd-before) / after: $after)"; exit 1; }
           old_sum=$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurd" | awk '{print $1}')
           new_sum=$(docker exec gpu-3 sha256sum /usr/local/bin/spurd | awk '{print $1}')
-          [ "$new_sum" != "$old_sum" ] \
-            || { echo "::error::gpu-3's spurd binary was not actually upgraded"; exit 1; }
-          echo "PASS: job $jid still RUNNING (same spurstepd $after), gpu-3 upgraded, no force/skip flags used"
+          if [ "$new_sum" = "$old_sum" ] && [ "${SPUR_BUILD_IDENTICAL:-}" != "true" ]; then
+            echo "::error::gpu-3's spurd binary was not actually upgraded"; exit 1
+          fi
+          echo "PASS: job $jid still RUNNING (same spurstepd $after), gpu-3 upgraded (or build unchanged upstream), no force/skip flags used"
           docker exec -u ciuser ctl-0 /usr/local/bin/spur cancel "$jid" || true
 
       # --- remove_nodes.yml: refuse / skip / force on a busy node -----------
