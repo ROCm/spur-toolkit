@@ -32,28 +32,32 @@
 # Force-upgrade ALL nodes even if jobs are still running — running jobs WILL be
 # killed (marked NODE_FAIL by the controller the moment spurd restarts). Only
 # use when job disruption is acceptable (e.g. a maintenance window where you
-# know no production work is running, or when jobs are short/re-runnable):
+# know no production work is running, or when jobs are short/re-runnable).
+# Unlike refuse/skip, this doesn't wait out spur_drain_wait_secs — it commits
+# to killing the job either way, so it checks busy status once, immediately:
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_force_upgrade_busy_agents=true
 #
 # Upgrade a busy node's spurd WITHOUT killing its running job, trusting that
 # job's spurstepd supervisor (a detached, double-forked process outside
 # spurd's lifecycle) to carry it across the restart unharmed. Refused if the
 # node has no spurstepd yet, or combined with spur_skip_busy_agents /
-# spur_force_upgrade_busy_agents:
+# spur_force_upgrade_busy_agents. Same as force above, this checks busy status
+# once immediately rather than waiting — the outcome doesn't depend on it:
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_trust_stepd_busy_agents=true
 #
 # Unlike teardown.yml/remove_nodes.yml, this playbook never calls
 # tasks/reap_stepd_supervisors.yml on a force-killed job's spurstepd — it
 # doesn't need to. kill_workload_processes.yml deliberately never touches
-# spurstepd (see its header): the supervisor notices its own job die, reports
-# the exit, and cleans up its own session normally — typically well before
-# spur_agent even gets to restarting spurd below. If a supervisor itself died
-# before it could report, spurd's own startup recovery (not a targeted reap)
-# catches that case on the next restart instead, so the controller never sees
-# a job stuck RUNNING either way. This playbook has no wipe flag (unlike
-# teardown.yml -e wipe=true), so anything else under spur_agent_state_dir is
-# left untouched — but the killed job's own session directory is already
-# gone by then, via the self-cleanup described above.
+# spurstepd (see its header): the supervisor notices the kill almost
+# immediately and tears down the job's cgroup as part of handling it, well
+# before spur_agent even gets to restarting spurd below. Its on-disk
+# completion record is deliberately kept until the controller acknowledges
+# the report, though — so whether the supervisor's own report races a spurd
+# restart, or the supervisor itself died before reporting at all, spurd's
+# startup recovery finds that record and retries, and the controller never
+# sees the job stuck RUNNING either way. This playbook has no wipe flag
+# (unlike teardown.yml -e wipe=true), so anything else under
+# spur_agent_state_dir is left untouched.
 #
 # Submit a real test job at the end to verify scheduling still works (default
 # false — off for routine upgrades, on in CI):
