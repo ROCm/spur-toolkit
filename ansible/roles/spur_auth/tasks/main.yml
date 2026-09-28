@@ -102,7 +102,11 @@
       {{ inventory_hostname }}. Build it (`cargo build --release -p spurauthd`
       into spur_binary_src) or use a release/nightly that includes ROCm/spur#919,
       then re-run.
-  when: not (spur_authd_bin.stat.exists | default(false))
+  # The stat above still "registers" on an unreachable host (as an unreachable
+  # result, no .stat key) — don't mistake that skip for a genuinely missing binary.
+  when:
+    - not (spur_authd_bin.unreachable | default(false))
+    - not (spur_authd_bin.stat.exists | default(false))
 
 # --- Key material (hybrid). The control-node spur_auth_keys_dir is the source of
 # truth. Generate the sets once on the first controller only if any are missing
