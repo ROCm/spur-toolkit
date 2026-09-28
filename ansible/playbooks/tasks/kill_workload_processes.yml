@@ -5,20 +5,31 @@
 # Include-time `when:` controls whether this actually runs; the script itself
 # is a no-op if the spur cgroup is already empty (job finished on its own).
 #
-# Three layers, in order:
+# Four layers, in order:
 #
-# 1. Container runtimes — if a job launched containers (Docker, containerd/nerdctl,
-#    Podman, or any OCI runtime) those containers live under their own cgroup
-#    subtree and are invisible to a plain cgroup.procs kill. Detect containers
-#    whose cgroup ancestry includes a spur job cgroup and stop them via the
-#    runtime's own CLI first, which cleanly tears down the network namespace,
-#    volume mounts, and GPU device contexts before the kernel sees SIGKILL.
+# 1. Container runtimes — a container nested INSIDE the job's own cgroup tree
+#    (rootless Podman/nerdctl/Docker in cgroupfs mode, which nest the
+#    container's cgroup under whatever cgroup invoked them) is invisible to a
+#    plain cgroup.procs kill of its own PID alone: stopping it via the
+#    runtime's own CLI first cleanly tears down the network namespace, volume
+#    mounts, and GPU device contexts before the kernel sees SIGKILL. Covers
+#    Docker/containerd/Podman naming conventions plus a best-effort runc/crun
+#    attempt. This does NOT cover a container a system daemon (e.g. system
+#    dockerd) placed entirely outside /sys/fs/cgroup/spur — this sweep is
+#    rooted there and never sees those PIDs; spur's own native
+#    --container-image jobs aren't affected either way, since that container
+#    is always a direct child of the job cgroup and layer 2 reaches it fine.
 #
 # 2. SIGTERM to surviving bare PIDs — catches any non-containerised processes
 #    still in spur cgroups (MPI ranks, Python scripts, bare GPU processes, etc.)
 #    and gives them 5s to flush/checkpoint.
 #
 # 3. SIGKILL to anything still alive after the grace period.
+#
+# 4. Best-effort cgroup directory cleanup — once every PID above is gone,
+#    rmdir the now-empty job/step leaf cgroups bottom-up so they don't sit
+#    around forever (found some 3+ days old in the wild). Never touches a
+#    directory whose cgroup.procs still has a PID in it.
 #
 # The sweep is rooted at /sys/fs/cgroup/spur, so it still reaches a job's
 # processes now that each step gets its own leaf cgroup under the job's.
@@ -29,6 +40,14 @@
 # stranded one — killing the supervisor first throws that away. Where the host
 # itself is going away and the supervisors have to go too,
 # tasks/reap_stepd_supervisors.yml does that explicitly, afterwards.
+#
+# Known limitation this doesn't fully close: a plain, un-salloc'd `srun` step
+# supervises its allocation with an "extern" step that doesn't reliably notice
+# its own workload died here, so the controller can be left showing the job
+# RUNNING with the node's resources still allocated even though the cgroup
+# above is empty. The explicit "Force-cancel jobs this kill just emptied" task
+# below (run against the controller, not this agent) is what actually clears
+# that — see its own comment for why an agent-side kill alone isn't enough.
 - name: Kill job processes and containers in spur cgroups
   ansible.builtin.shell: |
     set -uo pipefail
@@ -38,9 +57,25 @@
         | xargs cat 2>/dev/null | sort -u
     }
 
+    # Job IDs (job_<id>_<n> leaf dirs) that owned at least one PID at the
+    # start of this sweep — reported back so the caller can reconcile these
+    # jobs against the controller even if their supervisor never does.
+    affected_job_ids() {
+      # The top-level job directory has no PIDs of its own on this layout —
+      # live PIDs sit one level down, in a step_N/step_extern leaf — so this
+      # has to check recursively under each job dir, same as spur_pids().
+      find /sys/fs/cgroup/spur -mindepth 1 -maxdepth 1 -type d -name 'job_*' 2>/dev/null \
+        | while read -r d; do
+            p=$(find "$d" -name cgroup.procs 2>/dev/null | xargs cat 2>/dev/null | sort -u)
+            [ -n "$p" ] && basename "$d" | sed -E 's/^job_([0-9]+)_.*/\1/'
+          done \
+        | sort -un
+    }
+
     pids=$(spur_pids)
     [ -z "$pids" ] && { echo "no spur job processes found, nothing to kill"; exit 0; }
     echo "spur job PIDs before kill: $pids"
+    echo "AFFECTED_JOB_IDS: $(affected_job_ids | tr '\n' ' ')"
 
     container_ids=""
     for pid in $pids; do
@@ -68,6 +103,14 @@
         if command -v crictl &>/dev/null; then
           crictl stop "$short" 2>/dev/null && echo "crictl stop $short: ok" || true
         fi
+        # Best-effort: a raw runc/crun container whose ID happens to match
+        # (cgroupfs driver, default --root). Silently no-ops otherwise.
+        if command -v runc &>/dev/null; then
+          runc kill "$short" KILL 2>/dev/null && echo "runc kill $short: ok" || true
+        fi
+        if command -v crun &>/dev/null; then
+          crun kill "$short" KILL 2>/dev/null && echo "crun kill $short: ok" || true
+        fi
       done
       sleep 2
     fi
@@ -85,6 +128,16 @@
       echo "$pids" | xargs kill -KILL 2>/dev/null || true
     fi
 
+    # Cleanup: rmdir now-empty leaf cgroups, deepest first. Never removes a
+    # directory whose cgroup.procs still has a PID (rmdir fails harmlessly on
+    # a non-empty cgroup anyway, but the procs check avoids the noisy attempt).
+    find /sys/fs/cgroup/spur -mindepth 1 -type d 2>/dev/null \
+      | awk '{ print gsub(/\//,"/"), $0 }' | sort -rn | cut -d' ' -f2- \
+      | while read -r d; do
+          [ -s "$d/cgroup.procs" ] && continue
+          rmdir "$d" 2>/dev/null && echo "removed empty cgroup: $d" || true
+        done
+
     echo "kill sequence complete"
   args:
     executable: /bin/bash
@@ -95,3 +148,26 @@
   retries: 2
   delay: 3
   until: dckj_kill_result is success
+
+- name: Extract job IDs this kill just emptied
+  ansible.builtin.set_fact:
+    dckj_affected_job_ids: >-
+      {{ ((dckj_kill_result.stdout | regex_search('AFFECTED_JOB_IDS:(.*)', '\1')) or [''])[0]
+         | trim | split }}
+
+# The kill above only ever touches processes — it can't tell the CONTROLLER a
+# job is done, and a plain un-salloc'd srun step's "extern" supervisor doesn't
+# reliably self-report that its workload died (see this file's header
+# comment). Left alone, the controller keeps such a job JobState=RUNNING and
+# the node's resources allocated forever. Cancelling from here doesn't wait on
+# agent/stepd acknowledgment — it's a controller-side state change — so it
+# clears the job regardless of whether the local supervisor ever notices.
+# Idempotent: cancelling an already-terminal or nonexistent job id exits 0
+# with an informational stderr line, never fails the play.
+- name: Force-cancel jobs this kill just emptied (controller-side, no agent ack needed)
+  ansible.builtin.command:
+    argv: "{{ [spur_install_dir ~ '/spur', 'cancel', '-s', 'KILL'] + dckj_affected_job_ids }}"
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  when: dckj_affected_job_ids | length > 0
+  changed_when: true
+  failed_when: false
