@@ -2540,6 +2540,8 @@ jobs:
   #   * a normal user's job runs but that user is DENIED `spur node drain`
   #     while root (Administrator via allow_uid_zero_administrator) is allowed,
   # then flips the whole cluster to mode=required and re-verifies a user job.
+  # Also adds a third agent (gpu-2) and re-deploys with it unreachable + auth
+  # enabled: the auth-provisioning play must skip it, not abort the whole run.
   # ---------------------------------------------------------------------------
   integration-auth:
     # Builds spur from source, then runs it in the same jrei/systemd-ubuntu:24.04
@@ -2711,10 +2713,102 @@ jobs:
           docker exec gpu-1 grep -q 'mode = "required"' /opt/spur/etc/spur.conf || { echo "::error::agent not in required mode"; exit 1; }
           echo "PASS: required mode active; a ciuser verify job completed under it"
 
+      # --- SPUR-314 regression: auth-provisioning play must honor
+      # spur_ignore_unreachable_agents, not abort the whole run on one down
+      # agent. Adds a third node (gpu-2) this job stops before re-deploying. --
+      - name: Start gpu-2 for the unreachable-agent auth regression test
+        run: |
+          set -euo pipefail
+          docker run -d --name gpu-2 --hostname gpu-2 \
+            --network spur-ci-auth \
+            --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+            jrei/systemd-ubuntu:24.04
+          for i in $(seq 1 30); do
+            st=$(docker exec gpu-2 systemctl is-system-running 2>/dev/null || true)
+            case "$st" in running|degraded) break ;; esac
+            sleep 2
+          done
+          docker exec gpu-2 bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
+          docker exec gpu-2 useradd -m -s /bin/bash ciuser
+
+      - name: Stop spurauthd on ctl-0/gpu-1 so the next assertion proves the play re-ran, not leftover state
+        run: |
+          docker exec ctl-0 systemctl stop spurauthd
+          docker exec gpu-1 systemctl stop spurauthd
+
+      - name: Simulate gpu-2 unreachable, then re-deploy with spur_ignore_unreachable_agents=true
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          docker stop gpu-2
+          ansible-playbook -i ../.github/workflows/ci-auth-unreachable.ini playbooks/deploy.yml \
+            -e @inventory/group_vars/all.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_accounting_enabled=false \
+            -e spur_auth_enabled=true \
+            -e spur_auth_mode=required \
+            -e spur_overwrite_conf=true \
+            -e spur_ignore_unreachable_agents=true \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
+
+      - name: Assert the run did not abort — ctl-0/gpu-1 still fully auth-provisioned, gpu-2 skipped
+        run: |
+          set -euo pipefail
+          for n in ctl-0 gpu-1; do
+            docker exec "$n" systemctl is-active --quiet spurauthd || { echo "::error::spurauthd not active on $n after the unreachable-agent run"; exit 1; }
+            docker exec "$n" grep -q 'mode = "required"' /opt/spur/etc/spur.conf || { echo "::error::$n dropped required mode after the unreachable-agent run"; exit 1; }
+          done
+          docker exec ctl-0 /usr/local/bin/spur show node gpu-2 2>/dev/null | grep -qx "NodeName=gpu-2" \
+            && { echo "::error::gpu-2 should not have registered while unreachable"; exit 1; }
+          echo "PASS: unreachable gpu-2 did not abort auth provisioning on ctl-0/gpu-1"
+
+      - name: Bring gpu-2 back and re-deploy (all reachable) — assert it catches up on auth
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          set -euo pipefail
+          docker start gpu-2
+          for i in $(seq 1 30); do
+            st=$(docker exec gpu-2 systemctl is-system-running 2>/dev/null || true)
+            case "$st" in running|degraded) break ;; esac
+            sleep 2
+          done
+          ansible-playbook -i ../.github/workflows/ci-auth-unreachable.ini playbooks/deploy.yml \
+            -e @inventory/group_vars/all.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_accounting_enabled=false \
+            -e spur_auth_enabled=true \
+            -e spur_auth_mode=required \
+            -e spur_overwrite_conf=true \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
+
+      - name: Assert gpu-2 registered and fully auth-provisioned
+        run: |
+          set -euo pipefail
+          found=""
+          for i in $(seq 1 30); do
+            docker exec ctl-0 /usr/local/bin/spur show node gpu-2 2>/dev/null | grep -qx "NodeName=gpu-2" && { found=1; break; }
+            sleep 2
+          done
+          [ -n "$found" ] || { echo "::error::gpu-2 never registered after coming back"; exit 1; }
+          docker exec gpu-2 systemctl is-active --quiet spurauthd || { echo "::error::spurauthd not active on gpu-2"; exit 1; }
+          docker exec gpu-2 grep -q 'mode = "required"' /opt/spur/etc/spur.conf || { echo "::error::gpu-2 not in required mode"; exit 1; }
+          echo "PASS: gpu-2 caught up and fully auth-provisioned"
+
       - name: Dump logs on failure
         if: failure()
         run: |
-          for n in $NODES; do
+          for n in $NODES gpu-2; do
             echo "===== $n journal (spur*) ====="
             docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -80' || true
           done
@@ -2722,5 +2816,5 @@ jobs:
       - name: Teardown containers
         if: always()
         run: |
-          for n in $NODES; do docker rm -f "$n" || true; done
+          for n in $NODES gpu-2; do docker rm -f "$n" || true; done
           docker network rm spur-ci-auth || true

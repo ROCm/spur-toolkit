@@ -71,10 +71,22 @@
   # single "no hosts matched" line. A role-level `when:` instead attaches to every
   # task in the role and prints a "skipping" line per-task per-host (21 tasks x
   # every node), which is slow and noisy on a large direct-transport cluster.
-  hosts: "spur_controllers:spur_agents:spur_login{{ '' if (spur_transport | default('direct')) == 'wireguard' else ':!all' }}"
+  # Split strict/lenient by `hosts:` for the same ansible-core reason as the
+  # install plays above — a templated any_errors_fatal won't combine
+  # reliably with ignore_unreachable.
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if ((spur_transport | default('direct')) == 'wireguard' and not (spur_ignore_unreachable_agents | default(false) | bool)) else ':!all' }}"
   become: true
   gather_facts: no
   any_errors_fatal: true
+  roles:
+    - role: spur_wireguard
+
+- name: Configure WireGuard mesh (tolerate unreachable agents)
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if ((spur_transport | default('direct')) == 'wireguard' and (spur_ignore_unreachable_agents | default(false) | bool)) else ':!all' }}"
+  become: true
+  gather_facts: no
+  ignore_unreachable: true
+  any_errors_fatal: false
   roles:
     - role: spur_wireguard
 
@@ -85,10 +97,23 @@
   # Gated on spur_auth_enabled: off (default) -> the pattern matches no hosts and
   # the whole play is skipped. Runs after the WireGuard play so key distribution
   # (control node -> hosts over ordinary SSH) is unaffected by the mesh.
-  hosts: "spur_controllers:spur_agents:spur_login{{ '' if (spur_auth_enabled | default(false) | bool) else ':!all' }}"
+  # Split strict/lenient by `hosts:` for the same ansible-core reason as the
+  # install plays above.
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if ((spur_auth_enabled | default(false) | bool) and not (spur_ignore_unreachable_agents | default(false) | bool)) else ':!all' }}"
   become: true
   gather_facts: no
   any_errors_fatal: true
+  roles:
+    - role: spur_auth
+
+- name: Provision native authentication (keys + spurauthd) on every host (tolerate unreachable agents)
+  # A down agent is skipped when spur_ignore_unreachable_agents=true; a down
+  # controller is still caught by the strict "Start controller" play below.
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if ((spur_auth_enabled | default(false) | bool) and (spur_ignore_unreachable_agents | default(false) | bool)) else ':!all' }}"
+  become: true
+  gather_facts: no
+  ignore_unreachable: true
+  any_errors_fatal: false
   roles:
     - role: spur_auth
 
