@@ -155,6 +155,10 @@
       {{ ((dckj_kill_result.stdout | regex_search('AFFECTED_JOB_IDS:(.*)', '\1')) or [''])[0]
          | trim | split }}
 
+- name: Show job IDs extracted from this kill (debug visibility)
+  ansible.builtin.debug:
+    msg: "dckj_affected_job_ids={{ dckj_affected_job_ids }}"
+
 # The kill above only ever touches processes — it can't tell the CONTROLLER a
 # job is done, and a plain un-salloc'd srun step's "extern" supervisor doesn't
 # reliably self-report that its workload died (see this file's header
@@ -169,5 +173,11 @@
     argv: "{{ [spur_install_dir ~ '/spur', 'cancel', '-s', 'KILL'] + dckj_affected_job_ids }}"
   delegate_to: "{{ groups['spur_controllers'][0] }}"
   when: dckj_affected_job_ids | length > 0
+  register: dckj_cancel_result
   changed_when: true
   failed_when: false
+
+- name: Show force-cancel result (debug visibility)
+  ansible.builtin.debug:
+    var: dckj_cancel_result
+  when: dckj_affected_job_ids | length > 0
