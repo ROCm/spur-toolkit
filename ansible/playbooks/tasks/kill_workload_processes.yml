@@ -59,10 +59,7 @@
 
     # Job IDs (job_<id>_<n> leaf dirs) that owned at least one PID at the
     # start of this sweep — reported back so the caller can reconcile these
-    # jobs against the controller even if their supervisor never does. Each
-    # entry also carries the owning username (from the first live PID),
-    # so the caller can cancel as that user instead of assuming root has
-    # admin rights on the controller (it may not, depending on auth config).
+    # jobs against the controller even if their supervisor never does.
     affected_job_ids() {
       # The top-level job directory has no PIDs of its own on this layout —
       # live PIDs sit one level down, in a step_N/step_extern leaf — so this
@@ -70,10 +67,7 @@
       find /sys/fs/cgroup/spur -mindepth 1 -maxdepth 1 -type d -name 'job_*' 2>/dev/null \
         | while read -r d; do
             p=$(find "$d" -name cgroup.procs 2>/dev/null | xargs cat 2>/dev/null | sort -u)
-            [ -z "$p" ] && continue
-            jid=$(basename "$d" | sed -E 's/^job_([0-9]+)_.*/\1/')
-            owner=$(stat -c '%U' "/proc/$(echo "$p" | head -n 1)" 2>/dev/null || true)
-            echo "${jid}:${owner}"
+            [ -n "$p" ] && basename "$d" | sed -E 's/^job_([0-9]+)_.*/\1/'
           done \
         | sort -un
     }
@@ -155,15 +149,34 @@
   delay: 3
   until: dckj_kill_result is success
 
-- name: Extract job IDs (and owners) this kill just emptied
+- name: Extract job IDs this kill just emptied
   ansible.builtin.set_fact:
-    dckj_affected_jobs: >-
+    dckj_affected_job_ids: >-
       {{ ((dckj_kill_result.stdout | regex_search('AFFECTED_JOB_IDS:(.*)', '\1')) or [''])[0]
-         | trim | split | map('split', ':') | list }}
+         | trim | split }}
 
 - name: Show job IDs extracted from this kill (debug visibility)
   ansible.builtin.debug:
-    msg: "dckj_affected_job_ids={{ dckj_affected_jobs | map('first') | list }}"
+    msg: "dckj_affected_job_ids={{ dckj_affected_job_ids }}"
+
+# spur's cancel authorization checks the job's OWNER as recorded on the
+# controller at submit time — not the OS uid the workload happens to run
+# under on the agent, which a plain un-salloc'd srun step can leave owned by
+# root there regardless of who actually submitted it. Look the real owner up
+# from the controller's own job record so the cancel below authenticates as
+# that user rather than as whoever ansible connects as. Best-effort: an
+# already-gone/unreadable job leaves this empty and the cancel below just
+# falls back to the play's normal become target instead of failing the play.
+- name: Look up each affected job's owner on the controller
+  ansible.builtin.shell: "{{ spur_install_dir }}/spur show job {{ item }} 2>/dev/null | grep -oE 'UserId=[^ ]+' | head -n 1 | cut -d= -f2 | xargs -r getent passwd | cut -d: -f1"
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  loop: "{{ dckj_affected_job_ids }}"
+  loop_control:
+    label: "{{ item }}"
+  register: dckj_job_owners
+  changed_when: false
+  failed_when: false
+  when: dckj_affected_job_ids | length > 0
 
 # The kill above only ever touches processes — it can't tell the CONTROLLER a
 # job is done, and a plain un-salloc'd srun step's "extern" supervisor doesn't
@@ -174,22 +187,18 @@
 # clears the job regardless of whether the local supervisor ever notices.
 # Idempotent: cancelling an already-terminal or nonexistent job id exits 0
 # with an informational stderr line, never fails the play.
-#
-# Runs as the job's own owner (captured above), not root: without the native
-# spur auth plugin enabled, root has no special cancel rights, only the job
-# owner does — matching how a plain user could always cancel their own job.
-# Falls back to the play's normal become target when the owner could not be
-# resolved (e.g. the PID was already gone by the time we looked it up).
 - name: Force-cancel jobs this kill just emptied (controller-side, no agent ack needed)
   ansible.builtin.command:
-    argv: "{{ [spur_install_dir ~ '/spur', 'cancel', '-s', 'KILL', item[0]] }}"
+    argv: "{{ [spur_install_dir ~ '/spur', 'cancel', '-s', 'KILL', item.item] }}"
   delegate_to: "{{ groups['spur_controllers'][0] }}"
-  loop: "{{ dckj_affected_jobs }}"
+  loop: "{{ dckj_job_owners.results | default([]) }}"
   loop_control:
-    label: "{{ item[0] }}"
+    label: "{{ item.item }}"
   become: true
-  become_user: "{{ item[1] if (item[1] | default('') | length > 0) else omit }}"
-  when: dckj_affected_jobs | length > 0
+  become_user: >-
+    {{ (item.stdout | default('') | trim)
+       if ((item.stdout | default('') | trim) | length > 0) else omit }}
+  when: dckj_affected_job_ids | length > 0
   register: dckj_cancel_result
   changed_when: true
   failed_when: false
@@ -197,4 +206,4 @@
 - name: Show force-cancel result (debug visibility)
   ansible.builtin.debug:
     var: dckj_cancel_result
-  when: dckj_affected_jobs | length > 0
+  when: dckj_affected_job_ids | length > 0
