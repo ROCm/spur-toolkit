@@ -158,6 +158,13 @@ spur_log_level: info
 # needs more slack.
 spur_controller_stop_timeout_secs: 15
 
+# How long the playbook waits for spurctld's gRPC listener to come up after a
+# (re)start. spurctld only opens the port once Raft state recovery finishes —
+# it reads and parses the whole snapshot first — so this scales with cluster
+# history, not with machine speed. A cluster with a large snapshot needs more
+# than the old hardcoded 30s. Raise it with -e if a deploy still trips over it.
+spur_controller_start_timeout_secs: 120
+
 # Wipe Raft state on (re)deploy. Default false so re-runs/upgrades are non-destructive; set true for a fresh install.
 spur_wipe_state: false
 
