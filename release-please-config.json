@@ -4,6 +4,7 @@
     ".": {
       "release-type": "simple",
       "package-name": "spur-toolkit",
+      "initial-version": "0.1.0",
       "include-component-in-tag": false,
       "draft-pull-request": true,
       "bump-minor-pre-major": true,
