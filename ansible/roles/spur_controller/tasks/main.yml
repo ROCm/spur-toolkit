@@ -249,7 +249,7 @@
   ansible.builtin.wait_for:
     port: "{{ spur_controller_port }}"
     host: "127.0.0.1"
-    timeout: 30
+    timeout: "{{ spur_controller_start_timeout_secs | default(120) }}"
 
 - name: Wait for Raft leader to be elected (HA mode needs all peers up before quorum)
   # `spur nodes` returns the error `no leader elected yet` until election succeeds.
