@@ -175,6 +175,14 @@
     # the CLI (installed above) + the client env pointing at the controllers.
     - role: spur_login
       when: inventory_hostname in groups.get('spur_login', [])
+  post_tasks:
+    - name: Collect controller verification facts
+      ansible.builtin.include_tasks: tasks/collect_verification_facts.yml
+      vars:
+        spur_verify_daemon_name: spurctld
+        spur_verify_daemon_port: "{{ spur_controller_port }}"
+        spur_verify_role_label: controller
+      when: inventory_hostname in groups['spur_controllers']
 
 - name: Start agents
   # Same strict/lenient split as the install play above, and for the same
@@ -234,6 +242,14 @@
       ansible.builtin.include_tasks: tasks/resume_and_undrain_agent.yml
       when: deploy_agent_registered
 
+    - name: Collect agent verification facts
+      ansible.builtin.include_tasks: tasks/collect_verification_facts.yml
+      vars:
+        spur_verify_daemon_name: spurd
+        spur_verify_daemon_port: "{{ spur_agent_port }}"
+        spur_verify_role_label: agent
+        spur_verify_check_registration: true
+
 - name: Start agents (tolerate unreachable agents)
   hosts: "spur_agents{{ '' if (spur_ignore_unreachable_agents | default(false) | bool) else ':!all' }}"
   become: true
@@ -259,3 +275,10 @@
   gather_facts: no
   roles:
     - role: spur_verify
+
+- name: Print verification summary
+  hosts: spur_controllers[0]
+  become: false
+  gather_facts: no
+  tasks:
+    - ansible.builtin.include_tasks: tasks/print_verification_summary.yml

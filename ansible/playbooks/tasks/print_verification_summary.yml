@@ -1,0 +1,52 @@
+---
+# Renders one VERIFICATION SUMMARY table from every spur_verify_row recorded by
+# collect_verification_facts.yml across the fleet (hostvars persist across
+# plays within this run, same mechanism the gather_facts fix relies on).
+# Expected to run on a single host (e.g. spur_controllers[0]) at the tail of
+# the playbook.
+
+- name: "Verify: collect every node's summary row"
+  ansible.builtin.set_fact:
+    spur_summary_expected: "{{ groups['spur_controllers'] + groups['spur_agents'] }}"
+    spur_summary_rows: >-
+      {{
+        (groups['spur_controllers'] + groups['spur_agents'])
+        | map('extract', hostvars, 'spur_verify_row')
+        | select('defined') | list
+      }}
+
+- name: "Verify: build the table body"
+  ansible.builtin.set_fact:
+    spur_summary_lines: []
+    spur_summary_ok_count: 0
+
+- name: "Verify: append one line per node"
+  ansible.builtin.set_fact:
+    spur_summary_lines: >-
+      {{ spur_summary_lines + [
+           '%-14s %-11s %-14s %-9s %-24s %-s' | format(
+             item.node,
+             item.role,
+             ('OK (' ~ item.port ~ ')' if item.listening else 'FAIL'),
+             ('OK' if item.binary_current else 'STALE'),
+             item.version | default('?'),
+             (item.registered_state if item.registered_state | length > 0 else '-')
+           )
+      ] }}
+    spur_summary_ok_count: "{{ (spur_summary_ok_count | int) + (1 if (item.listening and item.binary_current) else 0) }}"
+  loop: "{{ spur_summary_rows }}"
+  loop_control:
+    label: "{{ item.node }}"
+
+- name: "Verify: print the summary table"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        ['', 'VERIFICATION SUMMARY',
+         '%-14s %-11s %-14s %-9s %-24s %-s' | format('NODE', 'ROLE', 'LISTENING', 'BINARY', 'VERSION', 'REGISTERED')]
+        + spur_summary_lines
+        + ['']
+        + [spur_summary_ok_count ~ '/' ~ (spur_summary_expected | length) ~ ' nodes verified'
+           ~ ((' (' ~ (spur_summary_expected | length - spur_summary_rows | length) ~ ' did not report)')
+              if (spur_summary_rows | length < spur_summary_expected | length) else '')]
+      }}

@@ -266,6 +266,13 @@
         # safe (the spur.conf template's | default(0) fallback already covers a
         # missing agent's facts identically either way).
         spur_controller_gather_missing_agent_facts: false
+  post_tasks:
+    - name: Collect controller verification facts
+      ansible.builtin.include_tasks: tasks/collect_verification_facts.yml
+      vars:
+        spur_verify_daemon_name: spurctld
+        spur_verify_daemon_port: "{{ spur_controller_port }}"
+        spur_verify_role_label: controller
 
 - name: Rolling upgrade — agents, drained and upgraded in batches
   hosts: spur_agents
@@ -355,6 +362,14 @@
     - name: Re-register + undrain the node now that it's back
       ansible.builtin.include_tasks: tasks/resume_and_undrain_agent.yml
 
+    - name: Collect agent verification facts
+      ansible.builtin.include_tasks: tasks/collect_verification_facts.yml
+      vars:
+        spur_verify_daemon_name: spurd
+        spur_verify_daemon_port: "{{ spur_agent_port }}"
+        spur_verify_role_label: agent
+        spur_verify_check_registration: true
+
 - name: Verify the upgraded cluster still schedules work
   # Opt-in (see spur_verify_enabled) — submits a real job, so it's off by
   # default for routine upgrades and enabled explicitly in CI.
@@ -363,3 +378,10 @@
   gather_facts: no
   roles:
     - role: spur_verify
+
+- name: Print verification summary
+  hosts: spur_controllers[0]
+  become: false
+  gather_facts: no
+  tasks:
+    - ansible.builtin.include_tasks: tasks/print_verification_summary.yml
