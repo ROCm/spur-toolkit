@@ -122,9 +122,13 @@
     tarball="/tmp/spur-bins-${hash}.tar.gz"
     if [ ! -f "$tarball" ]; then
       tmp="${tarball}.tmp.$$"
-      tar -czf "$tmp" {{ spur_bin_list | join(' ') }}
+      # Fixed mtime + gzip -n: byte-identical output for byte-identical
+      # inputs, so a lost local cache rebuilds to the same checksum instead
+      # of forcing a spurious re-copy.
+      tar --mtime=@0 -cf - {{ spur_bin_list | join(' ') }} | gzip -n > "$tmp"
       mv -f "$tmp" "$tarball"
     fi
+    echo "HASH=$hash"
     echo "TARBALL=$tarball"
   args:
     executable: /bin/bash
@@ -134,10 +138,17 @@
   changed_when: false
   when: spur_binary_src | default('') | length > 0
 
+# Kept remotely (named by content hash, not deleted after extraction) so this
+# copy's own checksum comparison is the idempotency check on every future
+# run — deleting it here would mean every subsequent deploy re-transfers and
+# re-extracts unconditionally, even with unchanged binaries.
 - name: Copy the binaries tarball to the remote host
+  vars:
+    spur_bin_hash: "{{ spur_bin_tar.stdout_lines | select('match', '^HASH=') | first | regex_replace('^HASH=', '') }}"
+    spur_bin_tarball_local: "{{ spur_bin_tar.stdout_lines | select('match', '^TARBALL=') | first | regex_replace('^TARBALL=', '') }}"
   ansible.builtin.copy:
-    src: "{{ spur_bin_tar.stdout | regex_replace('^TARBALL=', '') }}"
-    dest: "{{ spur_install_dir }}/.bins.tar.gz"
+    src: "{{ spur_bin_tarball_local }}"
+    dest: "{{ spur_install_dir }}/.bins-{{ spur_bin_hash }}.tar.gz"
     mode: "0644"
   register: spur_bin_copy
   when: spur_binary_src | default('') | length > 0
@@ -145,11 +156,13 @@
 - name: Extract the binaries (only when the tarball actually changed)
   ansible.builtin.shell: |
     set -e
-    tar -xzf "{{ spur_install_dir }}/.bins.tar.gz" -C "{{ spur_install_dir }}"
+    tar -xzf "{{ spur_bin_copy.dest }}" -C "{{ spur_install_dir }}"
     chmod 0755 {{ spur_bin_list | map('regex_replace', '^', spur_install_dir ~ '/') | join(' ') }}
-    rm -f "{{ spur_install_dir }}/.bins.tar.gz"
+    find "{{ spur_install_dir }}" -maxdepth 1 -name '.bins-*.tar.gz' ! -name '.bins-{{ spur_bin_hash }}.tar.gz' -delete
   args:
     executable: /bin/bash
+  vars:
+    spur_bin_hash: "{{ spur_bin_tar.stdout_lines | select('match', '^HASH=') | first | regex_replace('^HASH=', '') }}"
   changed_when: true
   when:
     - spur_binary_src | default('') | length > 0
