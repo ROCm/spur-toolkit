@@ -141,16 +141,15 @@
       ansible.builtin.include_tasks: tasks/kill_workload_processes.yml
       when: spur_ok_to_disrupt
 
+    # One shell call instead of 4 looped systemd-module calls — the "Reap any
+    # stray daemons" check right below already confirms the end state (no
+    # spurd/spurctld/spurdbd/spurauthd process survives), so per-unit
+    # changed-tracking here isn't load-bearing.
     - name: Stop and disable Spur systemd services
-      ansible.builtin.systemd:
-        name: "{{ item }}"
-        state: stopped
-        enabled: false
-      loop:
-        - spurd
-        - spurctld
-        - spurdbd
-        - spurauthd
+      ansible.builtin.shell: systemctl disable --now spurd spurctld spurdbd spurauthd 2>&1 || true
+      args:
+        executable: /bin/bash
+      changed_when: false
       failed_when: false
       when: spur_ok_to_disrupt
 
@@ -197,13 +196,16 @@
       when: spur_transport == 'wireguard' and spur_ok_to_disrupt
       changed_when: false
 
-    - name: Wipe state (only when -e wipe=true)
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - "{{ spur_home }}"
-        - "/etc/wireguard/{{ spur_wg_interface }}.conf"
+    # Merged: state wipe (2 paths), SPUR_CONTROLLER_ADDR removal, and the
+    # native-auth env vars (2 more) all share this exact when: condition —
+    # one shell instead of 5 separate file/lineinfile calls.
+    - name: Wipe state + clear env vars (only when -e wipe=true)
+      ansible.builtin.shell: |
+        rm -rf "{{ spur_home }}" "/etc/wireguard/{{ spur_wg_interface }}.conf"
+        sed -Ei '/^SPUR_CONTROLLER_ADDR=/d; /^SPUR_AUTH_PLUGIN=/d; /^SPUR_CLUSTER_NAME=/d' /etc/environment
+      args:
+        executable: /bin/bash
+      changed_when: true
       when: (wipe | default(false) | bool) and spur_ok_to_disrupt
 
     # Native-auth CLI config lives under spur_auth_conf_dir (/etc/spur by default),
@@ -246,25 +248,6 @@
         - (wipe | default(false) | bool)
         - spur_ok_to_disrupt
         - spur_auth_key_dir != spur_auth_conf_dir
-
-    - name: Remove SPUR_CONTROLLER_ADDR from /etc/environment (only when -e wipe=true)
-      # Otherwise a stale/wrong endpoint (e.g. a node's own underlay IP left by a prior run)
-      # persists and the CLI on this host talks to the wrong place after a fresh deploy.
-      ansible.builtin.lineinfile:
-        path: /etc/environment
-        regexp: '^SPUR_CONTROLLER_ADDR='
-        state: absent
-      when: (wipe | default(false) | bool) and spur_ok_to_disrupt
-
-    - name: Remove native-auth env vars from /etc/environment (only when -e wipe=true)
-      ansible.builtin.lineinfile:
-        path: /etc/environment
-        regexp: "{{ item }}"
-        state: absent
-      loop:
-        - '^SPUR_AUTH_PLUGIN='
-        - '^SPUR_CLUSTER_NAME='
-      when: (wipe | default(false) | bool) and spur_ok_to_disrupt
 
     - name: Note SPUR_CONTROLLER_ADDR is left in place on a non-wipe teardown
       # A plain teardown stops the daemons but keeps SPUR_CONTROLLER_ADDR, which now points at a
