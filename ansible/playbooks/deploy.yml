@@ -130,10 +130,18 @@
           if (groups['spur_accounting_node'] | default([]) | length > 0)
           else groups['spur_controllers'][0])]) | unique | join(':') }}
   become: true
-  gather_facts: yes
-  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  # The install play above already gathered facts for every controller and
+  # login host it reached; a standalone accounting host was never in its
+  # scope, and a controller/login host that was unreachable there (lenient
+  # variant) may still lack facts too — both covered by the pre_task below.
+  gather_facts: no
   any_errors_fatal: true
   pre_tasks:
+    - name: Gather facts if missing (standalone accounting host, or a host unreachable during install)
+      ansible.builtin.setup:
+        gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+      when: ansible_default_ipv4 is not defined
+
     # Native auth plugin switch (jwt->spur) or a mode flip must not leave a
     # switched leader forwarding to / deciding for an unswitched peer, so on an
     # HA cluster every controller must cross together. deploy.yml already

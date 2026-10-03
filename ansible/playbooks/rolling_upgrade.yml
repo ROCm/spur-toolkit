@@ -215,8 +215,8 @@
   gather_facts: yes
   gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   # ignore_unreachable: a temporarily down agent must not abort the whole upgrade.
-  # The spur_controller role's setup task will re-attempt fact-gathering for any
-  # agent still missing facts when spur.conf is re-rendered.
+  # A host still missing facts when its own play is reached later gets a
+  # conditional re-gather there (see the pre_tasks below) — not here.
   ignore_unreachable: true
   tasks: []
 
@@ -226,10 +226,19 @@
     {{ (spur_controller_upgrade_order | default('') | split(',') | map('trim') | select | list)
        or groups['spur_controllers'] }}
   become: true
-  gather_facts: yes
-  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  # Facts were already gathered for every controller reachable during the
+  # whole-cluster play above and persist in hostvars for the rest of this run
+  # — re-gathering here would be a wasted setup call per controller. A
+  # controller that was unreachable there (ignore_unreachable) and is only
+  # reachable now gets caught by the pre_task below instead.
+  gather_facts: no
   serial: 1
   max_fail_percentage: 0
+  pre_tasks:
+    - name: Gather facts if missing (this controller was unreachable during the whole-cluster gather)
+      ansible.builtin.setup:
+        gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+      when: ansible_default_ipv4 is not defined
   roles:
     - role: spur_install
       vars:
@@ -261,8 +270,10 @@
 - name: Rolling upgrade — agents, drained and upgraded in batches
   hosts: spur_agents
   become: true
-  gather_facts: yes
-  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  # Same reasoning as the controller play above: facts persist from the
+  # whole-cluster gather for every agent reachable there, so skip the
+  # redundant per-batch re-gather — except for one that wasn't (caught below).
+  gather_facts: no
   serial: "{{ spur_rolling_batch_size | default(1) }}"
   # Skip unreachable agents when spur_ignore_unreachable_agents=true, else strict.
   ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
@@ -274,6 +285,11 @@
     dckj_force_flag: spur_force_upgrade_busy_agents
     dckj_trust_stepd: "{{ spur_trust_stepd_busy_agents | default(false) | bool }}"
   pre_tasks:
+    - name: Gather facts if missing (this agent was unreachable during the whole-cluster gather)
+      ansible.builtin.setup:
+        gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+      when: ansible_default_ipv4 is not defined
+
     - name: Drain + guard this node against job loss before touching its binaries
       ansible.builtin.include_tasks: tasks/drain_and_guard_agent.yml
 
