@@ -55,12 +55,19 @@
       node: "{{ inventory_hostname }}"
       role: "{{ spur_verify_role_label }}"
       port: "{{ spur_verify_daemon_port }}"
-      listening: "{{ 'LISTENING=OK' in spur_verify_probe.stdout }}"
-      version: "{{ spur_verify_probe.stdout_lines | select('match', '^VERSION=') | first | default('VERSION=?') | regex_replace('^VERSION=', '') }}"
+      # .get(...) (not dot-attribute access) on purpose: an unreachable/failed
+      # probe registers as a dict with no stdout key, and bare .stdout raises
+      # AttributeError instead of rendering Undefined/default() here.
+      listening: "{{ 'LISTENING=OK' in spur_verify_probe.get('stdout', '') }}"
+      version: >-
+        {{
+          (spur_verify_probe.get('stdout_lines', []) | select('match', '^VERSION=') | first | default('VERSION=?'))
+          | regex_replace('^VERSION=', '')
+        }}
       binary_current: >-
         {{
-          (spur_verify_probe.stdout_lines | select('match', '^RUNNING_INODE=') | first | default('=-1') | regex_replace('^RUNNING_INODE=', ''))
+          ((spur_verify_probe.get('stdout_lines', []) | select('match', '^RUNNING_INODE=') | first | default('=-1')) | regex_replace('^RUNNING_INODE=', ''))
           ==
-          (spur_verify_probe.stdout_lines | select('match', '^ONDISK_INODE=') | first | default('=-2') | regex_replace('^ONDISK_INODE=', ''))
+          ((spur_verify_probe.get('stdout_lines', []) | select('match', '^ONDISK_INODE=') | first | default('=-2')) | regex_replace('^ONDISK_INODE=', ''))
         }}
-      registered_state: "{{ (spur_verify_node_state.stdout | default('')) | trim }}"
+      registered_state: "{{ spur_verify_node_state.get('stdout', '') | trim }}"
