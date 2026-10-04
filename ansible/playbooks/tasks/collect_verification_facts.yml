@@ -7,6 +7,25 @@
 # spur_verify_role_label (controller|agent). Agents additionally set
 # spur_verify_check_registration: true.
 
+# Records which hosts this run's plays actually targeted (after --limit), so
+# the final summary's denominator doesn't count a deliberately-excluded host
+# as "missing". ansible_play_hosts_all is identical for every host in this
+# play, so run_once + delegate_to (no race, same idiom as deploy.yml's
+# fleet-wide node-list query) collapses this to one write per play. Reads via
+# hostvars[...] (not a bare reference) so a later play's accumulation actually
+# sees the earlier play's value instead of a different host's empty default —
+# the same delegate_to + set_fact gotcha this repo's CONTRIBUTING.md documents.
+- name: "Verify: record which hosts this run actually targeted"
+  ansible.builtin.set_fact:
+    spur_verify_targeted_hosts: >-
+      {{
+        (hostvars[groups['spur_controllers'][0]].spur_verify_targeted_hosts | default([]) + ansible_play_hosts_all)
+        | unique
+      }}
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  delegate_facts: true
+  run_once: true
+
 # One shell call instead of four separate module calls (PID, listening,
 # running-exe inode, on-disk inode) — same reasoning as the restart+wait
 # merge elsewhere in these roles. Reports both -V (human-readable version,

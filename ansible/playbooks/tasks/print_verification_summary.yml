@@ -6,11 +6,20 @@
 # the playbook.
 
 - name: "Verify: collect every node's summary row"
+  vars:
+    # Falls back to the full inventory only if collect_verification_facts.yml
+    # never ran (e.g. this file invoked standalone) — the normal case always
+    # has this set, correctly scoped to whatever --limit narrowed this run to.
+    spur_verify_targeted_hosts_resolved: >-
+      {{
+        hostvars[groups['spur_controllers'][0]].spur_verify_targeted_hosts
+        | default(groups['spur_controllers'] + groups['spur_agents'])
+      }}
   ansible.builtin.set_fact:
-    spur_summary_expected: "{{ groups['spur_controllers'] + groups['spur_agents'] }}"
+    spur_summary_expected: "{{ spur_verify_targeted_hosts_resolved }}"
     spur_summary_rows: >-
       {{
-        (groups['spur_controllers'] + groups['spur_agents'])
+        spur_verify_targeted_hosts_resolved
         | map('extract', hostvars, 'spur_verify_row')
         | select('defined') | list
       }}
@@ -50,3 +59,17 @@
            ~ ((' (' ~ (spur_summary_expected | length - spur_summary_rows | length) ~ ' did not report)')
               if (spur_summary_rows | length < spur_summary_expected | length) else '')]
       }}
+
+# Opt-in (default off, same pattern as spur_verify_enabled) — a broken-but-
+# reachable daemon makes no `failed`/`unreachable` noise of its own (the probe
+# shell always exits 0 by design), so this is the only way to turn "verified
+# fewer nodes than targeted" into something a caller's exit-code check sees.
+- name: "Verify: fail the run if strict mode is on and not every targeted node verified"
+  ansible.builtin.fail:
+    msg: >-
+      Only {{ spur_summary_ok_count }}/{{ spur_summary_expected | length }} nodes verified
+      (spur_verify_strict=true). See the VERIFICATION SUMMARY table above for which node(s)
+      failed and why.
+  when:
+    - spur_verify_strict | default(false) | bool
+    - (spur_summary_ok_count | int) < (spur_summary_expected | length)
