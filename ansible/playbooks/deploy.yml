@@ -32,23 +32,12 @@
 # spur-CLI-everywhere change: it won't have `spur` yet, so this run re-fetches
 # the release (network dependency) to install it, once.
 
-- name: Preflight + install Spur, configure WireGuard mesh, provision native auth
+- name: Preflight + install Spur on all hosts
   # Accounting is embedded in spurctld now — a dedicated (non-controller/non-agent)
   # accounting host runs only Postgres and needs no spur binaries, so it is not
   # included here (spur_accounting role handles it independently). Login nodes DO
   # need the CLI binaries, so they're included (the group is empty by default,
   # making login nodes opt-in).
-  #
-  # These 3 roles used to be 3 separate plays (6 counting strict/lenient), each
-  # its own full fleet-wide pass. Merged into one play with per-role `when:` —
-  # same mechanism the "Deploy accounting/controller/login" play below already
-  # uses. Trade-off, measured: spur_wireguard is 29 tasks, spur_auth is 22 —
-  # with both features off (the common case) every host now prints ~51 extra
-  # "skipping" lines it didn't before, but costs no extra wall-clock (a skipped
-  # `when:` is evaluated locally, not a round trip). With either feature ON,
-  # this merge removes a full fleet-wide pass (bounded by `forks`) per feature —
-  # up to 2 fewer passes when both are on, which is the actual point: on a
-  # large fleet, a full extra pass costs far more than extra log lines.
   #
   # Split strict/lenient by `hosts:` (not a templated any_errors_fatal) because
   # ansible-core does not honor a Jinja-templated any_errors_fatal alongside
@@ -61,12 +50,8 @@
   any_errors_fatal: true
   roles:
     - role: spur_install
-    - role: spur_wireguard
-      when: (spur_transport | default('direct')) == 'wireguard'
-    - role: spur_auth
-      when: spur_auth_enabled | default(false) | bool
 
-- name: Preflight + install Spur, configure WireGuard mesh, provision native auth (tolerate unreachable agents)
+- name: Preflight + install Spur on all hosts (tolerate unreachable agents)
   # A down agent is skipped when spur_ignore_unreachable_agents=true; a down
   # controller is still caught by the strict "Start controller" play below.
   hosts: "spur_controllers:spur_agents:spur_login{{ '' if (spur_ignore_unreachable_agents | default(false) | bool) else ':!all' }}"
@@ -77,10 +62,71 @@
   any_errors_fatal: false
   roles:
     - role: spur_install
+
+# spur_wireguard and spur_auth are gated at the PLAY level (hosts: pattern),
+# NOT merged into the install play's role list via role-level `when:`. A
+# role-level `when:` (tried in an earlier version of this change, measured and
+# reverted — see PR #53 discussion) attaches to every task in the role and
+# still gets evaluated — "skipping: [host]" printed — for every host, every
+# task, even when the feature is off: spur_wireguard is 29 tasks, spur_auth is
+# 22, so the common case (both off) was paying for 51 extra per-host task
+# evaluations that don't make a network call but are NOT free — they're local
+# control-process bookkeeping (Jinja condition + result object + callback
+# line), and that cost scales with raw host count, not with `forks`. Measured
+# at 25 simulated hosts: ~10s of wall-clock (~6% of total deploy.yml runtime)
+# for zero benefit when both features are off, which is the overwhelmingly
+# common case — and the regression gets worse, not better, as fleet size
+# grows, since it doesn't benefit from fork-level parallelism the way real
+# SSH round trips do.
+#
+# A `hosts:` pattern that matches no hosts skips the ENTIRE play as a single
+# "no hosts matched" bookkeeping op — no per-host, per-task evaluation at all.
+# That's why these are separate plays again. When a feature IS on, you still
+# get the "one fleet pass instead of two" win this merge was reaching for,
+# because the play actually runs.
+- name: Configure WireGuard mesh (when spur_transport == wireguard)
+  # Login nodes join the mesh too, so interactive `srun` can stream job output
+  # directly from agents over the tunnel.
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if ((spur_transport | default('direct')) == 'wireguard' and not (spur_ignore_unreachable_agents | default(false) | bool)) else ':!all' }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  roles:
     - role: spur_wireguard
-      when: (spur_transport | default('direct')) == 'wireguard'
+
+- name: Configure WireGuard mesh (tolerate unreachable agents)
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if ((spur_transport | default('direct')) == 'wireguard' and (spur_ignore_unreachable_agents | default(false) | bool)) else ':!all' }}"
+  become: true
+  gather_facts: no
+  ignore_unreachable: true
+  any_errors_fatal: false
+  roles:
+    - role: spur_wireguard
+
+- name: Provision native authentication (keys + spurauthd) on every host
+  # Distributes JWKS keys per role, installs+starts the spurauthd mint, and drops
+  # the CLI-facing /etc/spur/spur.conf — all BEFORE any daemon (re)starts on
+  # plugin="spur" in the plays below. Same host union as the install plays.
+  # Gated on spur_auth_enabled: off (default) -> the pattern matches no hosts and
+  # the whole play is skipped. Runs after the WireGuard play so key distribution
+  # (control node -> hosts over ordinary SSH) is unaffected by the mesh.
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if ((spur_auth_enabled | default(false) | bool) and not (spur_ignore_unreachable_agents | default(false) | bool)) else ':!all' }}"
+  become: true
+  gather_facts: no
+  any_errors_fatal: true
+  roles:
     - role: spur_auth
-      when: spur_auth_enabled | default(false) | bool
+
+- name: Provision native authentication (keys + spurauthd) on every host (tolerate unreachable agents)
+  # A down agent is skipped when spur_ignore_unreachable_agents=true; a down
+  # controller is still caught by the strict "Start controller" play below.
+  hosts: "spur_controllers:spur_agents:spur_login{{ '' if ((spur_auth_enabled | default(false) | bool) and (spur_ignore_unreachable_agents | default(false) | bool)) else ':!all' }}"
+  become: true
+  gather_facts: no
+  ignore_unreachable: true
+  any_errors_fatal: false
+  roles:
+    - role: spur_auth
 
 - name: Deploy accounting, start controllers, configure login nodes
   # Merged into one play: a play runs its role list as a sequence of tasks
