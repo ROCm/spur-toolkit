@@ -141,10 +141,9 @@
       ansible.builtin.include_tasks: tasks/kill_workload_processes.yml
       when: spur_ok_to_disrupt
 
-    # One shell call instead of 4 looped systemd-module calls — the "Reap any
-    # stray daemons" check right below already confirms the end state (no
-    # spurd/spurctld/spurdbd/spurauthd process survives), so per-unit
-    # changed-tracking here isn't load-bearing.
+    # One shell call instead of 4 looped systemd-module calls — same
+    # best-effort semantics as the prior loop (failed_when: false), so
+    # per-unit changed-tracking here isn't load-bearing.
     - name: Stop and disable Spur systemd services
       ansible.builtin.shell: systemctl disable --now spurd spurctld spurdbd spurauthd 2>&1 || true
       args:
@@ -201,6 +200,7 @@
     # one shell instead of 5 separate file/lineinfile calls.
     - name: Wipe state + clear env vars (only when -e wipe=true)
       ansible.builtin.shell: |
+        set -e
         rm -rf "{{ spur_home }}" "/etc/wireguard/{{ spur_wg_interface }}.conf"
         sed -Ei '/^SPUR_CONTROLLER_ADDR=/d; /^SPUR_AUTH_PLUGIN=/d; /^SPUR_CLUSTER_NAME=/d' /etc/environment
       args:

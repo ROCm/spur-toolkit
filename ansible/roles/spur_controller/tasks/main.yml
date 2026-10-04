@@ -147,9 +147,11 @@
          | join(',') }}
   ansible.builtin.shell: |
     set -e
-    grep -q '^SPUR_CONTROLLER_ADDR=' /etc/environment 2>/dev/null \
-      && sed -Ei 's#^SPUR_CONTROLLER_ADDR=.*#SPUR_CONTROLLER_ADDR={{ all_controller_endpoints }}#' /etc/environment \
-      || echo 'SPUR_CONTROLLER_ADDR={{ all_controller_endpoints }}' >> /etc/environment
+    if grep -q '^SPUR_CONTROLLER_ADDR=' /etc/environment 2>/dev/null; then
+      sed -Ei 's#^SPUR_CONTROLLER_ADDR=.*#SPUR_CONTROLLER_ADDR={{ all_controller_endpoints }}#' /etc/environment
+    else
+      echo 'SPUR_CONTROLLER_ADDR={{ all_controller_endpoints }}' >> /etc/environment
+    fi
     sed -Ei '/^SPUR_ACCOUNTING_ADDR=/d' /etc/environment
   args:
     executable: /bin/bash
