@@ -1,0 +1,92 @@
+---
+# Included right after a daemon (spurd/spurctld) has just been (re)started.
+# Records one row of spur_verify_row for the final summary table — no new SSH
+# connection, runs in the same play/host that just touched this daemon.
+#
+# Caller must set: spur_verify_daemon_name (spurd|spurctld), spur_verify_daemon_port,
+# spur_verify_role_label (controller|agent). Agents additionally set
+# spur_verify_check_registration: true.
+
+# Records which hosts this run's plays actually targeted (after --limit), so
+# the final summary's denominator doesn't count a deliberately-excluded host
+# as "missing". ansible_play_hosts_all is identical for every host in this
+# play, so run_once + delegate_to (no race, same idiom as deploy.yml's
+# fleet-wide node-list query) collapses this to one write per play. Reads via
+# hostvars[...] (not a bare reference) so a later play's accumulation actually
+# sees the earlier play's value instead of a different host's empty default —
+# the same delegate_to + set_fact gotcha this repo's CONTRIBUTING.md documents.
+- name: "Verify: record which hosts this run actually targeted"
+  ansible.builtin.set_fact:
+    spur_verify_targeted_hosts: >-
+      {{
+        (hostvars[groups['spur_controllers'][0]].spur_verify_targeted_hosts | default([]) + ansible_play_hosts_all)
+        | unique
+      }}
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  delegate_facts: true
+  run_once: true
+
+# One shell call instead of four separate module calls (PID, listening,
+# running-exe inode, on-disk inode) — same reasoning as the restart+wait
+# merge elsewhere in these roles. Reports both -V (human-readable version,
+# read from the on-disk binary) and the inode pair (ground truth: does the
+# RUNNING process actually back onto that same file, or a stale replaced one
+# — /proc/<pid>/exe keeps resolving correctly to the real inode even if the
+# on-disk path was since overwritten while this process kept running).
+- name: "Verify: PID, version, listening state, and binary identity ({{ spur_verify_daemon_name }})"
+  ansible.builtin.shell: |
+    set +e -o pipefail
+    pid=$(systemctl show -p MainPID --value {{ spur_verify_daemon_name }})
+    version=$({{ spur_install_dir }}/{{ spur_verify_daemon_name }} -V 2>&1 | head -1)
+    listening=FAIL
+    if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+      (exec 3<>/dev/tcp/127.0.0.1/{{ spur_verify_daemon_port }}) 2>/dev/null && listening=OK
+    fi
+    running_inode=$(stat -L -c %i "/proc/$pid/exe" 2>/dev/null || echo -1)
+    ondisk_inode=$(stat -c %i "{{ spur_install_dir }}/{{ spur_verify_daemon_name }}" 2>/dev/null || echo -2)
+    echo "PID=$pid"
+    echo "VERSION=$version"
+    echo "LISTENING=$listening"
+    echo "RUNNING_INODE=$running_inode"
+    echo "ONDISK_INODE=$ondisk_inode"
+  args:
+    executable: /bin/bash
+  register: spur_verify_probe
+  changed_when: false
+
+- name: "Verify: this node's registration state"
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ spur_install_dir }}/spur show node {{ spur_node_name | default(ansible_hostname) }} 2>/dev/null \
+      | awk -v n="{{ spur_node_name | default(ansible_hostname) }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
+      | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  register: spur_verify_node_state
+  changed_when: false
+  failed_when: false
+  when: spur_verify_check_registration | default(false)
+
+- name: "Verify: record this node's summary row"
+  ansible.builtin.set_fact:
+    spur_verify_row:
+      node: "{{ inventory_hostname }}"
+      role: "{{ spur_verify_role_label }}"
+      port: "{{ spur_verify_daemon_port }}"
+      # .get(...) (not dot-attribute access) on purpose: an unreachable/failed
+      # probe registers as a dict with no stdout key, and bare .stdout raises
+      # AttributeError instead of rendering Undefined/default() here.
+      listening: "{{ 'LISTENING=OK' in spur_verify_probe.get('stdout', '') }}"
+      version: >-
+        {{
+          (spur_verify_probe.get('stdout_lines', []) | select('match', '^VERSION=') | first | default('VERSION=?'))
+          | regex_replace('^VERSION=', '')
+        }}
+      binary_current: >-
+        {{
+          ((spur_verify_probe.get('stdout_lines', []) | select('match', '^RUNNING_INODE=') | first | default('=-1')) | regex_replace('^RUNNING_INODE=', ''))
+          ==
+          ((spur_verify_probe.get('stdout_lines', []) | select('match', '^ONDISK_INODE=') | first | default('=-2')) | regex_replace('^ONDISK_INODE=', ''))
+        }}
+      registered_state: "{{ spur_verify_node_state.get('stdout', '') | trim }}"

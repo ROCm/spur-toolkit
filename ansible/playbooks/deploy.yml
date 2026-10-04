@@ -130,10 +130,18 @@
           if (groups['spur_accounting_node'] | default([]) | length > 0)
           else groups['spur_controllers'][0])]) | unique | join(':') }}
   become: true
-  gather_facts: yes
-  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  # The install play above already gathered facts for every controller and
+  # login host it reached; a standalone accounting host was never in its
+  # scope, and a controller/login host that was unreachable there (lenient
+  # variant) may still lack facts too — both covered by the pre_task below.
+  gather_facts: no
   any_errors_fatal: true
   pre_tasks:
+    - name: Gather facts if missing (standalone accounting host, or a host unreachable during install)
+      ansible.builtin.setup:
+        gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+      when: ansible_default_ipv4 is not defined
+
     # Native auth plugin switch (jwt->spur) or a mode flip must not leave a
     # switched leader forwarding to / deciding for an unswitched peer, so on an
     # HA cluster every controller must cross together. deploy.yml already
@@ -167,6 +175,14 @@
     # the CLI (installed above) + the client env pointing at the controllers.
     - role: spur_login
       when: inventory_hostname in groups.get('spur_login', [])
+  post_tasks:
+    - name: Collect controller verification facts
+      ansible.builtin.include_tasks: tasks/collect_verification_facts.yml
+      vars:
+        spur_verify_daemon_name: spurctld
+        spur_verify_daemon_port: "{{ spur_controller_port }}"
+        spur_verify_role_label: controller
+      when: inventory_hostname in groups['spur_controllers']
 
 - name: Start agents
   # Same strict/lenient split as the install play above, and for the same
@@ -226,6 +242,14 @@
       ansible.builtin.include_tasks: tasks/resume_and_undrain_agent.yml
       when: deploy_agent_registered
 
+    - name: Collect agent verification facts
+      ansible.builtin.include_tasks: tasks/collect_verification_facts.yml
+      vars:
+        spur_verify_daemon_name: spurd
+        spur_verify_daemon_port: "{{ spur_agent_port }}"
+        spur_verify_role_label: agent
+        spur_verify_check_registration: true
+
 - name: Start agents (tolerate unreachable agents)
   hosts: "spur_agents{{ '' if (spur_ignore_unreachable_agents | default(false) | bool) else ':!all' }}"
   become: true
@@ -251,3 +275,10 @@
   gather_facts: no
   roles:
     - role: spur_verify
+
+- name: Print verification summary
+  hosts: spur_controllers[0]
+  become: false
+  gather_facts: no
+  tasks:
+    - ansible.builtin.include_tasks: tasks/print_verification_summary.yml

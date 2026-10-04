@@ -1,0 +1,75 @@
+---
+# Renders one VERIFICATION SUMMARY table from every spur_verify_row recorded by
+# collect_verification_facts.yml across the fleet (hostvars persist across
+# plays within this run, same mechanism the gather_facts fix relies on).
+# Expected to run on a single host (e.g. spur_controllers[0]) at the tail of
+# the playbook.
+
+- name: "Verify: collect every node's summary row"
+  vars:
+    # Falls back to the full inventory only if collect_verification_facts.yml
+    # never ran (e.g. this file invoked standalone) — the normal case always
+    # has this set, correctly scoped to whatever --limit narrowed this run to.
+    spur_verify_targeted_hosts_resolved: >-
+      {{
+        hostvars[groups['spur_controllers'][0]].spur_verify_targeted_hosts
+        | default(groups['spur_controllers'] + groups['spur_agents'])
+      }}
+  ansible.builtin.set_fact:
+    spur_summary_expected: "{{ spur_verify_targeted_hosts_resolved }}"
+    spur_summary_rows: >-
+      {{
+        spur_verify_targeted_hosts_resolved
+        | map('extract', hostvars, 'spur_verify_row')
+        | select('defined') | list
+      }}
+
+- name: "Verify: build the table body"
+  ansible.builtin.set_fact:
+    spur_summary_lines: []
+    spur_summary_ok_count: 0
+
+- name: "Verify: append one line per node"
+  ansible.builtin.set_fact:
+    spur_summary_lines: >-
+      {{ spur_summary_lines + [
+           '%-14s %-11s %-14s %-9s %-24s %-s' | format(
+             item.node,
+             item.role,
+             ('OK (' ~ item.port ~ ')' if item.listening else 'FAIL'),
+             ('OK' if item.binary_current else 'STALE'),
+             item.version | default('?'),
+             (item.registered_state if item.registered_state | length > 0 else '-')
+           )
+      ] }}
+    spur_summary_ok_count: "{{ (spur_summary_ok_count | int) + (1 if (item.listening and item.binary_current) else 0) }}"
+  loop: "{{ spur_summary_rows }}"
+  loop_control:
+    label: "{{ item.node }}"
+
+- name: "Verify: print the summary table"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        ['', 'VERIFICATION SUMMARY',
+         '%-14s %-11s %-14s %-9s %-24s %-s' | format('NODE', 'ROLE', 'LISTENING', 'BINARY', 'VERSION', 'REGISTERED')]
+        + spur_summary_lines
+        + ['']
+        + [spur_summary_ok_count ~ '/' ~ (spur_summary_expected | length) ~ ' nodes verified'
+           ~ ((' (' ~ (spur_summary_expected | length - spur_summary_rows | length) ~ ' did not report)')
+              if (spur_summary_rows | length < spur_summary_expected | length) else '')]
+      }}
+
+# Opt-in (default off, same pattern as spur_verify_enabled) — a broken-but-
+# reachable daemon makes no `failed`/`unreachable` noise of its own (the probe
+# shell always exits 0 by design), so this is the only way to turn "verified
+# fewer nodes than targeted" into something a caller's exit-code check sees.
+- name: "Verify: fail the run if strict mode is on and not every targeted node verified"
+  ansible.builtin.fail:
+    msg: >-
+      Only {{ spur_summary_ok_count }}/{{ spur_summary_expected | length }} nodes verified
+      (spur_verify_strict=true). See the VERIFICATION SUMMARY table above for which node(s)
+      failed and why.
+  when:
+    - spur_verify_strict | default(false) | bool
+    - (spur_summary_ok_count | int) < (spur_summary_expected | length)
