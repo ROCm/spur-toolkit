@@ -94,20 +94,81 @@
 #
 # spurstepd rides the same copy as spurd so the two always come from one build:
 # a supervisor written by one build is not adopted by another, so the pair must
-# never be rolled independently. copy compares checksums, so an unchanged
-# re-run stays a no-op and a changed binary actually rolls.
-- name: Copy pre-built Spur binaries from control node
-  ansible.builtin.copy:
-    src: "{{ spur_binary_src }}/{{ item }}"
-    dest: "{{ spur_install_dir }}/{{ item }}"
-    mode: "0755"
-  loop: >-
-    {{ ['spur']
-       + (['spurctld'] if spur_needs_ctld else [])
-       + (['spurd'] if spur_needs_agent_bin else [])
-       + (['spurstepd'] if (spur_stepd_src.stat.exists | default(false)) else [])
-       + (['spurauthd'] if (spur_authd_src.stat.exists | default(false)) else []) }}
+# never be rolled independently.
+- name: Resolve which binaries this host needs copied
+  ansible.builtin.set_fact:
+    spur_bin_list: >-
+      {{ ['spur']
+         + (['spurctld'] if spur_needs_ctld else [])
+         + (['spurd'] if spur_needs_agent_bin else [])
+         + (['spurstepd'] if (spur_stepd_src.stat.exists | default(false)) else [])
+         + (['spurauthd'] if (spur_authd_src.stat.exists | default(false)) else []) }}
   when: spur_binary_src | default('') | length > 0
+
+# One tarball transfer instead of one `copy` call per binary (up to 5). The
+# tarball is named by a hash of its contents (computed locally, zero network
+# cost) so `copy`'s own checksum comparison below still skips the transfer
+# entirely on an unchanged re-run — same idempotency as before, fewer round
+# trips either way.
+- name: Build a local tarball of the binaries to copy (control node only)
+  # Multiple hosts needing the identical binary set run this concurrently
+  # (serial: 0 agent plays) and reuse the same tarball once one of them builds
+  # it — write-to-temp-then-rename keeps that reuse race-free, since a reader
+  # never sees a partially-written file.
+  ansible.builtin.shell: |
+    set -e -o pipefail
+    cache_dir="${HOME}/.cache/spur-ansible-bins"
+    mkdir -p "$cache_dir" && chmod 0700 "$cache_dir"
+    cd "{{ spur_binary_src }}"
+    hash=$(sha256sum {{ spur_bin_list | join(' ') }} | sha256sum | cut -d' ' -f1)
+    tarball="$cache_dir/spur-bins-${hash}.tar.gz"
+    if [ ! -f "$tarball" ]; then
+      tmp="${tarball}.tmp.$$"
+      # Fixed mtime + gzip -n: byte-identical output for byte-identical
+      # inputs, so a lost local cache rebuilds to the same checksum instead
+      # of forcing a spurious re-copy.
+      tar --mtime=@0 -cf - {{ spur_bin_list | join(' ') }} | gzip -n > "$tmp"
+      mv -f "$tmp" "$tarball"
+    fi
+    echo "HASH=$hash"
+    echo "TARBALL=$tarball"
+  args:
+    executable: /bin/bash
+  delegate_to: localhost
+  become: false
+  register: spur_bin_tar
+  changed_when: false
+  when: spur_binary_src | default('') | length > 0
+
+# Kept remotely (named by content hash, not deleted after extraction) so this
+# copy's own checksum comparison is the idempotency check on every future
+# run — deleting it here would mean every subsequent deploy re-transfers and
+# re-extracts unconditionally, even with unchanged binaries.
+- name: Copy the binaries tarball to the remote host
+  vars:
+    spur_bin_hash: "{{ spur_bin_tar.stdout_lines | select('match', '^HASH=') | first | regex_replace('^HASH=', '') }}"
+    spur_bin_tarball_local: "{{ spur_bin_tar.stdout_lines | select('match', '^TARBALL=') | first | regex_replace('^TARBALL=', '') }}"
+  ansible.builtin.copy:
+    src: "{{ spur_bin_tarball_local }}"
+    dest: "{{ spur_install_dir }}/.bins-{{ spur_bin_hash }}.tar.gz"
+    mode: "0644"
+  register: spur_bin_copy
+  when: spur_binary_src | default('') | length > 0
+
+- name: Extract the binaries (only when the tarball actually changed)
+  ansible.builtin.shell: |
+    set -e
+    tar --no-same-owner -xzf "{{ spur_bin_copy.dest }}" -C "{{ spur_install_dir }}"
+    chmod 0755 {{ spur_bin_list | map('regex_replace', '^', spur_install_dir ~ '/') | join(' ') }}
+    find "{{ spur_install_dir }}" -maxdepth 1 -name '.bins-*.tar.gz' ! -name '.bins-{{ spur_bin_hash }}.tar.gz' -delete
+  args:
+    executable: /bin/bash
+  vars:
+    spur_bin_hash: "{{ spur_bin_tar.stdout_lines | select('match', '^HASH=') | first | regex_replace('^HASH=', '') }}"
+  changed_when: true
+  when:
+    - spur_binary_src | default('') | length > 0
+    - spur_bin_copy.changed
 
 - name: Install Spur via upstream installer
   ansible.builtin.shell: |

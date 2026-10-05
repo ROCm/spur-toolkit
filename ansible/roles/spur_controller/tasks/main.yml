@@ -135,25 +135,27 @@
 # needed anymore) works on controllers without per-command flags. Controller-nodes
 # only. Lists every controller (comma-separated) so the CLI's built-in endpoint
 # rotation keeps working from this host even if this particular controller is down.
-- name: Set SPUR_CONTROLLER_ADDR in /etc/environment (controllers)
+# One shell instead of two lineinfile calls against the same file. Accounting
+# no longer has its own address/port (rides on SPUR_CONTROLLER_ADDR), so any
+# leftover SPUR_ACCOUNTING_ADDR from a pre-merge deployment is stripped too.
+- name: Set SPUR_CONTROLLER_ADDR and clear stale SPUR_ACCOUNTING_ADDR in /etc/environment
   vars:
     all_controller_endpoints: >-
       {{ groups['spur_controllers']
          | map('extract', hostvars, 'spur_controller_listen_ip')
          | map('regex_replace', '^(.*)$', 'http://\1:' ~ spur_controller_port)
          | join(',') }}
-  ansible.builtin.lineinfile:
-    path: /etc/environment
-    regexp: '^SPUR_CONTROLLER_ADDR='
-    line: "SPUR_CONTROLLER_ADDR={{ all_controller_endpoints }}"
-
-# Accounting no longer has its own address/port — it rides on SPUR_CONTROLLER_ADDR.
-# Strip any leftover SPUR_ACCOUNTING_ADDR from a pre-merge deployment of this host.
-- name: Remove stale SPUR_ACCOUNTING_ADDR from /etc/environment
-  ansible.builtin.lineinfile:
-    path: /etc/environment
-    regexp: '^SPUR_ACCOUNTING_ADDR='
-    state: absent
+  ansible.builtin.shell: |
+    set -e
+    if grep -q '^SPUR_CONTROLLER_ADDR=' /etc/environment 2>/dev/null; then
+      sed -Ei 's#^SPUR_CONTROLLER_ADDR=.*#SPUR_CONTROLLER_ADDR={{ all_controller_endpoints }}#' /etc/environment
+    else
+      echo 'SPUR_CONTROLLER_ADDR={{ all_controller_endpoints }}' >> /etc/environment
+    fi
+    sed -Ei '/^SPUR_ACCOUNTING_ADDR=/d' /etc/environment
+  args:
+    executable: /bin/bash
+  changed_when: true
 
 # Same write-if-missing opt-in as the spur_agent role's spur.conf render —
 # force: no leaves an existing file alone unless spur_overwrite_conf=true.
@@ -238,18 +240,23 @@
 # at runtime, so no restart is needed to see it. When not restarted, still ensure
 # spurctld is enabled + running (first-ever run needs it started; already-running
 # is left untouched).
-- name: Enable and (re)start spurctld
-  ansible.builtin.systemd:
-    name: spurctld
-    daemon_reload: true
-    enabled: true
-    state: "{{ 'started' if (spur_controller_skip_restart | default(false) | bool) else 'restarted' }}"
-
-- name: Wait for spurctld to listen on {{ spur_controller_port }}
-  ansible.builtin.wait_for:
-    port: "{{ spur_controller_port }}"
-    host: "127.0.0.1"
-    timeout: "{{ spur_controller_start_timeout_secs | default(120) }}"
+# Merged restart + wait-for-listen into one shell, same pattern spur_agent's
+# equivalent task already uses — cuts a round-trip per controller.
+- name: Enable and (re)start spurctld, then wait for it to listen on {{ spur_controller_port }}
+  ansible.builtin.shell: |
+    set -e
+    systemctl daemon-reload
+    systemctl enable spurctld
+    systemctl {{ 'start' if (spur_controller_skip_restart | default(false) | bool) else 'restart' }} spurctld
+    for i in $(seq 1 {{ spur_controller_start_timeout_secs | default(120) }}); do
+      (exec 3<>/dev/tcp/127.0.0.1/{{ spur_controller_port }}) 2>/dev/null && exit 0
+      sleep 1
+    done
+    echo "spurctld never started listening on 127.0.0.1:{{ spur_controller_port }}"
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: true
 
 - name: Wait for Raft leader to be elected (HA mode needs all peers up before quorum)
   # `spur nodes` returns the error `no leader elected yet` until election succeeds.

@@ -63,17 +63,12 @@
   roles:
     - role: spur_install
 
+# Gated on the play's hosts: pattern (zero-match skips the whole play with no
+# per-task cost), not a role-level when: — see commit message for the measured
+# regression a role-level when: caused here.
 - name: Configure WireGuard mesh (when spur_transport == wireguard)
   # Login nodes join the mesh too, so interactive `srun` can stream job output
   # directly from agents over the tunnel.
-  # Gate at the PLAY level via hosts: — when transport isn't wireguard the pattern
-  # matches no hosts (:!all removes everything) and the whole play is skipped as a
-  # single "no hosts matched" line. A role-level `when:` instead attaches to every
-  # task in the role and prints a "skipping" line per-task per-host (21 tasks x
-  # every node), which is slow and noisy on a large direct-transport cluster.
-  # Split strict/lenient by `hosts:` for the same ansible-core reason as the
-  # install plays above — a templated any_errors_fatal won't combine
-  # reliably with ignore_unreachable.
   hosts: "spur_controllers:spur_agents:spur_login{{ '' if ((spur_transport | default('direct')) == 'wireguard' and not (spur_ignore_unreachable_agents | default(false) | bool)) else ':!all' }}"
   become: true
   gather_facts: no
@@ -91,14 +86,7 @@
     - role: spur_wireguard
 
 - name: Provision native authentication (keys + spurauthd) on every host
-  # Distributes JWKS keys per role, installs+starts the spurauthd mint, and drops
-  # the CLI-facing /etc/spur/spur.conf — all BEFORE any daemon (re)starts on
-  # plugin="spur" in the plays below. Same host union as the install plays.
-  # Gated on spur_auth_enabled: off (default) -> the pattern matches no hosts and
-  # the whole play is skipped. Runs after the WireGuard play so key distribution
-  # (control node -> hosts over ordinary SSH) is unaffected by the mesh.
-  # Split strict/lenient by `hosts:` for the same ansible-core reason as the
-  # install plays above.
+  # Runs after WireGuard so key distribution isn't affected by the mesh coming up.
   hosts: "spur_controllers:spur_agents:spur_login{{ '' if ((spur_auth_enabled | default(false) | bool) and not (spur_ignore_unreachable_agents | default(false) | bool)) else ':!all' }}"
   become: true
   gather_facts: no
