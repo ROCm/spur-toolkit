@@ -3066,23 +3066,32 @@ jobs:
           done
           echo "PASS: phase=ready, gpu-1/gpu-2/gpu-3 all active"
 
-      - name: Wait for calico-node Running on both k0s-registered nodes, then assert the VXLAN fallback (no bird/BGP)
+      - name: Wait for kube-system to settle (incl. konnectivity-agent — kubectl exec needs its tunnel), then assert the VXLAN fallback (no bird/BGP)
         run: |
           set -euo pipefail
-          # gpu-1 is k0s control-plane-only here (no implicit worker role, k0s's
-          # own default) so it never appears as a kubectl Node or runs the
-          # calico-node DaemonSet — only gpu-2/gpu-3 do. Confirmed live.
+          # gpu-1 is k0s control-plane-only here (no implicit worker role, k0s's own
+          # default) so it never appears as a kubectl Node or runs node-level
+          # DaemonSets — only gpu-2/gpu-3 do. Confirmed live.
+          #
+          # Wait for every non-coredns kube-system pod, not just calico-node: the
+          # apiserver proxies `kubectl exec`/logs to a worker's kubelet through the
+          # konnectivity-agent tunnel, not directly, so calico-node alone reaching
+          # Running isn't sufficient — confirmed live (a prior pass here hit `error:
+          # unable to upgrade connection: error dialing backend: No agent available`
+          # because konnectivity-agent was still ContainerCreating when the
+          # calico-node check alone had already gone green). CoreDNS is excluded: it
+          # CrashLoopBackOffs by design here (see the job header) and is never used.
           ready=0; total=0
-          for i in $(seq 1 40); do
-            out=$(docker exec gpu-1 k0s kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null || true)
+          for i in $(seq 1 60); do
+            out=$(docker exec gpu-1 k0s kubectl get pods -n kube-system --no-headers 2>/dev/null | grep -v '^coredns-' || true)
             total=$(echo "$out" | grep -c . || true)
             ready=$(echo "$out" | awk '{split($2,a,"/"); if(a[1]==a[2]) c++} END{print c+0}')
-            [ "$total" -eq 2 ] && [ "$ready" -eq 2 ] && break
+            [ "$total" -ge 6 ] && [ "$ready" -eq "$total" ] && break
             sleep 5
           done
-          [ "$total" -eq 2 ] && [ "$ready" -eq 2 ] \
-            || { echo "::error::calico-node pods never both reached Running (total=$total ready=$ready)"; docker exec gpu-1 k0s kubectl get pods -n kube-system -o wide; exit 1; }
-          echo "PASS: calico-node Running on both gpu-2 and gpu-3"
+          [ "$total" -ge 6 ] && [ "$ready" -eq "$total" ] \
+            || { echo "::error::kube-system pods never all reached Running (total=$total ready=$ready)"; docker exec gpu-1 k0s kubectl get pods -n kube-system -o wide; exit 1; }
+          echo "PASS: every non-coredns kube-system pod Running ($ready/$total), including konnectivity-agent"
 
           docker exec gpu-1 k0s kubectl get ippool default-ipv4-ippool -o yaml | grep -q 'vxlanMode: Always' \
             || { echo "::error::IPPool is not vxlanMode=Always — direct transport should fall back to Calico's own VXLAN overlay"; exit 1; }
