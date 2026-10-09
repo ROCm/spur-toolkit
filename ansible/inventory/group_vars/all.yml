@@ -50,9 +50,11 @@ spur_wg_persist: true
 spur_k8s_enabled: false
 spur_k8s_pod_cidr: 10.42.0.0/16
 spur_k8s_service_cidr: 10.43.0.0/16
-# CNI: "calico" runs bird native-routing so pods ride the WireGuard mesh (required
-# when spur_transport=wireguard and you want pod traffic on the mesh). "kuberouter"
-# is the k0s default (no custom config). Calico advertises the API on the mesh IP.
+# CNI: "calico" works under either transport. With spur_transport=wireguard it runs
+# bird native-routing so pods ride the WireGuard mesh and the API advertises on the
+# mesh IP. With spur_transport=direct (no mesh present) it falls back to Calico's
+# own VXLAN overlay over the plain host network — still real pod-to-pod routing,
+# just not mesh-encrypted. "kuberouter" is the k0s default (no custom config).
 spur_k8s_cni: calico
 spur_k8s_cni_mtu: 1450
 # k0s control plane: CSV of control-plane node names (as registered with spurctld). One name = a
