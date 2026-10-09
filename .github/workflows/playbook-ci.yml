@@ -2958,6 +2958,13 @@ jobs:
             test -n "$bindir" || { echo "spurctld not found in $tarball"; exit 1; }
             mkdir -p "$GITHUB_WORKSPACE/spur-bin"
             for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"; done
+            # spurd in this release spawns spurstepd unconditionally to launch any job
+            # (including the plain scheduler smoke-test deploy.yml's own verify step
+            # runs before k8s ever enters the picture) — without it every job launch
+            # fails "failed to exec spurstepd". Copy it whenever the release ships it.
+            if [ -f "$bindir/spurstepd" ]; then
+              cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/spur-bin/spurstepd"
+            fi
             chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
           )
 
