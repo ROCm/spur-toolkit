@@ -5,7 +5,10 @@
 #   - spurctld/spurd are running and every target node is registered.
 #   - spur.conf carries the [cluster] section — set spur_k8s_enabled=true in
 #     group_vars (or -e) BEFORE deploy.yml so the controllers were rendered with it.
-#   - For pod traffic on the mesh: spur_transport=wireguard and spur_k8s_cni=calico.
+#   - spur_k8s_cni=calico works under either transport: with spur_transport=wireguard
+#     it rides the mesh via BGP-native routing (bird); with spur_transport=direct it
+#     falls back to Calico's own VXLAN overlay over the plain host network — no mesh
+#     required, confirmed in integration-k8s-direct (playbook-ci.yml).
 #
 # This calls `spur k8s up` on the first controller (the controller assigns roles,
 # mesh IPs, and per-node pod CIDRs, installs k0s on each scoped node, and reconciles

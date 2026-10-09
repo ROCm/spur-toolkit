@@ -301,6 +301,8 @@ ansible-playbook playbooks/k8s_up.yml -i inventory/hosts.k8sha.ini -e @inventory
 
 > `spur_k8s_enabled` must be `true` at `deploy.yml` time so `spur.conf` gets the `[cluster]` section — `k8s_up.yml` asserts this and fails fast otherwise. The 9 `gpu-*` compute agents and `login-0` are in the mesh and the SPUR scheduler but deliberately excluded from `spur_k8s_nodes`, so they never run k0s.
 
+`spur_k8s_cni: calico` is not mesh-only. Under `spur_transport=direct` (no WireGuard), Calico falls back to its own VXLAN overlay over the plain host network instead of BGP-native (`bird`) routing — pod-to-pod traffic across nodes still works, it's just not mesh-encrypted. Covered by `integration-k8s-direct` in `playbook-ci.yml`.
+
 ---
 
 ## Login (submission) nodes

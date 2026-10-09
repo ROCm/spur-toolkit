@@ -2880,3 +2880,302 @@ jobs:
         run: |
           for n in $NODES gpu-2; do docker rm -f "$n" || true; done
           docker network rm spur-ci-auth || true
+
+  # ---------------------------------------------------------------------------
+  # SPUR-managed k0s over spur_transport=direct + calico (VXLAN fallback)
+  # ---------------------------------------------------------------------------
+  # Live-validated on real hardware (4-node lab) but had zero CI coverage before
+  # this job: both k8s_up.yml and group_vars/all.yml implied Calico needs
+  # spur_transport=wireguard for pod traffic to work ("calico runs bird
+  # native-routing so pods ride the mesh"). That's true for the BGP-native path,
+  # but Calico has a second, mesh-independent path: with no WireGuard mesh
+  # present, spur-core's k0s controller-config renderer (mesh_native=false)
+  # writes `calico.mode: vxlan` instead of `bird`, and Calico's own VXLAN
+  # overlay rides the plain host network. Confirmed on the lab (and reproduced
+  # here) via `ps aux` inside calico-node — felix only, no bird/bird6, i.e. no
+  # BGP session ever forms — plus a cross-node busybox ping over the
+  # `vxlan.calico` interface.
+  #
+  # Asserts the chain this job exists to prove: deploy.yml with
+  # spur_transport=direct (ci.ini's default, unchanged) + spur_k8s_enabled=true
+  # + spur_k8s_cni=calico -> k8s_up.yml reaches phase=ready with every node
+  # active -> the rendered IPPool is vxlanMode=Always/ipipMode=Never -> no bird
+  # process in calico-node -> and, the assertion that actually matters here, two
+  # busybox pods pinned to DIFFERENT physical nodes (gpu-2/gpu-3) can ping each
+  # other — real cross-node pod traffic over the VXLAN fallback, not just "pods
+  # are Running". Then `spur k8s down --reset` via teardown.yml, same as a
+  # plain cluster's teardown.
+  #
+  # k0s-in-Docker constraint hit + workaround: containerd's overlayfs
+  # snapshotter cannot stack a second overlay mount on top of the container's
+  # own overlay2 rootfs (mount fails EINVAL — the classic "overlay-on-overlay"
+  # kernel limitation; the nested upperdir/lowerdir/workdir would all live on
+  # the already-overlay2 container root). Every pod sandbox failed with "failed
+  # to mount rootfs component ... err: invalid argument" until k0s's data dir
+  # (/var/lib/k0s, where its embedded containerd keeps snapshots) was given its
+  # own tmpfs mount — tmpfs is not itself an overlay filesystem, so nesting
+  # overlayfs on top of it works. Nothing else needed: the vxlan kernel module
+  # is already loaded on ubuntu-latest runners, and Felix programs its own
+  # iptables/sysctls (ip_forward, UDP 4789) with no host prep, exactly as
+  # observed on the lab.
+  #
+  # CoreDNS CrashLoopBackOffs in this job are expected and not asserted on: the
+  # container's own /etc/resolv.conf points at a loopback stub resolver, so
+  # CoreDNS's loop-detection plugin fatals rather than risk a forwarding loop.
+  # Irrelevant to Calico/VXLAN — cross-node pod reachability here is checked by
+  # pod IP, not cluster DNS.
+  # ---------------------------------------------------------------------------
+  integration-k8s-direct:
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      NODES: "ctl-0 gpu-1 gpu-2 gpu-3"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download + verify Spur binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_TAG: ""
+        run: |
+          set -euo pipefail
+          mkdir -p dl-spur-bin
+          ( cd dl-spur-bin
+            deploy_tag="${DEPLOY_TAG:-}"
+            if [ -z "$deploy_tag" ]; then
+              deploy_tag=$(gh api repos/ROCm/spur/releases --jq \
+                'map(select(.tag_name != "nightly"))[0].tag_name')
+            fi
+            echo "Deploy version: $deploy_tag -> spur-bin"
+            gh release download "$deploy_tag" --repo ROCm/spur \
+              --pattern '*-linux-amd64.tar.gz' \
+              --pattern '*-linux-amd64.tar.gz.sha256'
+            tarball=$(ls *-linux-amd64.tar.gz)
+            hash=$(awk '{print $1}' "${tarball}.sha256")
+            echo "${hash}  ${tarball}" | sha256sum -c -
+            tar xzf "$tarball"
+            bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
+            test -n "$bindir" || { echo "spurctld not found in $tarball"; exit 1; }
+            mkdir -p "$GITHUB_WORKSPACE/spur-bin"
+            for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/spur-bin/$b"; done
+            chmod +x "$GITHUB_WORKSPACE/spur-bin"/*
+          )
+
+      - name: Start systemd containers on a docker network (k0s's data dir on its own tmpfs — see header)
+        env:
+          IMG: jrei/systemd-ubuntu:24.04
+        run: |
+          set -euo pipefail
+          docker network create spur-ci
+          docker pull "$IMG"
+          for n in $NODES; do
+            docker run -d --name "$n" --hostname "$n" \
+              --network spur-ci \
+              --privileged \
+              --cgroupns=host \
+              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+              --tmpfs /var/lib/k0s:exec,size=4g \
+              "$IMG"
+          done
+
+      - name: Wait for systemd to be ready in every container
+        run: |
+          set -uo pipefail
+          for n in $NODES; do
+            ok=""
+            for i in $(seq 1 30); do
+              st=$(docker exec "$n" systemctl is-system-running 2>/dev/null || true)
+              case "$st" in running|degraded) ok=1; break ;; esac
+              sleep 2
+            done
+            [ -n "$ok" ] || { echo "::error::systemd never became ready in $n (last: ${st:-none})"; exit 1; }
+            echo "$n: systemd ready ($st)"
+          done
+
+      - name: Install in-container preflight deps (curl/tar/iproute2/python3/sudo) + a non-root submit user
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
+            docker exec "$n" useradd -m -s /bin/bash ciuser
+          done
+
+      - name: Install ansible + docker connection plugin
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ansible-core
+          ansible-galaxy collection install community.docker
+
+      - name: deploy.yml — direct transport (ci.ini default, unchanged) + calico k0s
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/deploy.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_k8s_enabled=true \
+            -e spur_k8s_cni=calico \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
+
+      - name: Assert all three agents registered
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            missing=""
+            for a in gpu-1 gpu-2 gpu-3; do
+              docker exec ctl-0 /usr/local/bin/spur show node "$a" 2>/dev/null \
+                | grep -qx "NodeName=$a" || missing="$missing $a"
+            done
+            [ -z "$missing" ] && { echo "all three agents registered"; break; }
+            sleep 2
+          done
+          [ -z "$missing" ] || { echo "::error::agents still missing:$missing"; exit 1; }
+
+      - name: k8s_up.yml — single control plane (gpu-1), workers gpu-2/gpu-3
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/k8s_up.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_k8s_enabled=true \
+            -e spur_k8s_control_plane_nodes=gpu-1 \
+            -e spur_k8s_nodes=gpu-1,gpu-2,gpu-3
+
+      - name: Assert phase=ready and every node active (CI-level check, not just the playbook's own retry)
+        run: |
+          set -euo pipefail
+          out=$(docker exec ctl-0 /usr/local/bin/spur k8s status)
+          echo "$out"
+          echo "$out" | grep -qx 'phase: ready' \
+            || { echo "::error::phase is not ready"; exit 1; }
+          for n in gpu-1 gpu-2 gpu-3; do
+            echo "$out" | grep -qE "^  ${n}\s+\S+\s+active\s+enabled=true" \
+              || { echo "::error::$n is not active"; exit 1; }
+          done
+          echo "PASS: phase=ready, gpu-1/gpu-2/gpu-3 all active"
+
+      - name: Wait for calico-node Running on both k0s-registered nodes, then assert the VXLAN fallback (no bird/BGP)
+        run: |
+          set -euo pipefail
+          # gpu-1 is k0s control-plane-only here (no implicit worker role, k0s's
+          # own default) so it never appears as a kubectl Node or runs the
+          # calico-node DaemonSet — only gpu-2/gpu-3 do. Confirmed live.
+          ready=0; total=0
+          for i in $(seq 1 40); do
+            out=$(docker exec gpu-1 k0s kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null || true)
+            total=$(echo "$out" | grep -c . || true)
+            ready=$(echo "$out" | awk '{split($2,a,"/"); if(a[1]==a[2]) c++} END{print c+0}')
+            [ "$total" -eq 2 ] && [ "$ready" -eq 2 ] && break
+            sleep 5
+          done
+          [ "$total" -eq 2 ] && [ "$ready" -eq 2 ] \
+            || { echo "::error::calico-node pods never both reached Running (total=$total ready=$ready)"; docker exec gpu-1 k0s kubectl get pods -n kube-system -o wide; exit 1; }
+          echo "PASS: calico-node Running on both gpu-2 and gpu-3"
+
+          docker exec gpu-1 k0s kubectl get ippool default-ipv4-ippool -o yaml | grep -q 'vxlanMode: Always' \
+            || { echo "::error::IPPool is not vxlanMode=Always — direct transport should fall back to Calico's own VXLAN overlay"; exit 1; }
+          docker exec gpu-1 k0s kubectl get ippool default-ipv4-ippool -o yaml | grep -q 'ipipMode: Never' \
+            || { echo "::error::IPPool is not ipipMode=Never"; exit 1; }
+          echo "PASS: IPPool is vxlanMode=Always/ipipMode=Never (Calico's own overlay, no mesh needed)"
+
+          pod=$(docker exec gpu-1 k0s kubectl get pods -n kube-system -l k8s-app=calico-node -o jsonpath='{.items[0].metadata.name}')
+          procs=$(docker exec gpu-1 k0s kubectl exec -n kube-system "$pod" -c calico-node -- ps aux)
+          echo "$procs"
+          echo "$procs" | grep -qE 'bird6?( |$)' \
+            && { echo "::error::a bird/bird6 process is running — direct transport should never form a BGP session"; exit 1; }
+          echo "$procs" | grep -q 'calico-node -felix' \
+            || { echo "::error::no felix process in calico-node — it should be programming the VXLAN routes directly"; exit 1; }
+          echo "PASS: felix only, no bird/bird6 — no BGP mesh, as expected without spur_transport=wireguard"
+
+      - name: Schedule two busybox pods on DIFFERENT physical nodes (gpu-2, gpu-3)
+        run: |
+          set -euo pipefail
+          cat <<'PODSPEC' | docker exec -i gpu-1 tee /root/ci-busybox-pods.yaml >/dev/null
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ci-busybox-a
+          spec:
+            nodeName: gpu-2
+            containers:
+            - name: busybox
+              image: busybox:1.36
+              command: ["sleep", "3600"]
+            restartPolicy: Never
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ci-busybox-b
+          spec:
+            nodeName: gpu-3
+            containers:
+            - name: busybox
+              image: busybox:1.36
+              command: ["sleep", "3600"]
+            restartPolicy: Never
+          PODSPEC
+          docker exec gpu-1 k0s kubectl apply -f /root/ci-busybox-pods.yaml
+          a=""; b=""
+          for i in $(seq 1 30); do
+            a=$(docker exec gpu-1 k0s kubectl get pod ci-busybox-a -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            b=$(docker exec gpu-1 k0s kubectl get pod ci-busybox-b -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            [ "$a" = Running ] && [ "$b" = Running ] && break
+            sleep 3
+          done
+          [ "$a" = Running ] && [ "$b" = Running ] \
+            || { echo "::error::busybox pods never both reached Running (a=$a b=$b)"; docker exec gpu-1 k0s kubectl get pods -o wide; exit 1; }
+          docker exec gpu-1 k0s kubectl get pods -o wide
+
+      - name: Assert cross-node pod-to-pod connectivity over the VXLAN fallback (the whole point of this job)
+        run: |
+          set -euo pipefail
+          node_a=$(docker exec gpu-1 k0s kubectl get pod ci-busybox-a -o jsonpath='{.spec.nodeName}')
+          node_b=$(docker exec gpu-1 k0s kubectl get pod ci-busybox-b -o jsonpath='{.spec.nodeName}')
+          [ "$node_a" != "$node_b" ] \
+            || { echo "::error::both busybox pods landed on the same node ($node_a) — this would prove nothing about cross-node traffic"; exit 1; }
+          pod_b_ip=$(docker exec gpu-1 k0s kubectl get pod ci-busybox-b -o jsonpath='{.status.podIP}')
+          echo "ci-busybox-a ($node_a) -> ci-busybox-b ($node_b, $pod_b_ip)"
+          docker exec gpu-1 k0s kubectl exec ci-busybox-a -- ping -c3 -W3 "$pod_b_ip" \
+            || { echo "::error::cross-node pod ping FAILED — the VXLAN fallback is not routing pod traffic"; exit 1; }
+          echo "PASS: cross-node pod ping succeeded over the vxlan.calico overlay (0% loss)"
+
+      - name: spur k8s down --reset via teardown.yml (same as a plain cluster's teardown)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/teardown.yml \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_k8s_enabled=true
+
+      - name: Assert no k0s process survives on any former k8s node (OS-level, not just the scheduler's view)
+        run: |
+          set -euo pipefail
+          for n in gpu-1 gpu-2 gpu-3; do
+            docker exec "$n" bash -c 'pgrep -f k0s' \
+              && { echo "::error::$n still has a k0s process running after teardown"; exit 1; }
+          done
+          echo "PASS: no k0s process survives on gpu-1/gpu-2/gpu-3 after teardown"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          for n in $NODES; do
+            echo "===== $n journal (spur*) ====="
+            docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -50' || true
+          done
+          docker exec gpu-1 k0s kubectl get pods -A -o wide 2>/dev/null || true
+          docker exec gpu-1 k0s kubectl get nodes -o wide 2>/dev/null || true
+
+      - name: Teardown containers
+        if: always()
+        run: |
+          for n in $NODES; do docker rm -f "$n" || true; done
+          docker network rm spur-ci || true
