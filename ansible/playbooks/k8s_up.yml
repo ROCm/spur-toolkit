@@ -58,8 +58,12 @@
       changed_when: "'up requested' in k8s_up_out.stdout"
       # `spur k8s up` prints the rejection reason to stderr ("... NOT accepted: ...") but still
       # exits 0, so without this a rejected request falls through to the readiness poll and times
-      # out with a generic error instead of surfacing why. Fail here with the real reason.
-      failed_when: "'NOT accepted' in (k8s_up_out.stderr | default(''))"
+      # out with a generic error instead of surfacing why. Fail here with the real reason. Also
+      # catch rc != 0 (connection refused, binary missing, auth error, timeout, ...) — any failure
+      # that ISN'T the "NOT accepted" case still needs to fail the task instead of silently
+      # reporting "ok" (SPUR-347).
+      failed_when: >-
+        k8s_up_out.rc != 0 or 'NOT accepted' in (k8s_up_out.stderr | default(''))
 
     - name: Show the up response
       ansible.builtin.debug:
@@ -81,7 +85,13 @@
       retries: "{{ k8s_ready_retries }}"
       delay: "{{ k8s_ready_delay }}"
       changed_when: false
-      failed_when: k8s_phase.stdout | trim == 'degraded'
+      # Fail on the explicit 'degraded' terminal state (fast, clear reason) AND when the retry
+      # budget was exhausted without ever reaching a terminal phase at all (e.g. spurctld
+      # unreachable/timeout/empty stdout on every attempt) — the latter used to report "ok"
+      # because this failed_when only ever checked for 'degraded' (SPUR-347).
+      failed_when: >-
+        k8s_phase.stdout | trim == 'degraded'
+        or k8s_phase.stdout | trim not in ['ready', 'degraded']
 
     - name: Final cluster status
       ansible.builtin.command: "{{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }}"
