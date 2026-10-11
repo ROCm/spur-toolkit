@@ -1,5 +1,21 @@
 cluster_name = "{{ spur_cluster_name }}"
 
+{% set _hooks = {
+  'prolog':       spur_hook_prolog       | default('') | trim,
+  'epilog':       spur_hook_epilog       | default('') | trim,
+  'task_prolog':  spur_hook_task_prolog  | default('') | trim,
+  'task_epilog':  spur_hook_task_epilog  | default('') | trim,
+  'srun_prolog':  spur_hook_srun_prolog  | default('') | trim,
+  'srun_epilog':  spur_hook_srun_epilog  | default('') | trim,
+} -%}
+{% if _hooks.values() | select | list | length > 0 %}
+
+[hooks]
+{% for key, val in _hooks.items() if val -%}
+{{ key }} = "{{ val }}"
+{% endfor -%}
+{% endif %}
+
 {% if spur_k8s_enabled | default(false) | bool %}
 {% set _k8s_cp_list = spur_k8s_control_plane_nodes | default('') | split(',') | map('trim') | select | list %}
 [cluster]

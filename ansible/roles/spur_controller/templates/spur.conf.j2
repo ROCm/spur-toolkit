@@ -16,6 +16,20 @@ peers = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['spur_controll
 plugin = "backfill"
 interval_secs = 1
 
+{% set _hooks = {
+  'prolog_slurmctld':  spur_hook_prolog_slurmctld  | default('') | trim,
+  'epilog_slurmctld':  spur_hook_epilog_slurmctld  | default('') | trim,
+  'job_submit':        spur_hook_job_submit         | default('') | trim,
+  'job_submit_lua':    spur_hook_job_submit_lua     | default('') | trim,
+} -%}
+{% if _hooks.values() | select | list | length > 0 %}
+
+[hooks]
+{% for key, val in _hooks.items() if val -%}
+{{ key }} = "{{ val }}"
+{% endfor -%}
+{% endif %}
+
 {% if spur_auth_enabled | default(false) | bool %}
 # Native authentication + RBAC. Read at startup only — a change here needs a
 # controller restart (scontrol reconfigure will not apply it). Because this
