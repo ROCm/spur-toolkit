@@ -2060,6 +2060,32 @@ jobs:
             sleep 2
           done
           [ -n "$leader" ] || { echo "::error::no Raft leader answered on any controller"; exit 1; }
+          echo "detected Raft leader: $leader"
+
+          # If the leader is already the LAST controller in inventory order,
+          # leader-last and inventory order coincide and the ordering assertion
+          # proves nothing. Force an election off it so the two orders differ and
+          # the assertion has to actually exercise the detection logic.
+          last_in_inventory=ctl-2
+          for attempt in 1 2 3; do
+            [ "$leader" != "$last_in_inventory" ] && break
+            echo "leader is $last_in_inventory (inventory-last) — restarting it to move leadership (attempt $attempt)"
+            docker exec "$leader" systemctl restart spurctld
+            sleep 10
+            leader=""
+            for i in $(seq 1 30); do
+              for c in ctl-0 ctl-1 ctl-2; do
+                code=$(docker exec "$c" curl -s -o /dev/null -w '%{http_code}' \
+                         http://127.0.0.1:6822/metrics/nodes 2>/dev/null || echo 000)
+                [ "$code" = "200" ] && { leader="$c"; break 2; }
+              done
+              sleep 2
+            done
+            [ -n "$leader" ] || { echo "::error::no leader after forcing an election"; exit 1; }
+          done
+          if [ "$leader" = "$last_in_inventory" ]; then
+            echo "::warning::leadership stayed on $last_in_inventory; the leader-last assertion is weak this round"
+          fi
           echo "pre-upgrade Raft leader: $leader"
           echo "CI_PRE_LEADER=$leader" >> "$GITHUB_ENV"
 
@@ -2150,7 +2176,10 @@ jobs:
           [ -s /tmp/ci-inplace.states ] \
             || { echo "::error::no node-state samples collected — this assertion would be vacuous"; exit 1; }
           echo "samples: $(wc -l < /tmp/ci-inplace.states), distinct: $(sort -u /tmp/ci-inplace.states | tr '\n' ' ')"
-          if grep -qE 'State=(DRAIN|DRAINING|DRAINED)' /tmp/ci-inplace.states; then
+          # DRAINED/DRAINING are base states, and any overlay (+RESERVED,
+          # +MAINTENANCE+RESERVED, +PLANNED) is appended after them, so a
+          # `State=DRAIN` prefix match covers every drained form.
+          if grep -qE 'State=DRAIN' /tmp/ci-inplace.states; then
             echo "::error::worker-0 entered a drained state during an in-place upgrade"
             sort -u /tmp/ci-inplace.states
             exit 1

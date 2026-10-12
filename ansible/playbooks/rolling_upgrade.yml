@@ -260,15 +260,25 @@
       changed_when: false
       when: ru_detect_leader | bool
 
-    # A group rather than a per-host boolean: group membership is a plain list
-    # of names, so the ordering expression below needs no bool/str coercion.
-    - name: Tag this controller as the current Raft leader
+    - name: Record whether this controller answered as the leader
+      ansible.builtin.set_fact:
+        ru_is_leader: "{{ (ru_leader_probe.status | default(0)) == 200 }}"
+      when: ru_detect_leader | bool
+
+    # add_host is a BYPASS_HOST_LOOP action: it runs ONCE per play, against the
+    # first host, so a bare `when:` on the probe result would only ever see that
+    # host's answer and every other controller's 200 would be discarded. Loop
+    # over the controllers explicitly and read each one's recorded fact instead.
+    #
+    # A group rather than a per-host boolean because group membership is a plain
+    # list of names, so the ordering expression below needs no bool/str coercion.
+    - name: Tag the detected leader
       ansible.builtin.add_host:
-        name: "{{ inventory_hostname }}"
+        name: "{{ item }}"
         groups: spur_raft_leader
-      when:
-        - ru_detect_leader | bool
-        - (ru_leader_probe.status | default(0)) == 200
+      loop: "{{ groups['spur_controllers'] }}"
+      when: hostvars[item].ru_is_leader | default(false) | bool
+      run_once: true
       changed_when: false
 
     - name: Warn that the leader could not be identified (falling back to inventory order)
