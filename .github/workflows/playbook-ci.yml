@@ -2064,13 +2064,32 @@ jobs:
 
           # If the leader is already the LAST controller in inventory order,
           # leader-last and inventory order coincide and the ordering assertion
-          # proves nothing. Force an election off it so the two orders differ and
+          # proves nothing. Move leadership off it so the two orders differ and
           # the assertion has to actually exercise the detection logic.
+          #
+          # STOP rather than restart. A restarted leader is only a follower for
+          # the moment it is down and can re-win the election that follows — it
+          # did, three times in a row, on the first version of this. A stopped
+          # controller cannot campaign at all, so one of the remaining two must
+          # take over (2 of 3 is still quorum). It is started again afterwards
+          # and rejoins as a follower, since a leader already exists by then.
           last_in_inventory=ctl-2
-          for attempt in 1 2 3; do
-            [ "$leader" != "$last_in_inventory" ] && break
-            echo "leader is $last_in_inventory (inventory-last) — restarting it to move leadership (attempt $attempt)"
-            docker exec "$leader" systemctl restart spurctld
+          if [ "$leader" = "$last_in_inventory" ]; then
+            echo "leader is $last_in_inventory (inventory-last) — stopping it to hand leadership to a peer"
+            docker exec "$last_in_inventory" systemctl stop spurctld
+            new_leader=""
+            for i in $(seq 1 45); do
+              for c in ctl-0 ctl-1; do
+                code=$(docker exec "$c" curl -s -o /dev/null -w '%{http_code}' \
+                         http://127.0.0.1:6822/metrics/nodes 2>/dev/null || echo 000)
+                [ "$code" = "200" ] && { new_leader="$c"; break 2; }
+              done
+              sleep 2
+            done
+            docker exec "$last_in_inventory" systemctl start spurctld
+            [ -n "$new_leader" ] \
+              || { echo "::error::no peer took over leadership after stopping $last_in_inventory"; exit 1; }
+            # Let the restarted node rejoin, then re-confirm who leads.
             sleep 10
             leader=""
             for i in $(seq 1 30); do
@@ -2081,12 +2100,13 @@ jobs:
               done
               sleep 2
             done
-            [ -n "$leader" ] || { echo "::error::no leader after forcing an election"; exit 1; }
-          done
-          if [ "$leader" = "$last_in_inventory" ]; then
-            echo "::warning::leadership stayed on $last_in_inventory; the leader-last assertion is weak this round"
+            [ -n "$leader" ] || { echo "::error::no leader after $last_in_inventory rejoined"; exit 1; }
           fi
-          echo "pre-upgrade Raft leader: $leader"
+          # Now a hard failure, not a warning: the stop-based handover above is
+          # deterministic, so landing back here means something genuinely wrong.
+          [ "$leader" != "$last_in_inventory" ] \
+            || { echo "::error::leadership returned to $last_in_inventory; the leader-last assertion would be vacuous"; exit 1; }
+          echo "pre-upgrade Raft leader: $leader (inventory-last is $last_in_inventory, so the orders differ)"
           echo "CI_PRE_LEADER=$leader" >> "$GITHUB_ENV"
 
       - name: Submit the job shapes that must survive the swap
@@ -2202,7 +2222,17 @@ jobs:
           last=$(tail -1 /tmp/ci-inplace.ctlorder)
           [ "$last" = "$CI_PRE_LEADER" ] \
             || { echo "::error::leader was $CI_PRE_LEADER but last controller swapped was $last"; exit 1; }
-          echo "PASS: leader $CI_PRE_LEADER upgraded last"
+
+          # The leader being last is only meaningful if that is NOT what plain
+          # inventory order would have produced — otherwise a detection that
+          # silently fell back to inventory order passes this too. The step that
+          # picked the leader guarantees they differ; re-check it here so the
+          # two can never drift apart unnoticed.
+          inventory_order="ctl-0 ctl-1 ctl-2"
+          observed=$(tr '\n' ' ' < /tmp/ci-inplace.ctlorder | sed 's/ *$//')
+          [ "$observed" != "$inventory_order" ] \
+            || { echo "::error::observed order equals inventory order ($observed) — leader-last is unproven this round"; exit 1; }
+          echo "PASS: leader $CI_PRE_LEADER upgraded last, and the order ($observed) differs from inventory order ($inventory_order)"
 
       - name: Assert the leader-detection play identified exactly one leader
         run: |
