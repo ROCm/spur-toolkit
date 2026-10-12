@@ -1928,7 +1928,9 @@ jobs:
     env:
       NODES: "ctl-0 ctl-1 ctl-2 worker-0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download + verify Spur binaries (deploy = release, upgrade = nightly)
         env:
@@ -2090,15 +2092,29 @@ jobs:
           docker exec worker-0 pgrep -x spurstepd | sort > /tmp/ci-inplace.stepd-before
           echo "spurstepd before: $(tr '\n' ' ' < /tmp/ci-inplace.stepd-before)"
 
-      - name: Start sampling worker-0's node state (proves it is never drained)
-        if: env.SPUR_NO_STEPD_BASELINE != 'true'
+      - name: Start samplers (node state + per-controller binary version)
         run: |
-          # Before/after assertions cannot catch a drain+resume pair, so sample
-          # continuously for the whole duration of the playbook run instead.
+          # Before/after assertions cannot catch a drain+resume pair, nor the
+          # order controllers were swapped in, so sample both continuously for
+          # the whole duration of the playbook run.
+          #
+          # Controller order is read from the binaries themselves rather than
+          # from Ansible's log: a serial:1 play still emits per-host task lines
+          # for OTHER hosts (delegated tasks, hostvars lookups), so log order
+          # does not reflect swap order. Verified on a 3-controller lab cluster,
+          # where log order said 202,204,203 and the real order was 202,203,204.
+          new_sum=$(sha256sum "$GITHUB_WORKSPACE/spur-bin-new/spurctld" | awk '{print $1}')
+          echo "$new_sum" > /tmp/ci-inplace.newsum
           nohup bash -c '
             while true; do
               docker exec ctl-0 /usr/local/bin/spur show node worker-0 2>/dev/null \
                 | grep -oE "State=[A-Z+]+" | head -1 >> /tmp/ci-inplace.states
+              for c in ctl-0 ctl-1 ctl-2; do
+                s=$(docker exec "$c" sha256sum /usr/local/bin/spurctld 2>/dev/null | awk "{print \$1}")
+                if [ "$s" = "$(cat /tmp/ci-inplace.newsum)" ] && ! grep -q "^$c\$" /tmp/ci-inplace.ctlorder 2>/dev/null; then
+                  echo "$c" >> /tmp/ci-inplace.ctlorder
+                fi
+              done
               sleep 1
             done
           ' >/dev/null 2>&1 &
@@ -2145,14 +2161,29 @@ jobs:
       - name: Assert the Raft leader was upgraded last
         run: |
           set -euo pipefail
-          # The play header does not list its hosts, so read the per-host task
-          # order from the log: the leader must be the last controller touched.
-          last=$(grep -oE '^(ok|changed): \[ctl-[0-9]\]' /tmp/ci-inplace.ansible.log \
-                   | grep -oE 'ctl-[0-9]' | tail -1)
-          [ -n "$last" ] || { echo "::error::could not determine controller order from the log"; exit 1; }
+          [ -s /tmp/ci-inplace.ctlorder ] \
+            || { echo "::error::no controller binary-swap order recorded — this assertion would be vacuous"; exit 1; }
+          echo "observed swap order: $(tr '\n' ' ' < /tmp/ci-inplace.ctlorder)"
+          seen=$(wc -l < /tmp/ci-inplace.ctlorder)
+          [ "$seen" -eq 3 ] \
+            || { echo "::error::only $seen/3 controllers observed swapping; sampler may have missed one"; exit 1; }
+          last=$(tail -1 /tmp/ci-inplace.ctlorder)
           [ "$last" = "$CI_PRE_LEADER" ] \
-            || { echo "::error::leader was $CI_PRE_LEADER but last controller upgraded was $last"; exit 1; }
+            || { echo "::error::leader was $CI_PRE_LEADER but last controller swapped was $last"; exit 1; }
           echo "PASS: leader $CI_PRE_LEADER upgraded last"
+
+      - name: Assert the leader-detection play identified exactly one leader
+        run: |
+          set -euo pipefail
+          # Guards against the detection silently falling back to inventory
+          # order, which would make the assertion above pass by luck on a
+          # cluster where the leader already happened to be last.
+          if grep -q "Warn that the leader could not be identified" /tmp/ci-inplace.ansible.log \
+             && ! grep -A2 "Warn that the leader could not be identified" /tmp/ci-inplace.ansible.log | grep -q "skipping"; then
+            echo "::error::leader detection fell back to inventory order instead of identifying a leader"
+            exit 1
+          fi
+          echo "PASS: detection identified a single leader (no fallback)"
 
       - name: Assert jobs survived, worker upgraded, cluster still writable
         if: env.SPUR_NO_STEPD_BASELINE != 'true'
