@@ -43,11 +43,21 @@
 # carry it across the restart unharmed. Refused if a busy node has no
 # spurstepd yet, or combined with spur_skip_busy_agents /
 # spur_force_upgrade_busy_agents. Because nothing is drained there is no wait
-# to skip; busy status is read straight off the node's live allocation.
-# Controllers are additionally ordered leader-last (see the detection play
-# below) — a new leader coexisting with not-yet-upgraded followers is the one
-# arrangement that can stall Raft replication on a WAL schema addition:
+# to skip; busy status is read straight off the node's live allocation, and
+# spur_drain_wait_secs is ignored entirely:
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_in_place_upgrade=true
+#
+# Two interactions specific to this mode, both consequences of not draining:
+#   - spur_rolling_batch_size > 1 does NOT "drain more capacity at once" here,
+#     because nothing drains. It puts N agents' spurd down simultaneously while
+#     all N stay schedulable, widening the new-job-dispatch window N-fold
+#     instead of serialising it. Prefer the default 1.
+#   - An agent unreachable over SSH is left schedulable AND un-upgraded. Every
+#     other mode still drains it (the drain is a controller-side call, so it
+#     works on a host Ansible cannot reach); this one does not. That is usually
+#     right — a node reachable by its own spurd but not by SSH is healthy and
+#     should keep taking work — but it does mean a genuinely dead node stays
+#     schedulable until it crosses its own heartbeat timeout and goes DOWN.
 #
 # Unlike teardown.yml/remove_nodes.yml, this playbook never calls
 # tasks/reap_stepd_supervisors.yml on a force-killed job's spurstepd — it
