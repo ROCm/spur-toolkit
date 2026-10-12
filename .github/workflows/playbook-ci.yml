@@ -2078,9 +2078,12 @@ jobs:
           ' | tail -1)
 
           # Both must really be RUNNING first, or surviving proves nothing.
+          # `spur queue` is squeue-compatible: the ST column carries the short
+          # code (R), not the long JobState name `spur show job` prints.
           running=0
           for i in $(seq 1 60); do
-            running=$(docker exec ctl-0 /usr/local/bin/spur queue 2>/dev/null | grep -cE "RUNNING" || true)
+            running=$(docker exec ctl-0 /usr/local/bin/spur queue 2>/dev/null \
+                        | awk '$5 == "R"' | wc -l)
             [ "$running" -ge 2 ] && break
             sleep 2
           done
@@ -2189,10 +2192,16 @@ jobs:
         if: env.SPUR_NO_STEPD_BASELINE != 'true'
         run: |
           set -euo pipefail
-          running=$(docker exec ctl-0 /usr/local/bin/spur queue 2>/dev/null | grep -cE "RUNNING" || true)
+          running=$(docker exec ctl-0 /usr/local/bin/spur queue 2>/dev/null \
+                      | awk '$5 == "R"' | wc -l)
           [ "$running" -ge 2 ] \
             || { echo "::error::expected 2 jobs still RUNNING after the upgrade, got $running"; \
                  docker exec ctl-0 /usr/local/bin/spur queue; exit 1; }
+
+          docker exec ctl-0 /usr/local/bin/spur show job "$CI_INPLACE_BATCH_JID" \
+            | grep -qE "JobState=RUNNING" \
+            || { echo "::error::batch job $CI_INPLACE_BATCH_JID is not RUNNING after the upgrade"; \
+                 docker exec ctl-0 /usr/local/bin/spur show job "$CI_INPLACE_BATCH_JID"; exit 1; }
 
           after=$(docker exec worker-0 pgrep -x spurstepd | sort)
           before=$(cat /tmp/ci-inplace.stepd-before)
