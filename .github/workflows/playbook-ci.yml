@@ -75,6 +75,9 @@ on:
       - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
 
+permissions:
+  contents: read
+
 concurrency:
   group: playbook-ci-${{ github.ref }}
   cancel-in-progress: true
@@ -83,7 +86,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install ansible + lint
         run: |
           python3 -m pip install --upgrade pip
@@ -111,7 +116,9 @@ jobs:
     env:
       NODES: "ctl-0 gpu-1 gpu-2 gpu-3"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download + verify Spur binaries (deploy = release, upgrade = nightly)
         env:
@@ -933,7 +940,9 @@ jobs:
     env:
       NODES: "ctl-0 gpu-1 gpu-2 gpu-3"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download + verify Spur binaries (deploy = release, upgrade = nightly)
         env:
@@ -1376,7 +1385,9 @@ jobs:
       # default disruptive path), gpu-3 (teardown.yml opt-in drain path).
       NODES: "ctl-0 gpu-1 gpu-2 gpu-3"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download + verify Spur binaries (deploy = release, upgrade = nightly)
         env:
@@ -1910,7 +1921,9 @@ jobs:
       # not just controllers (the deferred #23 review fast-follows).
       NODES: "ctl-0 ctl-1 ctl-2 worker-0 worker-1 login-0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Load the WireGuard module on the runner
         # modinfo inside a container reads the container's (empty) /lib/modules,
@@ -2370,7 +2383,9 @@ jobs:
     env:
       NODES: "ctl-0 gpu-1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download + verify Spur binaries
         env:
@@ -2615,11 +2630,14 @@ jobs:
       NODES: "ctl-0 gpu-1"
       AUTH_INV: "../.github/workflows/ci-techsupport.ini"   # lean 1-ctl + 1-agent
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Check out ROCm/spur (for a spurauthd-capable build)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           repository: ROCm/spur
           path: spur-src
           fetch-depth: 1
@@ -2631,7 +2649,7 @@ jobs:
           sudo apt-get install -y -qq protobuf-compiler build-essential
 
       - name: Cache cargo + build output
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -2931,7 +2949,9 @@ jobs:
     env:
       NODES: "ctl-0 gpu-1 gpu-2 gpu-3"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download + verify Spur binaries
         env:
