@@ -14,9 +14,10 @@
 #                    reachable when dckj_force_busy can be false (i.e. proceeding
 #                    isn't already the default) — see deploy.yml, where force is
 #                    the default and this branch never fires.
-#   dckj_trust_stepd bool — a busy node may proceed untouched-job-wise if its
-#                    running work is spurstepd-supervised (rolling_upgrade.yml
-#                    only; other callers leave this false). See spur_node_busy_trusted.
+#   dckj_in_place    bool — in-place mode: never drain at all, and let a busy
+#                    node proceed untouched-job-wise if its running work is
+#                    spurstepd-supervised (rolling_upgrade.yml only; other
+#                    callers leave this false). See spur_node_in_place.
 
 - name: Probe agent reachability
   ansible.builtin.ping:
@@ -39,12 +40,39 @@
 # nothing left to protect. Also accepts DOWN as a fully-drained outcome: a
 # genuinely unreachable agent may independently cross its heartbeat timeout.
 - name: Drain this node and wait for it to fully drain
-  # Force/trust-stepd modes check once, no wait: both already commit to a
-  # specific outcome for a busy node regardless of how much longer its job
-  # runs, and the controller flips Draining->Drain synchronously off job
-  # completion (no reconciliation lag to wait out either).
+  # Force mode checks once, no wait: it already commits to a specific outcome
+  # for a busy node regardless of how much longer its job runs, and the
+  # controller flips Draining->Drain synchronously off job completion (no
+  # reconciliation lag to wait out either).
+  #
+  # In-place mode never drains at all — see the branch at the top of the
+  # script. Busy-ness there is read straight off the live allocation, because
+  # there is no drain outcome to infer it from.
   ansible.builtin.shell: |
     set -o pipefail
+    node_block() {
+      {{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
+        | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p'
+    }
+    check_state() {
+      node_block | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2
+    }
+    if [ "{{ dckj_in_place | default(false) | bool | lower }}" = "true" ]; then
+      block=$(node_block)
+      if [ -z "$block" ]; then
+        echo "RESULT=ALREADY_GONE"
+        exit 0
+      fi
+      # CPUAlloc is non-zero for as long as the node holds any allocation,
+      # which is the only busy signal available without draining.
+      alloc=$(echo "$block" | grep -oE 'CPUAlloc=[0-9]+' | head -1 | cut -d= -f2)
+      if [ "${alloc:-0}" -gt 0 ]; then
+        echo "RESULT=BUSY (in-place mode — node deliberately NOT drained)"
+      else
+        echo "RESULT=IDLE (in-place mode — node deliberately NOT drained)"
+      fi
+      exit 0
+    fi
     drain_out=$({{ spur_install_dir }}/spur node drain {{ spur_node_name }} --reason "ansible {{ dckj_action }}" 2>&1)
     drain_rc=$?
     if [ "$drain_rc" -ne 0 ]; then
@@ -55,18 +83,12 @@
       echo "$drain_out" >&2
       exit 1
     fi
-    check_state() {
-      {{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
-        | awk -v n="{{ spur_node_name }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
-        | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2
-    }
-    if [ "{{ dckj_force_busy | default(false) | bool | lower }}" = "true" ] \
-       || [ "{{ dckj_trust_stepd | default(false) | bool | lower }}" = "true" ]; then
+    if [ "{{ dckj_force_busy | default(false) | bool | lower }}" = "true" ]; then
       st=$(check_state)
       case "$st" in
         DRAINED|DOWN) echo "RESULT=DRAINED"; exit 0 ;;
       esac
-      echo "RESULT=BUSY (force/trust-stepd mode — proceeding immediately instead of waiting up to {{ spur_drain_wait_secs | default(120) }}s)"
+      echo "RESULT=BUSY (force mode — proceeding immediately instead of waiting up to {{ spur_drain_wait_secs | default(120) }}s)"
       exit 0
     fi
     for i in $(seq 1 {{ spur_drain_wait_secs | default(120) }}); do
@@ -92,7 +114,8 @@
 # Busy = reachable (drain wasn't skipped by unreachability or already being
 # gone) but the wait above didn't reach DRAINED/DOWN in time — i.e. a job is
 # still running there. Draining never force-kills a running job, so this is
-# expected.
+# expected. In-place mode reports the same RESULT=BUSY off a live CPUAlloc
+# instead, having never drained.
 - name: Determine whether this node is busy (reachable but still draining)
   ansible.builtin.set_fact:
     spur_node_busy: >-
@@ -106,26 +129,28 @@
   ansible.builtin.stat:
     path: "{{ spur_install_dir }}/spurstepd"
   register: dckj_stepd_stat
-  when: spur_node_busy and (dckj_trust_stepd | default(false))
+  when: spur_node_busy and (dckj_in_place | default(false))
 
 - name: Determine whether it's safe to trust spurstepd across this restart
   ansible.builtin.set_fact:
-    spur_node_busy_trusted: >-
-      {{ spur_node_busy and (dckj_trust_stepd | default(false))
+    spur_node_in_place: >-
+      {{ spur_node_busy and (dckj_in_place | default(false))
          and (dckj_stepd_stat.stat.exists | default(false)) }}
 
 - name: Refuse to disrupt a busy node unless skip, force, or a trusted supervisor covers it
   ansible.builtin.fail:
     msg: >-
-      {{ spur_node_name }} still has a running job and did not drain within
-      {{ spur_drain_wait_secs | default(120) }}s. This {{ dckj_action }} never
-      force-kills running work by default. Re-run with
+      {{ spur_node_name }} still has a running job
+      {{ "and has no spurstepd to carry it across a restart"
+         if (dckj_in_place | default(false))
+         else "and did not drain within " ~ (spur_drain_wait_secs | default(120)) ~ "s" }}.
+      This {{ dckj_action }} never force-kills running work by default. Re-run with
       -e spur_skip_busy_agents=true to leave busy nodes untouched and continue
       with the rest of the fleet, or with -e {{ dckj_force_flag }}=true to
       proceed immediately and accept that the running job will be killed.
   when: >-
     spur_node_busy and not dckj_skip_busy and not dckj_force_busy
-    and not spur_node_busy_trusted
+    and not spur_node_in_place
 
 - name: Note busy node is being left untouched
   ansible.builtin.debug:
@@ -138,9 +163,10 @@
   ansible.builtin.debug:
     msg: >-
       {{ spur_node_name }} still has a running job, but it's supervised by an
-      already-installed spurstepd — proceeding with {{ dckj_action }} without
-      waiting for it to finish or killing it (spur_trust_stepd_busy_agents=true).
-  when: spur_node_busy_trusted and not dckj_skip_busy
+      already-installed spurstepd — proceeding with {{ dckj_action }} in place,
+      without draining the node, waiting for the job to finish, or killing it
+      (spur_in_place_upgrade=true).
+  when: spur_node_in_place and not dckj_skip_busy
 
 - name: Warn that the running job WILL be killed
   ansible.builtin.debug:

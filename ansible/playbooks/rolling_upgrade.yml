@@ -37,13 +37,17 @@
 # to killing the job either way, so it checks busy status once, immediately:
 #   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_force_upgrade_busy_agents=true
 #
-# Upgrade a busy node's spurd WITHOUT killing its running job, trusting that
-# job's spurstepd supervisor (a detached, double-forked process outside
-# spurd's lifecycle) to carry it across the restart unharmed. Refused if the
-# node has no spurstepd yet, or combined with spur_skip_busy_agents /
-# spur_force_upgrade_busy_agents. Same as force above, this checks busy status
-# once immediately rather than waiting — the outcome doesn't depend on it:
-#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_trust_stepd_busy_agents=true
+# Non-disruptive in-place upgrade: never drain any agent, and upgrade a busy
+# node's spurd WITHOUT killing its running job, trusting that job's spurstepd
+# supervisor (a detached, double-forked process outside spurd's lifecycle) to
+# carry it across the restart unharmed. Refused if a busy node has no
+# spurstepd yet, or combined with spur_skip_busy_agents /
+# spur_force_upgrade_busy_agents. Because nothing is drained there is no wait
+# to skip; busy status is read straight off the node's live allocation.
+# Controllers are additionally ordered leader-last (see the detection play
+# below) — a new leader coexisting with not-yet-upgraded followers is the one
+# arrangement that can stall Raft replication on a WAL schema addition:
+#   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/tmp/spur-bin-new -e spur_in_place_upgrade=true
 #
 # Unlike teardown.yml/remove_nodes.yml, this playbook never calls
 # tasks/reap_stepd_supervisors.yml on a force-killed job's spurstepd — it
@@ -198,12 +202,90 @@
       ansible.builtin.fail:
         msg: >-
           spur_skip_busy_agents, spur_force_upgrade_busy_agents, and
-          spur_trust_stepd_busy_agents are mutually exclusive — pick one
+          spur_in_place_upgrade are mutually exclusive — pick one
           busy-node strategy per run.
       when: >-
         [spur_skip_busy_agents | default(false) | bool,
          spur_force_upgrade_busy_agents | default(false) | bool,
-         spur_trust_stepd_busy_agents | default(false) | bool] | select | list | length > 1
+         spur_in_place_upgrade | default(false) | bool] | select | list | length > 1
+
+# Upgrading the Raft leader LAST keeps a mixed-version cluster safe. WalOperation
+# is an externally-tagged serde enum with no tolerant unknown-variant path, and
+# the raft transport deserializes a whole AppendEntries payload in one call, so a
+# not-yet-upgraded follower handed a variant added by the new build rejects the
+# RPC and stops replicating until it is itself upgraded. While the leader is on
+# the old build it cannot produce such a variant at all, which closes the window.
+#
+# Detection is best-effort by design: it only ever reorders hosts the playbook
+# was already going to upgrade, so failing to detect falls back to inventory
+# order rather than aborting a legitimate upgrade.
+- name: Detect the Raft leader so controllers upgrade leader-last
+  hosts: spur_controllers
+  become: true
+  gather_facts: no
+  ignore_unreachable: true
+  vars:
+    # Pointless for one controller, and an explicit order is the operator
+    # overriding this on purpose.
+    ru_detect_leader: >-
+      {{ (groups['spur_controllers'] | length) > 1
+         and (spur_controller_upgrade_order | default('') | length == 0) }}
+  tasks:
+    - name: Probe this controller's metrics port for Raft leadership
+      # Every /metrics/* route answers 200 on the leader and 503 on a follower.
+      # The metrics listener is enabled by default and binds loopback, so the
+      # probe has to run on the controller itself. uri rather than curl: the
+      # toolkit only requires curl for the install.sh fallback path.
+      # The retry covers a metrics server that isn't answering yet (restarting,
+      # or still recovering Raft state), not an election — a controller mid
+      # election answers 503 immediately, and that is a fallback, not a retry.
+      # Kept short on purpose: a cluster with [metrics] disabled pays this on
+      # every controller and gets nothing back, so the whole sweep is bounded to
+      # about 15s per host rather than minutes.
+      #
+      # failed_when: false is what makes detection non-blocking. Exhausting the
+      # retries would otherwise fail the task; instead the probe reports its
+      # connection-failure sentinel (status -1), no leader is tagged, and the
+      # controller play falls back to inventory order.
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ spur_metrics_port | default(6822) }}/metrics/nodes"
+        method: GET
+        status_code: [200, 503]
+        timeout: 3
+      register: ru_leader_probe
+      retries: 3
+      delay: 2
+      until: (ru_leader_probe.status | default(0)) in [200, 503]
+      failed_when: false
+      changed_when: false
+      when: ru_detect_leader | bool
+
+    # A group rather than a per-host boolean: group membership is a plain list
+    # of names, so the ordering expression below needs no bool/str coercion.
+    - name: Tag this controller as the current Raft leader
+      ansible.builtin.add_host:
+        name: "{{ inventory_hostname }}"
+        groups: spur_raft_leader
+      when:
+        - ru_detect_leader | bool
+        - (ru_leader_probe.status | default(0)) == 200
+      changed_when: false
+
+    - name: Warn that the leader could not be identified (falling back to inventory order)
+      ansible.builtin.debug:
+        msg: >-
+          Could not identify a single Raft leader
+          ({{ groups['spur_raft_leader'] | default([]) | length }} of
+          {{ groups['spur_controllers'] | length }} controllers answered as leader) —
+          upgrading controllers in inventory order instead. If this cluster is
+          mid-election, or [metrics] is disabled, re-run once it settles or pass
+          -e spur_controller_upgrade_order=<followers>,<leader> to order it by hand.
+          Upgrading the leader first can stall replication on not-yet-upgraded
+          followers when the new build adds a WAL variant.
+      run_once: true
+      when:
+        - ru_detect_leader | bool
+        - (groups['spur_raft_leader'] | default([]) | length) != 1
 
 # spur_controller re-renders spur.conf on every controller it touches, which
 # needs ansible_hostname for every agent (the [[nodes]] block) — gather facts
@@ -221,10 +303,15 @@
   tasks: []
 
 - name: Rolling upgrade — controllers, one at a time (preserves Raft quorum)
-  # Custom order (validated above) if given, else natural inventory order.
+  # Custom order (validated above) if given; else the detected leader-last order;
+  # else natural inventory order. The ternary's branches are evaluated lazily, so
+  # the group reference is safe when no leader was tagged.
   hosts: >-
     {{ (spur_controller_upgrade_order | default('') | split(',') | map('trim') | select | list)
-       or groups['spur_controllers'] }}
+       or ((groups['spur_controllers'] | difference(groups['spur_raft_leader'] | default([])))
+             + (groups['spur_raft_leader'] | default([]))
+           if (groups['spur_raft_leader'] | default([]) | length) == 1
+           else groups['spur_controllers']) }}
   become: true
   # Facts were already gathered for every controller reachable during the
   # whole-cluster play above and persist in hostvars for the rest of this run
@@ -290,7 +377,7 @@
     dckj_skip_busy: "{{ spur_skip_busy_agents | default(false) | bool }}"
     dckj_force_busy: "{{ spur_force_upgrade_busy_agents | default(false) | bool }}"
     dckj_force_flag: spur_force_upgrade_busy_agents
-    dckj_trust_stepd: "{{ spur_trust_stepd_busy_agents | default(false) | bool }}"
+    dckj_in_place: "{{ spur_in_place_upgrade | default(false) | bool }}"
   pre_tasks:
     - name: Gather facts if missing (this agent was unreachable during the whole-cluster gather)
       ansible.builtin.setup:
@@ -331,8 +418,8 @@
     # under its own job is unsafe regardless of how the drain wait turned out.
     # When spur_force_upgrade_busy_agents=true the operator has explicitly
     # accepted that running jobs will be killed, so we proceed regardless.
-    # spur_node_busy_trusted proceeds too, without killing anything — set only
-    # when spur_trust_stepd_busy_agents=true and the job is already stepd-supervised.
+    # spur_node_in_place proceeds too, without killing anything — set only
+    # when spur_in_place_upgrade=true and the job is already stepd-supervised.
     # Still attempted for an unreachable node; every task inside will itself
     # fail (ignored, not counted, via the play's ignore_unreachable) since
     # there's no connection to reach it.
@@ -342,7 +429,7 @@
       when: >-
         not (spur_node_busy | default(false)) or
         (spur_force_upgrade_busy_agents | default(false) | bool) or
-        (spur_node_busy_trusted | default(false))
+        (spur_node_in_place | default(false))
     # Carry auth forward on the agent: new spurauthd + keys/CLI conf before spurd
     # restarts (spurd Wants=spurauthd and mints its register call). Same busy-node
     # gate as the roles around it, plus spur_auth_enabled.
@@ -351,12 +438,12 @@
         (spur_auth_enabled | default(false) | bool)
         and (not (spur_node_busy | default(false))
              or (spur_force_upgrade_busy_agents | default(false) | bool)
-             or (spur_node_busy_trusted | default(false)))
+             or (spur_node_in_place | default(false)))
     - role: spur_agent
       when: >-
         not (spur_node_busy | default(false)) or
         (spur_force_upgrade_busy_agents | default(false) | bool) or
-        (spur_node_busy_trusted | default(false))
+        (spur_node_in_place | default(false))
 
   post_tasks:
     - name: Re-register + undrain the node now that it's back

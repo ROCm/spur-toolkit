@@ -7,15 +7,19 @@
 
 # A skipped busy node was never touched (the caller's role/task didn't run for
 # it), so the daemon never restarted — there's nothing to wait for. A force-
-# disrupted or trusted-stepd busy node DID have its daemon restarted, so we
+# disrupted or in-place busy node DID have its daemon restarted, so we
 # wait for those too. Merged
 # with the resume/undrain below (both delegated to the controller) to cut a
 # round-trip; a drained node stays drained after the daemon restarts —
 # draining is server-side state, not tied to the agent process — so resuming
 # unconditionally here also correctly covers a skipped-busy node.
+#
+# In-place mode never drained, so there is nothing to undrain: issuing RESUME
+# anyway would clear an operator's own pre-existing drain on that node. The
+# re-registration wait still applies — spurd did restart.
 - name: Wait for the node to re-register (if it was actually restarted), then resume it
   ansible.builtin.shell: |
-    {% if (not (spur_node_busy | default(false))) or dckj_force_busy or (spur_node_busy_trusted | default(false)) %}
+    {% if (not (spur_node_busy | default(false))) or dckj_force_busy or (spur_node_in_place | default(false)) %}
     ok=""
     for i in $(seq 1 30); do
       {{ spur_install_dir }}/spur show node {{ spur_node_name }} >/dev/null 2>&1 && { ok=1; break; }
@@ -26,9 +30,13 @@
       exit 1
     fi
     {% endif %}
+    {% if dckj_in_place | default(false) | bool %}
+    echo "RESULT=NOT_RESUMED (in-place mode — node was never drained)"
+    {% else %}
     {{ spur_install_dir }}/scontrol update NodeName={{ spur_node_name }} State=RESUME
+    {% endif %}
   args:
     executable: /bin/bash
   delegate_to: "{{ groups['spur_controllers'][0] }}"
-  changed_when: true
+  changed_when: not (dckj_in_place | default(false) | bool)
   when: not (spur_agent_ping.unreachable | default(false))

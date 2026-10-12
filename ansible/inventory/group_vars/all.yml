@@ -73,6 +73,10 @@ spur_k8s_version: "v1.36.2+k0s.0"
 spur_controller_port: 6817
 spur_agent_port: 6818
 spur_raft_port: 6821
+# spurctld's metrics listener. Not rendered into spur.conf — this is spurctld's
+# own default, recorded here so rolling_upgrade.yml's leader probe can reach it
+# on a cluster that overrides it out of band.
+spur_metrics_port: 6822
 
 # Accounting (PostgreSQL, embedded in spurctld). OPTIONAL — set
 # spur_accounting_enabled: false to skip. Single database for the whole cluster;

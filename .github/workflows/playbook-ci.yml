@@ -28,9 +28,20 @@
 #   stays RUNNING across `systemctl restart spurd`, re-adopted by the SAME
 #   supervisor pids rather than respawned ones) and teardown's explicit reap of
 #   the supervisors that stopping spurd deliberately leaves behind, plus
-#   rolling_upgrade.yml's spur_trust_stepd_busy_agents=true path (same
+#   rolling_upgrade.yml's spur_in_place_upgrade=true path (same
 #   restart-survival guarantee, but driven through the playbook's own
 #   drain/guard logic instead of a raw systemctl restart)
+#
+# integration-inplace-upgrade:
+#   rolling_upgrade.yml's spur_in_place_upgrade=true path on 3 controllers + 1
+#   worker over the direct transport — the parts a single-controller cluster
+#   cannot show. Asserts the worker is NEVER drained (node state sampled once a
+#   second for the whole run, since a drain+resume pair is invisible to
+#   before/after checks), that the Raft leader is upgraded LAST (detected via
+#   the same loopback /metrics probe the playbook uses), that an sbatch job and
+#   a plain srun step both survive under their original spurstepd pids, that
+#   the cluster still accepts a write afterwards, and that the mode still
+#   refuses to combine with spur_force_upgrade_busy_agents.
 #
 # The spurstepd assertions in both jobs are conditional on the fetched build
 # actually shipping the binary — no tagged release does yet — and start
@@ -1586,14 +1597,14 @@ jobs:
           done
           echo "cleanup: job $jid is ${st:-unknown}"
 
-      # --- rolling_upgrade.yml: spur_trust_stepd_busy_agents keeps a busy
+      # --- rolling_upgrade.yml: spur_in_place_upgrade keeps a busy
       # node's job alive with NO force/skip flag — the non-disruptive path. ---
-      - name: Submit a busy job on gpu-3 for the rolling_upgrade.yml trust-stepd test
+      - name: Submit a busy job on gpu-3 for the rolling_upgrade.yml in-place test
         run: |
           set -euo pipefail
           jid=$(docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
             set -e
-            printf "#!/bin/bash\n#SBATCH --job-name=ru-trust-stepd\nsleep 600\n" > /tmp/ci-ru-trust.sh
+            printf "#!/bin/bash\n#SBATCH --job-name=ru-in-place\nsleep 600\n" > /tmp/ci-ru-trust.sh
             jid=$(/usr/local/bin/spur submit -w gpu-3 /tmp/ci-ru-trust.sh | grep -oE "[0-9]+" | head -1)
             for i in $(seq 1 30); do
               st=$(/usr/local/bin/spur show job "$jid" 2>/dev/null | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
@@ -1609,7 +1620,7 @@ jobs:
           echo "CI_RU_TRUST_JID=$jid" >> "$GITHUB_ENV"
           docker exec gpu-3 pgrep -x spurstepd > /tmp/ci-ru-trust.stepd-before
 
-      - name: rolling_upgrade.yml -e spur_trust_stepd_busy_agents=true (must succeed, job survives, no force/skip)
+      - name: rolling_upgrade.yml -e spur_in_place_upgrade=true (must succeed, job survives, no force/skip)
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
@@ -1619,7 +1630,7 @@ jobs:
             -e spur_install_dir=/usr/local/bin \
             -e spur_home=/opt/spur \
             -e spur_drain_wait_secs=10 \
-            -e spur_trust_stepd_busy_agents=true
+            -e spur_in_place_upgrade=true
 
       - name: Assert gpu-3's job survived and gpu-3 is on the new build
         run: |
@@ -1627,12 +1638,12 @@ jobs:
           jid="$CI_RU_TRUST_JID"
           st=$(docker exec ctl-0 /usr/local/bin/spur show job "$jid" | grep -oE "JobState=[A-Z]+" | head -1 | cut -d= -f2)
           [ "$st" = RUNNING ] \
-            || { echo "::error::job $jid is $st after rolling_upgrade.yml --trust-stepd, expected RUNNING"; exit 1; }
+            || { echo "::error::job $jid is $st after rolling_upgrade.yml -e spur_in_place_upgrade=true, expected RUNNING"; exit 1; }
           docker exec gpu-3 systemctl is-active spurd | grep -qx active \
-            || { echo "::error::spurd not active on gpu-3 after the trust-stepd upgrade"; exit 1; }
+            || { echo "::error::spurd not active on gpu-3 after the in-place upgrade"; exit 1; }
           after=$(docker exec gpu-3 pgrep -x spurstepd || true)
           [ "$after" = "$(cat /tmp/ci-ru-trust.stepd-before)" ] \
-            || { echo "::error::spurstepd identity changed across the trust-stepd upgrade (before: $(cat /tmp/ci-ru-trust.stepd-before) / after: $after)"; exit 1; }
+            || { echo "::error::spurstepd identity changed across the in-place upgrade (before: $(cat /tmp/ci-ru-trust.stepd-before) / after: $after)"; exit 1; }
           old_sum=$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurd" | awk '{print $1}')
           new_sum=$(docker exec gpu-3 sha256sum /usr/local/bin/spurd | awk '{print $1}')
           if [ "$new_sum" = "$old_sum" ] && [ "${SPUR_BUILD_IDENTICAL:-}" != "true" ]; then
@@ -1892,6 +1903,309 @@ jobs:
             echo "===== $n journal (spur*) ====="
             docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -50' || true
           done
+
+      - name: Teardown containers
+        if: always()
+        run: |
+          for n in $NODES; do docker rm -f "$n" || true; done
+          docker network rm spur-ci || true
+
+  # ---------------------------------------------------------------------------
+  # Job 3b: non-disruptive in-place rolling upgrade — spur_in_place_upgrade
+  #
+  # 3 controllers + 1 worker over the direct transport (ci-inplace.ini). What
+  # integration-day2's single-controller pass cannot show:
+  #   - the worker is NEVER drained (the whole point of the mode) — sampled
+  #     continuously while the playbook runs, since a drain+resume pair would
+  #     be invisible to before/after assertions alone
+  #   - the Raft leader is upgraded LAST
+  #   - two different supervision paths survive concurrently, not one sbatch job
+  #   - the cluster still accepts writes after the controller phase
+  # ---------------------------------------------------------------------------
+  integration-inplace-upgrade:
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      NODES: "ctl-0 ctl-1 ctl-2 worker-0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download + verify Spur binaries (deploy = release, upgrade = nightly)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_TAG: ""
+          UPGRADE_TAG: ""
+        run: |
+          set -euo pipefail
+
+          fetch() {
+            local tag="$1" dest="$2" d
+            d="dl-$dest"
+            mkdir -p "$d"
+            ( cd "$d"
+              gh release download "$tag" --repo ROCm/spur \
+                --pattern '*-linux-amd64.tar.gz' \
+                --pattern '*-linux-amd64.tar.gz.sha256'
+              tarball=$(ls *-linux-amd64.tar.gz)
+              hash=$(awk '{print $1}' "${tarball}.sha256")
+              echo "${hash}  ${tarball}" | sha256sum -c -
+              tar xzf "$tarball"
+              bindir=$(dirname "$(find . -type f -name spurctld | head -1)")
+              mkdir -p "$GITHUB_WORKSPACE/$dest"
+              for b in spur spurctld spurd; do cp "$bindir/$b" "$GITHUB_WORKSPACE/$dest/$b"; done
+              if [ -f "$bindir/spurstepd" ]; then
+                cp "$bindir/spurstepd" "$GITHUB_WORKSPACE/$dest/spurstepd"
+              fi
+              chmod +x "$GITHUB_WORKSPACE/$dest"/*
+            )
+          }
+
+          deploy_tag="${DEPLOY_TAG:-}"
+          if [ -z "$deploy_tag" ]; then
+            deploy_tag=$(gh api repos/ROCm/spur/releases --jq \
+              'map(select(.tag_name != "nightly"))[0].tag_name')
+          fi
+          fetch "$deploy_tag" spur-bin
+          fetch "${UPGRADE_TAG:-nightly}" spur-bin-new
+
+          if [ "$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurd" | awk '{print $1}')" \
+               = "$(sha256sum "$GITHUB_WORKSPACE/spur-bin-new/spurd" | awk '{print $1}')" ]; then
+            echo "::notice::$deploy_tag and nightly ship byte-identical spurd binaries"
+            echo "SPUR_BUILD_IDENTICAL=true" >> "$GITHUB_ENV"
+          fi
+
+          # The mode refuses a busy node with no spurstepd, so a baseline release
+          # predating spurstepd cannot exercise the path. Say so rather than
+          # letting the job assertions fail for the wrong reason.
+          if [ ! -f "$GITHUB_WORKSPACE/spur-bin/spurstepd" ]; then
+            echo "::warning::$deploy_tag ships no spurstepd — in-place will correctly refuse the busy worker"
+            echo "SPUR_NO_STEPD_BASELINE=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Start systemd containers on a docker network
+        env:
+          IMG: jrei/systemd-ubuntu:24.04
+        run: |
+          set -euo pipefail
+          docker network create spur-ci
+          docker pull "$IMG"
+          for n in $NODES; do
+            docker run -d --name "$n" --hostname "$n" \
+              --network spur-ci --privileged --cgroupns=host \
+              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+              "$IMG"
+          done
+
+      - name: Wait for systemd to be ready in every container
+        run: |
+          set -uo pipefail
+          for n in $NODES; do
+            ok=""
+            for i in $(seq 1 30); do
+              st=$(docker exec "$n" systemctl is-system-running 2>/dev/null || true)
+              case "$st" in running|degraded) ok=1; break ;; esac
+              sleep 2
+            done
+            [ -n "$ok" ] || { echo "::error::systemd never became ready in $n (last: ${st:-none})"; exit 1; }
+          done
+
+      - name: Install in-container preflight deps + job-submission user
+        run: |
+          set -euo pipefail
+          for n in $NODES; do
+            docker exec "$n" bash -c 'apt-get update -qq && apt-get install -y -qq curl tar iproute2 python3 sudo'
+            docker exec "$n" useradd -m -s /bin/bash ciuser
+          done
+
+      - name: Install ansible + docker connection plugin
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ansible-core
+          ansible-galaxy collection install community.docker
+
+      - name: deploy.yml (3 ctl + 1 worker, direct transport)
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i inventory/ci-inplace.ini playbooks/deploy.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_verify_enabled=true \
+            -e spur_verify_submit_user=ciuser
+
+      - name: Assert the worker registered and Raft has a leader
+        run: |
+          set -euo pipefail
+          reg=""
+          for i in $(seq 1 30); do
+            docker exec ctl-0 /usr/local/bin/spur show node worker-0 2>/dev/null \
+              | grep -qx "NodeName=worker-0" && { reg=1; break; }
+            sleep 2
+          done
+          [ -n "$reg" ] || { echo "::error::worker-0 never registered"; exit 1; }
+
+          # Same probe rolling_upgrade.yml uses: 200 = leader, 503 = follower.
+          leader=""
+          for i in $(seq 1 30); do
+            for c in ctl-0 ctl-1 ctl-2; do
+              code=$(docker exec "$c" curl -s -o /dev/null -w '%{http_code}' \
+                       http://127.0.0.1:6822/metrics/nodes 2>/dev/null || echo 000)
+              [ "$code" = "200" ] && { leader="$c"; break 2; }
+            done
+            sleep 2
+          done
+          [ -n "$leader" ] || { echo "::error::no Raft leader answered on any controller"; exit 1; }
+          echo "pre-upgrade Raft leader: $leader"
+          echo "CI_PRE_LEADER=$leader" >> "$GITHUB_ENV"
+
+      - name: Submit the job shapes that must survive the swap
+        if: env.SPUR_NO_STEPD_BASELINE != 'true'
+        run: |
+          set -euo pipefail
+          # sbatch plus a detached plain srun step — two different paths through
+          # spurstepd, both of which must ride out the restart.
+          batch_jid=$(docker exec -u ciuser -w /home/ciuser ctl-0 bash -c '
+            set -e
+            printf "#!/bin/bash\n#SBATCH --job-name=inplace-batch\nsleep 900\n" > /tmp/ci-inplace-batch.sh
+            b=$(/usr/local/bin/spur submit -w worker-0 /tmp/ci-inplace-batch.sh | grep -oE "[0-9]+" | head -1)
+            setsid /usr/local/bin/srun -w worker-0 sleep 900 >/tmp/ci-inplace-srun.log 2>&1 < /dev/null &
+            echo "$b"
+          ' | tail -1)
+
+          # Both must really be RUNNING first, or surviving proves nothing.
+          running=0
+          for i in $(seq 1 60); do
+            running=$(docker exec ctl-0 /usr/local/bin/spur queue 2>/dev/null | grep -cE "RUNNING" || true)
+            [ "$running" -ge 2 ] && break
+            sleep 2
+          done
+          [ "$running" -ge 2 ] \
+            || { echo "::error::expected 2 RUNNING jobs before the upgrade, got $running"; \
+                 docker exec ctl-0 /usr/local/bin/spur queue; exit 1; }
+
+          echo "CI_INPLACE_BATCH_JID=$batch_jid" >> "$GITHUB_ENV"
+          docker exec worker-0 pgrep -x spurstepd | sort > /tmp/ci-inplace.stepd-before
+          echo "spurstepd before: $(tr '\n' ' ' < /tmp/ci-inplace.stepd-before)"
+
+      - name: Start sampling worker-0's node state (proves it is never drained)
+        if: env.SPUR_NO_STEPD_BASELINE != 'true'
+        run: |
+          # Before/after assertions cannot catch a drain+resume pair, so sample
+          # continuously for the whole duration of the playbook run instead.
+          nohup bash -c '
+            while true; do
+              docker exec ctl-0 /usr/local/bin/spur show node worker-0 2>/dev/null \
+                | grep -oE "State=[A-Z+]+" | head -1 >> /tmp/ci-inplace.states
+              sleep 1
+            done
+          ' >/dev/null 2>&1 &
+          echo $! > /tmp/ci-inplace.sampler.pid
+
+      - name: rolling_upgrade.yml -e spur_in_place_upgrade=true
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          set -o pipefail
+          ansible-playbook -i inventory/ci-inplace.ini playbooks/rolling_upgrade.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin \
+            -e spur_home=/opt/spur \
+            -e spur_in_place_upgrade=true \
+            2>&1 | tee /tmp/ci-inplace.ansible.log
+
+      - name: Stop sampling
+        if: always()
+        run: |
+          if [ -f /tmp/ci-inplace.sampler.pid ]; then
+            kill "$(cat /tmp/ci-inplace.sampler.pid)" 2>/dev/null || true
+          fi
+
+      - name: Assert worker-0 was NEVER drained
+        if: env.SPUR_NO_STEPD_BASELINE != 'true'
+        run: |
+          set -euo pipefail
+          [ -s /tmp/ci-inplace.states ] \
+            || { echo "::error::no node-state samples collected — this assertion would be vacuous"; exit 1; }
+          echo "samples: $(wc -l < /tmp/ci-inplace.states), distinct: $(sort -u /tmp/ci-inplace.states | tr '\n' ' ')"
+          if grep -qE 'State=(DRAIN|DRAINING|DRAINED)' /tmp/ci-inplace.states; then
+            echo "::error::worker-0 entered a drained state during an in-place upgrade"
+            sort -u /tmp/ci-inplace.states
+            exit 1
+          fi
+          # It must also not have issued a RESUME it had no business issuing.
+          if grep -q 'State=RESUME' /tmp/ci-inplace.ansible.log; then
+            echo "::error::in-place run issued a State=RESUME undrain"; exit 1
+          fi
+          echo "PASS: worker-0 never drained, no RESUME issued"
+
+      - name: Assert the Raft leader was upgraded last
+        run: |
+          set -euo pipefail
+          # The play header does not list its hosts, so read the per-host task
+          # order from the log: the leader must be the last controller touched.
+          last=$(grep -oE '^(ok|changed): \[ctl-[0-9]\]' /tmp/ci-inplace.ansible.log \
+                   | grep -oE 'ctl-[0-9]' | tail -1)
+          [ -n "$last" ] || { echo "::error::could not determine controller order from the log"; exit 1; }
+          [ "$last" = "$CI_PRE_LEADER" ] \
+            || { echo "::error::leader was $CI_PRE_LEADER but last controller upgraded was $last"; exit 1; }
+          echo "PASS: leader $CI_PRE_LEADER upgraded last"
+
+      - name: Assert jobs survived, worker upgraded, cluster still writable
+        if: env.SPUR_NO_STEPD_BASELINE != 'true'
+        run: |
+          set -euo pipefail
+          running=$(docker exec ctl-0 /usr/local/bin/spur queue 2>/dev/null | grep -cE "RUNNING" || true)
+          [ "$running" -ge 2 ] \
+            || { echo "::error::expected 2 jobs still RUNNING after the upgrade, got $running"; \
+                 docker exec ctl-0 /usr/local/bin/spur queue; exit 1; }
+
+          after=$(docker exec worker-0 pgrep -x spurstepd | sort)
+          before=$(cat /tmp/ci-inplace.stepd-before)
+          [ "$after" = "$before" ] \
+            || { echo "::error::spurstepd identity changed (before: $before / after: $after)"; exit 1; }
+
+          docker exec worker-0 systemctl is-active spurd | grep -qx active \
+            || { echo "::error::spurd not active on worker-0"; exit 1; }
+
+          old_sum=$(sha256sum "$GITHUB_WORKSPACE/spur-bin/spurd" | awk '{print $1}')
+          new_sum=$(docker exec worker-0 sha256sum /usr/local/bin/spurd | awk '{print $1}')
+          if [ "$new_sum" = "$old_sum" ] && [ "${SPUR_BUILD_IDENTICAL:-}" != "true" ]; then
+            echo "::error::worker-0's spurd was not actually upgraded"; exit 1
+          fi
+
+          # A quorum that lost replication would accept no writes at all.
+          docker exec -u ciuser ctl-0 /usr/local/bin/spur cancel "$CI_INPLACE_BATCH_JID" \
+            || { echo "::error::cluster refused a write after the controller phase"; exit 1; }
+          echo "PASS: jobs survived under the same spurstepd, worker upgraded, cluster writable"
+
+      - name: Assert in-place is mutually exclusive with force
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          if ansible-playbook -i inventory/ci-inplace.ini playbooks/rolling_upgrade.yml \
+              -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+              -e spur_install_dir=/usr/local/bin \
+              -e spur_home=/opt/spur \
+              -e spur_in_place_upgrade=true \
+              -e spur_force_upgrade_busy_agents=true; then
+            echo "::error::should have refused two busy-node strategies at once"; exit 1
+          fi
+          echo "PASS: refused spur_in_place_upgrade + spur_force_upgrade_busy_agents"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          for n in $NODES; do
+            echo "===== $n journal (spur*) ====="
+            docker exec "$n" bash -c 'journalctl -u "spur*" --no-pager | tail -50' || true
+          done
+          echo "===== sampled node states ====="
+          sort -u /tmp/ci-inplace.states 2>/dev/null || true
 
       - name: Teardown containers
         if: always()
