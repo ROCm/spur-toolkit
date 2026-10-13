@@ -46,6 +46,30 @@ tasks, and combine independent probes without removing safety barriers.
 - HA mesh setup reuses the public keys already read during init/join, removing
   another remote key read and a fact-publication pass across every member.
 
+## Agent provisioning consolidation
+
+Agent configuration now uses one remote module invocation for the CLI environment,
+configuration file, systemd unit, private supervisor-state directory, and MPI
+plugin. Templates are still rendered by Ansible. Existing configuration remains
+untouched unless overwrite is requested; managed files are replaced atomically
+only when their contents differ, and required permissions are reconciled.
+Environment updates preserve unrelated lines. File symlinks retain the original
+lineinfile/template behavior, and check mode reports changes without writing.
+
+Local-build installation includes the optional MPI plugin in the shared binary
+archive. Agents copy it from that staged file to the configured plugin directory,
+avoiding a separate upload per host. An absent plugin remains optional; a plugin
+that was selected for staging but is missing remotely fails before configuration.
+Upstream-installer layouts and disabled MPI remain supported.
+
+Cgroup validation still precedes configuration, and deployment still restarts
+selected agents even if every file is already current. Drain/kill/skip decisions,
+registration checks, binary verification, and test-job coverage are unchanged.
+The new module has six filesystem regression tests; the existing mixed-source
+installation fixture now exercises the consolidated configuration task. CI also
+introduces file drift and asserts that deployment repairs it, preserves unrelated
+environment settings, retains an unchanged unit's inode, and restarts the daemon.
+
 ## Boundaries deliberately retained
 
 Fresh provisioning still needs package installation, file transfers, permissions,
@@ -87,10 +111,10 @@ connections and fixture commands replacing live services. Coverage includes:
 
 All existing CI job commands/assertions remain. A healthcheck container smoke
 test is added to `integration-conf`; a compatibility job runs the local suite on
-Ansible 2.17 and 2.19 alongside the existing default-version lint job. All hosted CI jobs remain pending execution. The lab validation below is
-separate from the deterministic fixture suite.
+Ansible 2.17 and 2.19 alongside the existing default-version lint job. The lab
+validation below is separate from the deterministic fixture suite.
 
-The final local suite passes all 32 tests on Ansible 2.17 and 2.19; all nine
+The final local suite passes all 38 tests on Ansible 2.17 and 2.19; all nine
 playbooks also pass syntax checks on both versions.
 
 ## Additional regression coverage

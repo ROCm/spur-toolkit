@@ -86,11 +86,18 @@ class FleetHelpers(unittest.TestCase):
             targets["upstream"] = dict(spec, source="")
             with patch.object(artifacts, "digest", wraps=artifacts.digest) as hashed:
                 result = artifacts.prepare_install(targets, Path(directory) / "cache")
-            self.assertEqual(hashed.call_count, 7)
+            self.assertEqual(hashed.call_count, 9)
             self.assertEqual(result["bundles_built"], 4)
             self.assertEqual(
                 set(result["artifacts"]["dual"]["manifest"]),
-                {"spur", "spurctld", "spurd", "spurstepd", "spurauthd"},
+                {
+                    "spur",
+                    "spurctld",
+                    "spurd",
+                    "spurstepd",
+                    "spurauthd",
+                    "spur_mpi_pmix.so",
+                },
             )
             self.assertEqual(
                 set(result["artifacts"]["login"]["manifest"]), {"spur", "spurauthd"}
@@ -663,7 +670,15 @@ class LocalPlaybooks(unittest.TestCase):
                 spur_binary_src=str(src),
                 spur_install_dir=str(install),
                 spur_mpi_plugin_dir=str(plugin),
+                spur_home=str(install),
+                spur_agent_state_dir=str(install / "state"),
+                spur_controller_endpoints=["http://controller:6817"],
+                spur_agent_listen_ip="127.0.0.1",
+                spur_node_name=name,
+                spur_agent_port=6818,
+                spur_log_level="info",
             )
+            (install / "etc").mkdir()
         self.inventory_file(hosts, agents=["worker", "second"])
         tasks = yaml.safe_load(
             (ANSIBLE / "roles/spur_install/tasks/main.yml").read_text()
@@ -677,11 +692,13 @@ class LocalPlaybooks(unittest.TestCase):
         chosen = [t for t in tasks if t["name"] in names]
         self.assertEqual(len(chosen), len(names))
         mpi = yaml.safe_load((ANSIBLE / "roles/spur_agent/tasks/main.yml").read_text())
-        mpi_names = [
-            "Reuse the MPI source discovered during installation",
-            "Install MPI plugin from spur_binary_src",
-        ]
-        mpi_tasks = [t for t in mpi if t["name"] in mpi_names]
+        mpi_tasks = [t for t in mpi if "spur_configure_agent" in t]
+        self.assertEqual(len(mpi_tasks), 1)
+        mpi_tasks[0]["spur_configure_agent"].update(
+            environment_file="{{ spur_home }}/environment",
+            unit_file="{{ spur_home }}/spurd.service",
+        )
+        (self.root / "templates").symlink_to(ANSIBLE / "roles/spur_agent/templates")
         playbook = self.root / "install.yml"
         playbook.write_text(
             yaml.safe_dump(

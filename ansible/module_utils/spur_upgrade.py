@@ -150,8 +150,11 @@ def prepare_install(targets, cache_dir):
             if spec["auth"] and (source / "spurauthd").is_file():
                 names.append("spurauthd")
             plugin = mpi_source(source) if "agent" in roles and spec["mpi"] else None
+            files = {name: source / name for name in names}
+            if plugin:
+                files["spur_mpi_pmix.so"] = plugin
             prepared_specs[key] = dict(
-                builder.bundle({name: source / name for name in names}),
+                builder.bundle(files),
                 mpi_source=str(plugin) if plugin else "",
             )
         artifacts[host] = prepared_specs[key]

@@ -1264,6 +1264,15 @@ jobs:
           done
           echo "sentinel written to spur.conf on ctl-0 and gpu-1"
 
+      - name: Seed agent file drift before deployment convergence
+        run: |
+          set -euo pipefail
+          docker exec gpu-1 sh -c 'echo CI_ENV_SENTINEL=keep >> /etc/environment'
+          docker exec gpu-1 chmod 0755 /opt/spur/agent-state
+          docker exec gpu-1 sh -c 'printf stale > /usr/lib/spur/spur_mpi_pmix.so'
+          docker exec gpu-1 stat -c %i /etc/systemd/system/spurd.service > /tmp/ci-unit-inode
+          docker exec gpu-1 systemctl show spurd -p MainPID --value > /tmp/ci-agent-pid
+
       - name: deploy.yml (default — spur.conf must be preserved on controller and agent)
         working-directory: ansible
         env:
@@ -1275,6 +1284,19 @@ jobs:
             -e spur_home=/opt/spur \
             -e spur_drain_wait_secs=10 \
             -e spur_verify_enabled=false
+
+      - name: Assert deployment repairs drift and restarts without rewriting unchanged unit
+        run: |
+          set -euo pipefail
+          docker exec gpu-1 grep -qx CI_ENV_SENTINEL=keep /etc/environment
+          test "$(docker exec gpu-1 stat -c %a /opt/spur/agent-state)" = 700
+          test "$(docker exec gpu-1 stat -c %a /usr/lib/spur/spur_mpi_pmix.so)" = 755
+          expected=$(sha256sum spur-bin-new/spur_mpi_pmix.so | cut -d ' ' -f1)
+          actual=$(docker exec gpu-1 sha256sum /usr/lib/spur/spur_mpi_pmix.so | cut -d ' ' -f1)
+          test "$actual" = "$expected"
+          test "$(docker exec gpu-1 stat -c %i /etc/systemd/system/spurd.service)" = "$(cat /tmp/ci-unit-inode)"
+          test "$(docker exec gpu-1 systemctl show spurd -p MainPID --value)" != "$(cat /tmp/ci-agent-pid)"
+          docker exec gpu-1 systemctl is-active --quiet spurd
 
       - name: Assert deploy.yml did NOT overwrite spur.conf on ctl-0 or gpu-1 (sentinel must still be present)
         run: |

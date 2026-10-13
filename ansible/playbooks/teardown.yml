@@ -141,7 +141,7 @@
       ansible.builtin.include_tasks: tasks/kill_workload_processes.yml
       when: spur_ok_to_disrupt
 
-    - name: Stop systemd services and reap daemons started outside systemd
+    - name: Stop and disable Spur systemd services
       ansible.builtin.shell: |
         systemctl disable --now spurd spurctld spurdbd spurauthd 2>&1 || true
         pkill -x spurd 2>/dev/null || true

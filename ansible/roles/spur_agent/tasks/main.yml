@@ -66,114 +66,25 @@
     - (spur_cgroup_v2_probe.stdout | default('OK') | trim) != 'OK'
     - not ((spur_cgroup_require_v2 | default(false) | bool) or (spur_cgroup_required | default(false) | bool))
 
-# Every agent gets the CLI now (spur_install always installs it), so this is
-# unconditional — CLI on agents must target the controller over the same
-# transport spurd uses (mesh IP under wireguard), not the node's own underlay
-# IP left over from a prior run.
-- name: Set SPUR_CONTROLLER_ADDR in /etc/environment (every agent has the CLI)
-  ansible.builtin.lineinfile:
-    path: /etc/environment
-    regexp: '^SPUR_CONTROLLER_ADDR='
-    line: "SPUR_CONTROLLER_ADDR={{ spur_controller_endpoints | join(',') }}"
-    create: true
-
-- name: Ensure MPI plugin directory exists
-  ansible.builtin.file:
-    path: "{{ spur_mpi_plugin_dir }}"
-    state: directory
-    mode: "0755"
-  when: spur_mpi_plugin_enabled | default(true) | bool
-
-- name: Reuse the MPI source discovered during installation
-  ansible.builtin.set_fact:
-    spur_mpi_plugin_src: "{{ hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].mpi_source }}"
-  when:
-    - spur_mpi_plugin_enabled | default(true) | bool
-    - spur_binary_src | default('') | length > 0
-
-- name: Install MPI plugin from spur_binary_src
-  ansible.builtin.copy:
-    src: "{{ spur_mpi_plugin_src }}"
-    dest: "{{ spur_mpi_plugin_dir }}/spur_mpi_pmix.so"
-    mode: "0755"
-  when:
-    - spur_mpi_plugin_enabled | default(true) | bool
-    - spur_mpi_plugin_src | default('') | length > 0
-
-# Stat-then-copy merged into one shell (agent-local, no delegate_to) to cut a
-# round-trip — copy has no "only if source exists" guard of its own.
-- name: Install MPI plugin from install.sh layout to {{ spur_mpi_plugin_dir }} (if present)
-  ansible.builtin.shell: |
-    set -e
-    src="{{ spur_install_dir | regex_replace('/[^/]+$', '') }}/lib/spur/spur_mpi_pmix.so"
-    dest="{{ spur_mpi_plugin_dir }}/spur_mpi_pmix.so"
-    if [ ! -f "$src" ]; then
-      echo "RESULT=NOT_FOUND"
-    elif cmp -s "$src" "$dest" 2>/dev/null; then
-      echo "RESULT=UNCHANGED"
-    else
-      install -m 0755 "$src" "$dest"
-      echo "RESULT=INSTALLED"
-    fi
-  args:
-    executable: /bin/bash
-  register: spur_mpi_install_sh_copy
-  changed_when: "'RESULT=INSTALLED' in spur_mpi_install_sh_copy.stdout"
-  when:
-    - spur_mpi_plugin_enabled | default(true) | bool
-    - spur_binary_src | default('') | length == 0
-
-- name: Note MPI plugin not found (PMIx jobs will fail until installed)
-  ansible.builtin.debug:
-    msg: >-
-      spur_mpi_pmix.so not found for {{ inventory_hostname }} —
-      skipping MPI plugin install (set spur_mpi_plugin_enabled=false to silence).
-  when:
-    - spur_mpi_plugin_enabled | default(true) | bool
-    - spur_mpi_plugin_src | default('') | length == 0
-    - >-
-      (spur_binary_src | default('') | length > 0)
-      or (
-        spur_binary_src | default('') | length == 0
-        and 'RESULT=NOT_FOUND' in (spur_mpi_install_sh_copy.stdout | default(''))
-      )
-
-# spurd loads spur.conf best-effort at startup (missing file is fine) — of
-# what it reads (cluster identity, [cluster]/k0s, [devices]/GRES), this
-# role's own template only renders cluster identity + [cluster], not the
-# controller's full fleet-wide file. Rendering N agents' worth of the
-# [[nodes]]/[[partitions]] loop, once per agent, doesn't scale (O(N^2) across
-# a large fleet) and the content would be dead weight on an agent anyway.
-#
-# Respect an existing file unless the operator asks to re-render it — same
-# opt-in as rolling_upgrade.yml's spur_overwrite_conf for the controller.
-# force: no is template's own write-if-missing primitive, so this needs no
-# separate stat call (and no unreachable-result guard to hand-write for one).
-- name: Write spur.conf on the agent
-  ansible.builtin.template:
-    src: spur.conf.j2
-    dest: "{{ spur_home }}/etc/spur.conf"
-    mode: "0644"
-    force: "{{ spur_overwrite_conf | default(false) | bool }}"
-
-# Supervisor sessions live in a runtime/ subdirectory of this path. spurd
-# creates it on demand, but pre-creating it 0700 keeps a session descriptor
-# (which carries the job's environment) off a loose umask, and makes the
-# directory visible to healthcheck/teardown before the first job ever runs.
-- name: Ensure the agent's own runtime state directory exists
-  ansible.builtin.file:
-    path: "{{ spur_agent_state_dir }}"
-    state: directory
-    mode: "0700"
-
-- name: Install spurd systemd unit
-  # WorkingDirectory in the unit is {{ spur_home }} so job stdout (spur-<N>.out)
-  # always lands there regardless of where the daemon was launched from.
-  ansible.builtin.template:
-    src: spurd.service.j2
-    dest: /etc/systemd/system/spurd.service
-    mode: "0644"
-  register: spurd_unit
+- name: Configure agent files and install the staged MPI plugin
+  spur_configure_agent:
+    environment_file: /etc/environment
+    controller_endpoints: "{{ spur_controller_endpoints }}"
+    config_file: "{{ spur_home }}/etc/spur.conf"
+    config_content: "{{ lookup('ansible.builtin.template', 'spur.conf.j2') }}"
+    overwrite_config: "{{ spur_overwrite_conf | default(false) | bool }}"
+    state_dir: "{{ spur_agent_state_dir }}"
+    unit_file: /etc/systemd/system/spurd.service
+    unit_content: "{{ lookup('ansible.builtin.template', 'spurd.service.j2') }}"
+    mpi_enabled: "{{ spur_mpi_plugin_enabled | default(true) | bool }}"
+    mpi_dir: "{{ spur_mpi_plugin_dir }}"
+    mpi_source_required: "{{ spur_binary_src | default('') | length > 0 }}"
+    mpi_source: >-
+      {{ (spur_install_dir ~ '/spur_mpi_pmix.so')
+         if (spur_binary_src | default('') | length > 0 and
+             hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].mpi_source | length > 0)
+         else ((spur_install_dir | regex_replace('/[^/]+$', '')) ~ '/lib/spur/spur_mpi_pmix.so')
+         if spur_binary_src | default('') | length == 0 else '' }}
 
 # Restart + wait-for-listen merged into one shell (agent-local) to cut a
 # round-trip. Poll across the add-node bootstrap window: the reconcile can
