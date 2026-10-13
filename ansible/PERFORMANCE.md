@@ -37,6 +37,9 @@ tasks, and combine independent probes without removing safety barriers.
 - Verification, including the in-place activation path, uses one `show node` query per batch, rather than one delegated
   query per agent. Failed snapshots clear previous state instead of reporting
   stale registrations. Retryable query failures share the configured deadline.
+- Binary activation writes temporary executables only for changed files.
+  Unchanged reruns still hash installed and running binaries and validate every
+  archive member, but avoid writing and deleting duplicate binaries per host.
 - Authentication's clock, NSS and binary checks share one read-only remote call.
   Time-sync/NSS warnings and the missing-binary failure remain, including in
   check mode. Key distribution and coordinated service startup remain separate.
@@ -78,12 +81,17 @@ connections and fixture commands replacing live services. Coverage includes:
   configuration, informative readiness errors, and early refusal of unhealthy
   existing services without re-provisioning or changing their binaries;
 - ordinary agent failures with serial batches of one and two: strict aborts,
-  opt-in continuation through later batches, and a nonzero final result.
+  opt-in continuation through later batches, and a nonzero final result;
+- unchanged activation without temporary binary writes, and rejection of corrupt
+  archive bytes even when every installed binary already matches the manifest.
 
 All existing CI job commands/assertions remain. A healthcheck container smoke
 test is added to `integration-conf`; a compatibility job runs the local suite on
 Ansible 2.17 and 2.19 alongside the existing default-version lint job. All hosted CI jobs remain pending execution. The lab validation below is
 separate from the deterministic fixture suite.
+
+The final local suite passes all 32 tests on Ansible 2.17 and 2.19; all nine
+playbooks also pass syntax checks on both versions.
 
 ## Additional regression coverage
 
@@ -103,6 +111,8 @@ idle cleanup does not expand controller reconciliation tasks.
 ## Live validation
 
 The scale fixture had three HA controllers, 200 workers and 100 running jobs.
+These measurements precede the additional reduction in temporary binary writes;
+that change has local regression coverage but has not been timed on the fleet.
 An unchanged-binary in-place rerun took 5m32s with the original inventory order
 and 3m00s with hosts interleaved across the four physical machines, using the
 same batch size of 200 and 40 forks. Staging fell from 139s to 73s and activation

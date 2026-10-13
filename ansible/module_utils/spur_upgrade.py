@@ -1,5 +1,6 @@
 """Artifact preparation and activation for an already provisioned Spur host."""
 
+from contextlib import ExitStack
 import gzip
 import hashlib
 import io
@@ -355,20 +356,26 @@ def activate(
                         "Only regular files are allowed in upgrade archives"
                     )
                 dest = destinations[member.name]
-                fd, temporary = tempfile.mkstemp(
-                    dir=dest.parent, prefix=".spur-upgrade-"
-                )
-                staged[member.name] = temporary
                 checksum = hashlib.sha256()
-                with os.fdopen(fd, "wb") as out, tar.extractfile(member) as source:
+                with ExitStack() as stack:
+                    source = stack.enter_context(tar.extractfile(member))
+                    out = None
+                    if digest(dest) != manifest[member.name]:
+                        fd, temporary = tempfile.mkstemp(
+                            dir=dest.parent, prefix=".spur-upgrade-"
+                        )
+                        staged[member.name] = temporary
+                        out = stack.enter_context(os.fdopen(fd, "wb"))
+                        replacements.append(member.name)
+                    # Validate every archive member, but write only changed files.
                     for chunk in iter(lambda: source.read(1024 * 1024), b""):
                         checksum.update(chunk)
-                        out.write(chunk)
-                    os.fchmod(out.fileno(), 0o755)
+                        if out is not None:
+                            out.write(chunk)
+                    if out is not None:
+                        os.fchmod(out.fileno(), 0o755)
                 if checksum.hexdigest() != manifest[member.name]:
                     raise ValueError("Archive checksum mismatch: %s" % member.name)
-                if digest(dest) != manifest[member.name]:
-                    replacements.append(member.name)
         if check:
             return {
                 "changed": bool(
@@ -378,7 +385,7 @@ def activate(
                 )
             }
         # Catch an incompatible executable before changing the installed service.
-        version_output = command([staged[daemon], "-V"])
+        version_output = command([staged.get(daemon, str(destinations[daemon])), "-V"])
         if not version_output:
             raise ValueError("Target daemon did not report its version")
         version = version_output.splitlines()[0]

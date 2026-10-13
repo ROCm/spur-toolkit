@@ -8,6 +8,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -251,6 +252,56 @@ class UpgradeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                 upgrade.activate(**args)
         self.assertEqual((install / "spurd").read_bytes(), before)
+        self.assertEqual(list(install.glob(".spur-upgrade-*")), [])
+
+    def test_unchanged_activation_does_not_write_temporary_binaries(self):
+        install, state, args = self.activation_fixture()
+        shutil.copyfile(self.source / "spurd", install / "spurd")
+        with (
+            patch.object(upgrade, "service", return_value=state),
+            patch.object(
+                upgrade, "running_digest", return_value=args["manifest"]["spurd"]
+            ),
+            patch.object(
+                upgrade, "process_args", return_value=["spurd", "--hostname=worker"]
+            ),
+            patch.object(
+                upgrade, "command", return_value="fixture version"
+            ) as commands,
+            patch.object(upgrade, "wait_ready", return_value=state),
+            patch.object(
+                upgrade.tempfile, "mkstemp", wraps=tempfile.mkstemp
+            ) as temporary,
+        ):
+            result = upgrade.activate(**args)
+        self.assertFalse(result["changed"])
+        temporary.assert_not_called()
+        commands.assert_called_once_with([str(install / "spurd"), "-V"])
+
+    def test_unchanged_install_still_rejects_corrupt_archive_bytes(self):
+        install, state, args = self.activation_fixture()
+        shutil.copyfile(self.source / "spurd", install / "spurd")
+        (self.source / "spurstepd").write_text("corrupted archive member")
+        with tarfile.open(args["archive"], "w:gz") as archive:
+            for name in args["manifest"]:
+                archive.add(self.source / name, arcname=name)
+        with (
+            patch.object(upgrade, "service", return_value=state),
+            patch.object(
+                upgrade, "running_digest", return_value=args["manifest"]["spurd"]
+            ),
+            patch.object(
+                upgrade, "process_args", return_value=["spurd", "--hostname=worker"]
+            ),
+            patch.object(upgrade, "command") as commands,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "Archive checksum mismatch: spurstepd"
+            ):
+                upgrade.activate(**args)
+        commands.assert_not_called()
+        for name, checksum in args["manifest"].items():
+            self.assertEqual(upgrade.digest(install / name), checksum)
         self.assertEqual(list(install.glob(".spur-upgrade-*")), [])
 
     def test_auth_mint_restarts_before_agent_and_incomplete_units_request_provisioning(
