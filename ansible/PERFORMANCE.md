@@ -62,6 +62,12 @@ avoiding a separate upload per host. An absent plugin remains optional; a plugin
 that was selected for staging but is missing remotely fails before configuration.
 Upstream-installer layouts and disabled MPI remain supported.
 
+An unchanged archive is not proof that installed files still match it: an
+in-place upgrade may have replaced those files since the last deployment.
+Installation checks their hashes against the prepared manifest in its existing
+remote call and re-extracts a cached archive when files differ or are missing.
+The mixed-source fixture covers this transition and damaged staged MPI files.
+
 Cgroup validation still precedes configuration, and deployment still restarts
 selected agents even if every file is already current. Drain/kill/skip decisions,
 registration checks, binary verification, and test-job coverage are unchanged.

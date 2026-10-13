@@ -720,6 +720,20 @@ class LocalPlaybooks(unittest.TestCase):
         output = self.run_play(playbook)
         self.assertRegex(output, r"worker\s+: ok=\d+\s+changed=0")
 
+        archive = next((self.root / "worker").glob(".bins-*.tar.gz"))
+        archive_inode = archive.stat().st_ino
+        (self.root / "worker/spurd").write_text("older build activated in place")
+        (self.root / "second/spurd").unlink()
+        (self.root / "worker/spur_mpi_pmix.so").write_text("damaged staged plugin")
+        self.run_play(playbook)
+        self.assertEqual((self.root / "worker/spurd").read_text(), "first spurd")
+        self.assertEqual((self.root / "second/spurd").read_text(), "second spurd")
+        self.assertEqual(
+            (self.root / "worker/spur_mpi_pmix.so").read_text(),
+            "first libspur_mpi_pmix.so",
+        )
+        self.assertEqual(archive.stat().st_ino, archive_inode)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1269,6 +1269,7 @@ jobs:
           set -euo pipefail
           docker exec gpu-1 sh -c 'echo CI_ENV_SENTINEL=keep >> /etc/environment'
           docker exec gpu-1 chmod 0755 /opt/spur/agent-state
+          docker exec gpu-1 sh -c 'cp /bin/true /usr/local/bin/spurd.ci-drift; mv /usr/local/bin/spurd.ci-drift /usr/local/bin/spurd'
           docker exec gpu-1 sh -c 'printf stale > /usr/lib/spur/spur_mpi_pmix.so'
           docker exec gpu-1 stat -c %i /etc/systemd/system/spurd.service > /tmp/ci-unit-inode
           docker exec gpu-1 systemctl show spurd -p MainPID --value > /tmp/ci-agent-pid
@@ -1293,6 +1294,9 @@ jobs:
           test "$(docker exec gpu-1 stat -c %a /usr/lib/spur/spur_mpi_pmix.so)" = 755
           expected=$(sha256sum spur-bin-new/spur_mpi_pmix.so | cut -d ' ' -f1)
           actual=$(docker exec gpu-1 sha256sum /usr/lib/spur/spur_mpi_pmix.so | cut -d ' ' -f1)
+          test "$actual" = "$expected"
+          expected=$(sha256sum spur-bin-new/spurd | cut -d ' ' -f1)
+          actual=$(docker exec gpu-1 sha256sum /usr/local/bin/spurd | cut -d ' ' -f1)
           test "$actual" = "$expected"
           test "$(docker exec gpu-1 stat -c %i /etc/systemd/system/spurd.service)" = "$(cat /tmp/ci-unit-inode)"
           test "$(docker exec gpu-1 systemctl show spurd -p MainPID --value)" != "$(cat /tmp/ci-agent-pid)"
