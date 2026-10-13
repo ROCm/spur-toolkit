@@ -1,8 +1,8 @@
 ---
 # Rolling upgrade of an ALREADY-RUNNING Spur cluster — one host at a time (agents
 # drained first), so the cluster keeps scheduling and running jobs throughout.
-# Local in-place upgrades use a binary-only path; configuration upgrades reuse
-# deploy.yml's roles, batched with `serial` and the selected job-safety policy.
+# Local in-place upgrades pre-stage bundles and reuse deploy.yml's roles,
+# batched with `serial` and the selected job-safety policy.
 #
 # Use deploy.yml instead when: doing a fresh install, changing topology (adding/
 # removing hosts, migrating off a pre-merge spurdbd deployment), or when a brief
@@ -219,7 +219,7 @@
          spur_in_place_upgrade | default(false) | bool] | select | list | length > 1
 
 # Preparation runs outside serial plays so artifacts and target metadata are shared.
-- name: Prepare and stage binary-only upgrades
+- name: Prepare and stage local in-place upgrades
   hosts: spur_controllers:spur_agents
   become: true
   gather_facts: false
@@ -251,17 +251,7 @@
     - name: Record the hosts targeted by this upgrade
       ansible.builtin.set_fact:
         spur_verify_targeted_hosts: "{{ ansible_play_hosts_all }}"
-        ru_configuration_hosts: >-
-          {%- set ns = namespace(hosts=[], controller_config=false) -%}
-          {%- for name in ansible_play_hosts_all -%}
-          {%- if name not in hostvars['localhost'].ru_prepared.artifacts -%}
-          {%- set ns.hosts = ns.hosts + [name] -%}
-          {%- if name in groups['spur_controllers'] -%}
-          {%- set ns.controller_config = true -%}
-          {%- endif -%}
-          {%- endif -%}
-          {%- endfor -%}
-          {{ ansible_play_hosts_all if ns.controller_config else ns.hosts }}
+        ru_configuration_hosts: "{{ ansible_play_hosts_all }}"
       delegate_to: "{{ groups['spur_controllers'][0] }}"
       delegate_facts: true
       run_once: true  # noqa run-once -- this play explicitly uses linear strategy
@@ -400,7 +390,7 @@
            if (groups['spur_raft_leader'] | default([]) | length) == 1
            else groups['spur_controllers']) }}
   become: true
-  # The binary path needs no setup facts; the full path reuses the earlier gather.
+  # Both upgrade paths reuse the earlier configuration fact gather.
   gather_facts: no
   serial: 1
   max_fail_percentage: 0

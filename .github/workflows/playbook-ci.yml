@@ -82,12 +82,14 @@ on:
       - 'tests/ansible/**'
       - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
+      - '.github/scripts/upgrade_convergence.py'
   pull_request:
     paths:
       - 'ansible/**'
       - 'tests/ansible/**'
       - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
+      - '.github/scripts/upgrade_convergence.py'
 
 permissions:
   contents: read
@@ -2257,6 +2259,9 @@ jobs:
           ' >/dev/null 2>&1 &
           echo $! > /tmp/ci-inplace.sampler.pid
 
+      - name: Introduce unit, environment, symlink and PMIx drift before in-place upgrade
+        run: python3 .github/scripts/upgrade_convergence.py before "$GITHUB_WORKSPACE/spur-bin-new"
+
       - name: rolling_upgrade.yml -e spur_in_place_upgrade=true
         working-directory: ansible
         env:
@@ -2269,6 +2274,9 @@ jobs:
             -e spur_home=/opt/spur \
             -e spur_in_place_upgrade=true \
             2>&1 | tee /tmp/ci-inplace.ansible.log
+
+      - name: Verify all target artifacts and systemd convergence after in-place upgrade
+        run: python3 .github/scripts/upgrade_convergence.py after "$GITHUB_WORKSPACE/spur-bin-new"
 
       - name: Stop sampling
         if: always()
@@ -3253,6 +3261,32 @@ jobs:
           docker exec ctl-0 grep -q 'plugin = "spur"' /opt/spur/etc/spur.conf || { echo "::error::controller not on native plugin"; exit 1; }
           docker exec gpu-1 grep -q 'plugin = "spur"' /opt/spur/etc/spur.conf || { echo "::error::agent not on native plugin"; exit 1; }
           echo "PASS: both daemons on plugin=spur"
+
+      - name: Prepare distinct target artifacts and native-auth provisioning drift
+        run: |
+          set -euo pipefail
+          cp -a spur-bin spur-bin-upgrade
+          # Trailing ELF bytes change every checksum without changing executable behavior.
+          for b in spur spurctld spurd spurstepd spurauthd; do
+            printf '\nci-upgrade-artifact\n' >> "spur-bin-upgrade/$b"
+          done
+          # This fixture tests .so delivery; MPI execution has separate coverage.
+          printf 'int ci_pmix_fixture(void) { return 1; }\n' | cc -shared -fPIC -x c - -o spur-bin-upgrade/spur_mpi_pmix.so
+          python3 .github/scripts/upgrade_convergence.py before "$GITHUB_WORKSPACE/spur-bin-upgrade" --auth
+
+      - name: In-place upgrade reconciles native auth and all target artifacts
+        working-directory: ansible
+        run: |
+          ansible-playbook -i "$AUTH_INV" playbooks/rolling_upgrade.yml \
+            -e @inventory/group_vars/all.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-upgrade" \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
+            -e spur_accounting_enabled=false -e spur_auth_enabled=true \
+            -e spur_in_place_upgrade=true -e spur_overwrite_conf=false \
+            -e spur_verify_enabled=true -e spur_verify_submit_user=ciuser
+
+      - name: Assert native auth, all binaries, PMIx and systemd were reconciled
+        run: python3 .github/scripts/upgrade_convergence.py after "$GITHUB_WORKSPACE/spur-bin-upgrade" --auth
 
       - name: Assert RBAC — normal user denied drain, admin (root) allowed
         run: |

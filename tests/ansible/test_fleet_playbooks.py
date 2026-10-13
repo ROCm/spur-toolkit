@@ -357,6 +357,21 @@ class LocalPlaybooks(unittest.TestCase):
         self.assertIn("spurstepd missing", output)
         self.assertNotIn("changed=1", output)
 
+    def test_custom_ansible_config_discovers_bundled_modules_without_new_paths(self):
+        self.executable("systemctl", "print('active')\n")
+        self.executable("spur", "print('healthy')\n")
+        self.inventory_file(
+            {"ctl": {}, "worker": {}}, spur_agent_port=1, spur_cgroup_enabled=False
+        )
+        config = self.root / "custom.cfg"
+        config.write_text("[defaults]\nroles_path = " + str(ANSIBLE / "roles") + "\n")
+        self.env["ANSIBLE_CONFIG"] = str(config)
+        # Closed port fails health, but the module and its utilities must load.
+        output = self.run_play(ANSIBLE / "playbooks/healthcheck.yml", success=False)
+        self.assertIn("not listening", output)
+        self.assertNotIn("couldn't resolve module", output)
+        self.assertNotIn("ModuleNotFoundError", output)
+
     def test_real_healthcheck_skips_only_unreachable_agents(self):
         self.executable("systemctl", "print('active')\n")
         self.executable("spur", "print('healthy')\n")
@@ -448,6 +463,7 @@ class LocalPlaybooks(unittest.TestCase):
         names = [
             "Determine which Spur components this host needs",
             "Prepare local install artifacts for this batch",
+            "Select this host's prepared installation artifact",
             "Copy the binaries tarball to the remote host",
             "Extract changed binaries, verify components, and maintain CLI symlinks",
         ]
@@ -706,6 +722,7 @@ class LocalPlaybooks(unittest.TestCase):
         names = [
             "Determine which Spur components this host needs",
             "Prepare local install artifacts for this batch",
+            "Select this host's prepared installation artifact",
             "Copy the binaries tarball to the remote host",
             "Extract changed binaries, verify components, and maintain CLI symlinks",
         ]

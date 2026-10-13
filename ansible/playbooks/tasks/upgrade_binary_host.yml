@@ -1,5 +1,24 @@
 ---
-- name: Activate and verify the staged binary upgrade
+- name: Validate the staged archive before changing this host
+  spur_validate_upgrade:
+    role: "{{ ru_upgrade_role }}"
+    auth: "{{ spur_auth_enabled }}"
+    archive: "{{ spur_install_dir }}/.spur-upgrade-{{ ru_upgrade_role }}.tar.gz"
+    manifest: "{{ hostvars['localhost'].ru_prepared.artifacts[inventory_hostname][ru_upgrade_role].manifest }}"
+  when:
+    - not ansible_check_mode
+    - not (ru_staged.unreachable | default(false))
+
+- name: Reconcile the complete installation using the staged build
+  ansible.builtin.include_tasks: "upgrade_{{ ru_upgrade_role }}_full.yml"
+  vars:
+    spur_install_staged_artifact: "{{ hostvars['localhost'].ru_prepared.artifacts[inventory_hostname][ru_upgrade_role] }}"
+    spur_install_staged_archive: "{{ spur_install_dir }}/.spur-upgrade-{{ ru_upgrade_role }}.tar.gz"
+  when:
+    - not ansible_check_mode
+    - not (ru_staged.unreachable | default(false))
+
+- name: Verify installed and running binaries against the staged build
   spur_activate_upgrade:
     archive: "{{ spur_install_dir }}/.spur-upgrade-{{ ru_upgrade_role }}.tar.gz"
     manifest: "{{ hostvars['localhost'].ru_prepared.artifacts[inventory_hostname][ru_upgrade_role].manifest }}"
@@ -12,15 +31,15 @@
     plugin_dir: "{{ spur_mpi_plugin_dir }}"
     auth: "{{ spur_auth_enabled }}"
     cluster: "{{ spur_cluster_name }}"
+    verify_only: true
   register: ru_activated
   when:
     - not (ru_staged.unreachable | default(false))
 
 - name: Finish the in-place upgrade
-  ansible.builtin.include_tasks: >-
-    {{ 'upgrade_existing_configuration.yml' if ru_activated.configuration_required is defined
-       else 'verify_binary_registration.yml' }}
+  ansible.builtin.include_tasks: verify_binary_registration.yml
   when:
     - not ansible_check_mode
     - not (ru_activated.unreachable | default(false))
     - not (ru_activated.skipped | default(false))
+    - ru_activated.configuration_required is not defined

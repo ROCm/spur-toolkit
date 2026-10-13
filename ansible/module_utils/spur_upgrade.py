@@ -98,6 +98,32 @@ def mpi_source(source):
     )
 
 
+def validate_archive(archive, manifest):
+    allowed = {
+        "spur",
+        "spurctld",
+        "spurd",
+        "spurstepd",
+        "spurauthd",
+        "spur_mpi_pmix.so",
+    }
+    if not manifest or not manifest.keys() <= allowed:
+        raise ValueError("Unexpected or missing binaries in upgrade manifest")
+    with tarfile.open(archive, "r:gz") as bundle:
+        members = bundle.getmembers()
+        if len(members) != len(manifest) or {m.name for m in members} != set(manifest):
+            raise ValueError("Archive does not match upgrade manifest")
+        for member in members:
+            if not member.isfile():
+                raise ValueError("Only regular files are allowed in upgrade archives")
+            checksum = hashlib.sha256()
+            with bundle.extractfile(member) as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    checksum.update(chunk)
+            if checksum.hexdigest() != manifest[member.name]:
+                raise ValueError("Archive checksum mismatch: %s" % member.name)
+
+
 def prepare(targets, cache_dir):
     """Prepare separate activation bundles for each daemon role."""
     builder = ArtifactBuilder(cache_dir)
@@ -272,6 +298,28 @@ def wait_ready(
             time.sleep(0.2)
 
 
+def verify_running(install, home, role, daemon, manifest, port, timeout):
+    health = [str(install / "spur"), "nodes"] if role == "controller" else None
+    health_environment = None
+    if health:
+        # Match the preserved daemon config, not a leftover CLI auth configuration.
+        health_environment = dict(os.environ)
+        health_environment.pop("SPUR_AUTH_PLUGIN", None)
+        health_environment.pop("SPUR_CLUSTER_NAME", None)
+        health_environment["SPUR_CONF"] = str(Path(home) / "etc/spur.conf")
+        health_environment["SPUR_CONTROLLER_ADDR"] = "http://127.0.0.1:%s" % port
+    state = wait_ready(
+        daemon,
+        manifest[daemon],
+        install / daemon,
+        port,
+        timeout,
+        health_command=health,
+        health_environment=health_environment,
+    )
+    return state
+
+
 def activate(
     archive,
     manifest,
@@ -284,14 +332,19 @@ def activate(
     auth,
     cluster,
     check=False,
+    verify_only=False,
 ):
     """Stage and verify the entire bundle before replacing any executable."""
     install = Path(install_dir)
     daemon = "spurctld" if role == "controller" else "spurd"
-    required = {"spur", daemon} | ({"spurstepd"} if role == "agent" else set())
+    required = {"spur", daemon} | (
+        {"spurstepd"} if role == "agent" and not verify_only else set()
+    )
     if auth:
         required.add("spurauthd")
-    allowed = required | ({"spur_mpi_pmix.so"} if role == "agent" else set())
+    allowed = required | (
+        {"spurstepd", "spur_mpi_pmix.so"} if role == "agent" else set()
+    )
     if not manifest.keys() <= allowed:
         raise ValueError("Unexpected or missing binaries in upgrade manifest")
     if not required <= manifest.keys():
@@ -357,6 +410,37 @@ def activate(
                 or (auth and auth_hash != manifest["spurauthd"])
             )
         }
+    if verify_only:
+        for name, dest in destinations.items():
+            if digest(dest) != manifest[name]:
+                raise ValueError("Installed binary does not match target: %s" % dest)
+        if current_hash != manifest[daemon] or (
+            auth and auth_hash != manifest["spurauthd"]
+        ):
+            raise ValueError("Running daemon does not match the target build")
+        if auth:
+            wait_ready(
+                "spurauthd",
+                manifest["spurauthd"],
+                install / "spurauthd",
+                None,
+                timeout,
+                auth_socket="/run/spur/%s/auth.sock" % cluster,
+            )
+        state = verify_running(install, home, role, daemon, manifest, port, timeout)
+        version = command([str(install / daemon), "-V"])
+        if not version:
+            raise ValueError("Target daemon did not report its version")
+        return {
+            "changed": False,
+            "replaced": [],
+            "restarted": [],
+            "pid": state["pid"],
+            "version": version.splitlines()[0],
+            "node_name": node_name,
+            "listening": True,
+            "binary_current": True,
+        }
     staged, replacements, restarted = {}, [], []
     mutated = False
     try:
@@ -416,24 +500,7 @@ def activate(
             mutated = True
             command(["systemctl", "restart", daemon], timeout=timeout)
             restarted.append(daemon)
-        health = [str(install / "spur"), "nodes"] if role == "controller" else None
-        health_environment = None
-        if health:
-            # Match the preserved daemon config, not a leftover CLI auth configuration.
-            health_environment = dict(os.environ)
-            health_environment.pop("SPUR_AUTH_PLUGIN", None)
-            health_environment.pop("SPUR_CLUSTER_NAME", None)
-            health_environment["SPUR_CONF"] = str(Path(home) / "etc/spur.conf")
-            health_environment["SPUR_CONTROLLER_ADDR"] = "http://127.0.0.1:%s" % port
-        state = wait_ready(
-            daemon,
-            manifest[daemon],
-            install / daemon,
-            port,
-            timeout,
-            health_command=health,
-            health_environment=health_environment,
-        )
+        state = verify_running(install, home, role, daemon, manifest, port, timeout)
         return {
             "changed": bool(replacements or restarted),
             "replaced": replacements,

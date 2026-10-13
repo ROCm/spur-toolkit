@@ -64,6 +64,7 @@
 
 - name: Collect agent verification facts
   ansible.builtin.include_tasks: collect_verification_facts.yml
+  when: spur_install_staged_artifact is not defined
   vars:
     spur_verify_daemon_name: spurd
     spur_verify_daemon_port: "{{ spur_agent_port }}"

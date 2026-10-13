@@ -102,7 +102,7 @@ Release and nightly tarballs from [ROCm/spur](https://github.com/ROCm/spur/relea
 
 `spurstepd` supervises one `(job, step)` each. `spurd` spawns them detached — their own session, reparented to init — so they own the job's process tree, cgroup and exit status, and keep running across an `spurd` restart or upgrade; the restarted agent re-adopts them. Three things follow, and the playbooks handle all three:
 
-- **It must live in the same directory as `spurd`** (`spur_install_dir`). The agent resolves it beside its own executable and **does not search `$PATH`**, so a node without it fails *every* job launch. `spur_install` copies it from the same source as `spurd`, in the same task, so the pair always comes from one build — a supervisor written by one build is not adopted by another. It participates in the same checksum comparison, so an unchanged re-run stays a no-op.
+- **It must live in the same directory as `spurd`** (`spur_install_dir`). The agent resolves it beside its own executable and **does not search `$PATH`**, so a node without it fails *every* job launch. `spur_install` copies it from the same source as `spurd`, in the same task, so the pair always comes from one build — a supervisor written by one build is not adopted by another. It participates in the same checksum comparison, so unchanged binaries avoid re-extraction; the service restart still runs.
 - **The `spurd` unit sets `KillMode=process`.** Supervisors detach from the agent but remain in its cgroup, so systemd's default (`control-group`) would kill them on every stop or restart and silently defeat the feature.
 - **Each agent gets its own session directory**, `spur_agent_state_dir` (default `{{ spur_home }}/agent-state`), passed as `SPUR_STEPD_STATE_DIR` in the unit. Deliberately not `{{ spur_home }}/state`, which is the controller's Raft directory: a host running both daemons must not have them share one. The environment variable is used rather than `spurd --state-dir` because a build that predates `spurstepd` ignores an unknown variable but refuses to start on an unknown flag.
 
@@ -567,7 +567,7 @@ ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src=
 
 A few things worth knowing:
 
-- **Binaries roll out by content, not version string.** Ansible compares checksums, so an unchanged re-run is a near no-op.
+- **Binaries roll out by content, not version string.** Ansible compares checksums to avoid redundant uploads and extraction; provisioning and daemon restarts still run.
 - **Rebuild all of them together.** They share a Raft WAL schema. Mixing binaries from different builds — say, rebuilding only `spurctld` — can leave a controller unable to parse a log a differently-versioned peer wrote. `spurd` and `spurstepd` are even tighter: a supervisor written by one build is not adopted by another, so those two must always come from the same build. The role copies them in the same task for that reason.
 - **HA topology changes are guarded.** Adding, removing, or reordering a **controller** needs a reinit. Spur 0.3.0 has no online Raft membership change, so the role fails early with an actionable message if you change the controller set without `-e spur_wipe_state=true`. **Compute agents aren't Raft members** — add or remove them freely, no wipe needed.
 - **Demoting a controller to agent-only leaves a stale `spurctld`.** Moving a host out of `[spur_controllers]`? Run `systemctl disable --now spurctld` on it first. Otherwise the leftover daemon keeps the old membership and can block quorum.
@@ -581,31 +581,32 @@ cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
 ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini -e spur_binary_src=/path/to/target/release
 ```
 
-The default drained upgrade reuses the `spur_install`/`spur_controller`/`spur_agent` roles from `deploy.yml`. Local-build in-place upgrades use the binary-only path described below. The drained path runs these steps:
+All upgrade modes reuse the `spur_install`/`spur_auth`/`spur_controller`/`spur_agent` roles from `deploy.yml`, with auth gated by `spur_auth_enabled`. The default drained path runs these steps:
 
 1. **Guard rail.** Refuses to start if `spur_wipe_state=true`, if `spur_transport=wireguard` (this playbook doesn't support it yet), or if the cluster isn't already healthy (leader elected, `spur nodes` reachable). With `spur_auth_enabled=true` it also refuses a first-time jwt→spur switch on an HA cluster (that needs `deploy.yml`; see [Authentication & RBAC](#authentication--rbac)) and only carries forward auth on a cluster already running `plugin="spur"`.
 2. **Controllers, one at a time** (`serial: 1`; the whole run aborts on the first failure). For each: force-reinstall, restart `spurctld`, then wait on the existing HA-aware "wait for Raft leader" task as the health gate before moving to the next controller. Client-side failover keeps the rest serving while one is down, since every agent and CLI is pointed at *every* controller.
 3. **Agents, in configurable batches** (`spur_rolling_batch_size`, default `1`). For each node: `spur node drain <node>`, poll until `DRAINED` (once no running jobs are left), force-reinstall, restart `spurd`, wait for re-registration, then `scontrol update NodeName=<node> State=RESUME`.
 4. **Verify** *(opt-in — `-e spur_verify_enabled=true`)*. Submits a real test job at the end to confirm the upgraded cluster actually schedules work. Off by default so routine upgrades don't add job noise; CI enables it.
 
-The same rebuild-everything-together caveat from full convergence applies here too. The full configuration path can install `spurstepd` for the first time; the optimized path falls back to those roles when provisioning is needed.
+The same rebuild-everything-together caveat from full convergence applies here too. Both paths can install `spurstepd` for the first time on an idle node; a busy node without an existing supervisor is refused in in-place mode.
 
-#### Binary-only in-place upgrades
+#### Staged in-place upgrades
 
-With `spur_in_place_upgrade=true`, a nonempty `spur_binary_src`, and `spur_overwrite_conf=false`, the existing in-place mode uses the following optimized sequence:
+With `spur_in_place_upgrade=true`, a nonempty `spur_binary_src`, and `spur_overwrite_conf=false`, the playbook uses this sequence:
 
-1. Validate the cluster. Hash each source file once and prepare each distinct controller/agent bundle once, including per-host source and auth differences.
-2. Upload bundles to the selected hosts in parallel, bounded by Ansible `forks`. These are staging files; live executables are unchanged during upload. Detect the Raft leader after staging, immediately before the controller phase.
-3. Activate controllers one at a time, leader last, then agents in `spur_rolling_batch_size` batches. Validate the complete archive, stage files on the destination filesystem, and rename changed executables over their installed paths. Existing processes retain their old executable until restarted.
-4. Restart a daemon only when its running executable differs from the target (or its MPI plugin changed). When native auth is enabled, update and check the mint before the main daemon. Check the running binary and listener, require a successful controller health query, and check each agent's registration without draining or resuming it.
+1. Validate the cluster, hash each source file once, and prepare each distinct controller/agent bundle once, including per-host source and auth differences.
+2. Upload bundles in parallel, bounded by Ansible `forks`, before restarting any daemon. Gather configuration facts and detect the Raft leader immediately before the controller phase.
+3. Process controllers one at a time, leader last, then agents in `spur_rolling_batch_size` batches. Validate each complete staged archive and existing service health before changing that host. Run the shared installation, auth and controller/agent roles, reusing the staged bundle without packaging or uploading it again.
+4. Reconcile unit files, CLI environment, directories, symlinks, native-auth keys/configuration, cgroup checks, Raft membership checks and scoped k0s installation. Run `systemctl daemon-reload`, enable and restart each applicable service, with `spurauthd` before the main daemon. An unchanged rerun still performs these operational steps.
+5. Verify every target artifact's installed hash, the running controller/agent and auth daemon hashes, listeners, controller health and agent registration. Final verification is read-only and cannot initiate another restart.
 
-This path does not gather hardware/network facts or rewrite configuration, service units, environment, keys, symlinks, directories, or k0s. It reads the agent's registered name from its running command line, so an inventory alias need not match that name. Controller/agent overlap uses separate bundles: the controller phase never replaces `spurd` or `spurstepd`.
+Controllers receive `spur` and `spurctld`; agents receive `spur`, `spurd` and `spurstepd` when the build ships it. Auth-enabled hosts receive `spurauthd`. MPI-enabled agents install an available `spur_mpi_pmix.so` into `spur_mpi_plugin_dir`. Missing optional artifacts retain the existing warning behavior; `spur_require_stepd`/`spur_require_authd` remain available. Controller/agent overlap uses separate staged bundles so the controller phase does not replace the agent binaries.
 
-Hosts that already have the required executables, active daemon, and `spur.conf` avoid provisioning. Agents also need `spurstepd` beside `spurd`, plus an effective systemd unit with `KillMode=process` and `SPUR_STEPD_STATE_DIR`. A host needing provisioning automatically uses the existing role path, including its busy-node safety checks, before any binary is replaced. This also handles first-time MPI plugin installation and older builds without `spurstepd`. The build directory must remain unchanged during the run.
+Existing `spur.conf` files remain unchanged unless `spur_overwrite_conf=true`; managed unit files and other provisioning still converge. In-place mode never drains or resumes nodes or kills their workloads. Existing `spurstepd` processes keep supervising their current jobs on the executable they started with; the new on-disk `spurstepd` is used for new jobs. Restarting those existing supervisors would defeat job survival.
 
-`-e spur_overwrite_conf=true` selects the existing full configuration path. Upgrades through the upstream installer also retain that path. There is no additional upgrade option. In-place mode still never drains on either path. On the binary-only path, `--check` prepares artifacts locally and compares installed files and running daemon hashes with the target manifest, without staging or replacing remote binaries or restarting services. It does not validate a remote archive or perform post-upgrade readiness and registration checks; those run when applying the upgrade.
+`spur_overwrite_conf=true` and upstream-installer upgrades use the full role path without pre-staging. No new command or option is required. Keep the build directory unchanged during a run. Custom `ansible.cfg` files can retain their existing `roles_path`: bundled modules and utilities are also discovered relative to the playbook directory.
 
-The fast path reduces per-host work without increasing restart concurrency. An unchanged rerun still validates installed and running binary hashes: the presence of a cached archive alone is not evidence that an upgrade completed.
+For staged in-place upgrades, `--check` prepares artifacts locally and compares installed files and running daemon hashes without staging remote files or restarting services. It is a binary comparison, not a full provisioning/readiness preview; those checks run when applying the upgrade.
 
 `spur_rolling_batch_size` trades speed for blast radius. The default `1` disrupts at most one agent's capacity at a time; a higher value upgrades faster but drains more capacity concurrently. Under `spur_in_place_upgrade` the cost is different, because nothing is drained: a batch of N puts N agents' `spurd` down at the same time while all N stay schedulable, which widens the new-job-dispatch window N-fold rather than serialising it. Keep the default there.
 

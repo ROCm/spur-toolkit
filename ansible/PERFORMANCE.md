@@ -5,8 +5,8 @@ against the initial optimized in-place implementation (`23bc075`). They describe
 work removed, not a measured wall-clock speedup. No new operator mode or tuning
 variable is required.
 
-An in-place binary replacement can skip provisioning. A deployment must still
-configure files, services, authentication and networking. The shared rule is to
+In-place upgrades and deployments both reconcile their applicable provisioning
+roles, including files, services and authentication. The shared rule is to
 prepare identical inputs once, omit disabled workflows before expanding their
 tasks, and combine independent probes without removing safety barriers.
 
@@ -14,7 +14,7 @@ tasks, and combine independent probes without removing safety barriers.
 |---|---|---|
 | `deploy.yml` | Shared installation preparation, MPI discovery, endpoint construction and batched registration verification; merged auth preflight and controller identity facts. | Full convergence, config preservation/overwrite, default force behavior, skip-busy option, controller auth-switch barrier and unreachable-agent policy. |
 | `add_nodes.yml` | Skip the entire mesh play on direct transport; dynamically include only required roles; one registration query for the candidates and one fleet query per readiness attempt. | Existing agents are not restarted; resolved node names, including inventory aliases, are checked; controller config refresh and full mesh updates remain. |
-| `rolling_upgrade.yml` | Existing binary fast path retained; configuration fallback benefits from shared role changes. Controller health uses the preserved daemon config, with underlying errors included in timeouts. An unhealthy existing service fails immediately instead of entering provisioning. The existing agent-tolerance flag continues later batches and reports failures at the end. | Controller serialization/leader ordering, batching, native-auth carry-forward, binary identity verification and the original provisioning fallback. |
+| `rolling_upgrade.yml` | Local in-place builds are prepared and staged before rolling; shared provisioning roles reuse those bundles and reconcile the full installation. Read-only final checks verify every target artifact and running daemon. Unhealthy existing services fail before provisioning; the tolerance flag continues later batches and reports failures at the end. | Controller serialization/leader ordering, batching, native-auth carry-forward, binary identity verification and full provisioning, unit reload/enable/restart, auth and safety checks. |
 | `remove_nodes.yml` | One shared drain polling window instead of a sequential timeout per node; identity-only facts; cleanup tasks expand only on selected agents; no mesh play under direct transport or repeated mesh fact gather. | Refuse/skip/force decisions, workload cleanup before daemon stop, supervisor cleanup after stop, authoritative removal and surviving mesh-member updates. |
 | `teardown.yml` | Combine service stop and stray-daemon cleanup; omit native-auth cleanup tasks on non-wiping or non-auth runs. | k0s reset before stopping Spur, optional drain, workload/daemon/supervisor order, session preservation without wipe and shared-key protection. |
 | `healthcheck.yml` | One remote probe per host role. Controller tasks: 10 → 2; agent tasks: 11 → 3; accounting tasks: 4 → 2, with the disabled accounting play omitted. | Service/port, controller/queue/accounting, auth socket/key, cgroup, optional supervisor binary and disk checks; failures remain nonzero, and only explicitly ignored unreachable agents are skipped. |
@@ -24,8 +24,7 @@ tasks, and combine independent probes without removing safety barriers.
 
 ## Shared costs removed
 
-- Installation has 10 task definitions instead of 14; extraction and binary
-  housekeeping share one remote call. Optional binary discovery,
+- Extraction and binary housekeeping share one remote call. Optional binary discovery,
   initial file hashing and packaging run once per distinct source/component set
   in a batch. A delegated fact holds the result instead of copying the entire
   manifest into every host's facts. Bundle assembly still verifies source bytes.
@@ -37,9 +36,9 @@ tasks, and combine independent probes without removing safety barriers.
 - Verification, including the in-place activation path, uses one `show node` query per batch, rather than one delegated
   query per agent. Failed snapshots clear previous state instead of reporting
   stale registrations. Retryable query failures share the configured deadline.
-- Binary activation writes temporary executables only for changed files.
-  Unchanged reruns still hash installed and running binaries and validate every
-  archive member, but avoid writing and deleting duplicate binaries per host.
+- Staged in-place upgrades avoid a second packaging/upload pass. Matching
+  installed binaries avoid extraction, while provisioning and service restarts
+  still run. Final manifest verification never writes or restarts anything.
 - Authentication's clock, NSS and binary checks share one read-only remote call.
   Time-sync/NSS warnings and the missing-binary failure remain, including in
   check mode. Key distribution and coordinated service startup remain separate.
@@ -124,8 +123,7 @@ test is added to `integration-conf`; a compatibility job runs the local suite on
 Ansible 2.14, 2.17 and 2.19 alongside the existing default-version lint job. The lab
 validation below is separate from the deterministic fixture suite.
 
-The final local suite passes all 41 tests on Ansible 2.14, 2.17 and 2.19; all nine
-playbooks also pass syntax checks on these versions. Ansible 2.14 uses Ubuntu
+The local suite and all nine playbooks are checked on Ansible 2.14, 2.17 and 2.19. Ansible 2.14 uses Ubuntu
 22.04's Python 3.10 in CI to stay within its supported control-node Python range.
 
 ## Additional regression coverage
@@ -145,16 +143,16 @@ idle cleanup does not expand controller reconciliation tasks.
 
 ## Live validation
 
-The scale fixture had three HA controllers, 200 workers and 100 running jobs.
-These measurements precede the additional reduction in temporary binary writes;
-that change has local regression coverage but has not been timed on the fleet.
-An unchanged-binary in-place rerun took 5m32s with the original inventory order
-and 3m00s with hosts interleaved across the four physical machines, using the
-same batch size of 200 and 40 forks. Staging fell from 139s to 73s and activation
-from 161s to 76s. These are warm-rerun measurements, not timings for replacing
-binaries across the whole fleet. The latter was tested separately on an isolated
-worker with a live job: its agent PID changed, the supervisor PID stayed the
-same, and job output continued across a real release-to-target replacement.
+The scale fixture has three HA controllers and 200 workers. Historical timings
+for the earlier binary-only implementation do not describe the restored full
+convergence path. Its interleaved unchanged in-place run took 2m59.78s with batch
+200 and 40 forks. The earlier grouped-inventory 5m31.87s run exited nonzero on an
+unhealthy worker and is not a successful benchmark.
+
+Prior measured full deployment improved from 11m15.39s to 8m41.97s (23% faster),
+with 100 busy nodes skipped and 100 idle nodes restarted. A full force upgrade
+with batch 200 took 11m31.43s and killed 100 jobs; teardown took 3m13.04s. These
+measurements precede the restoration of provisioning on staged in-place runs.
 
 Removal and re-addition of one idle worker through the full inventory passed
 (1m03s and 1m41s). The full deployment test with busy-node skipping passed:
@@ -173,3 +171,17 @@ addition exposed an upstream CLI authentication defect and remains blocked on
 that binary fix. Shared host cgroup mounts also exposed an upstream daemon
 cleanup bug (signaling PID zero). Isolating test-container cgroups avoids that
 fixture collision; the playbook cleanup now rejects zero/negative PIDs itself.
+
+## In-place convergence regression coverage
+
+The real-playbook fixture repairs unit and PMIx drift, reloads/enables/restarts
+services, restores symlinks and supervisor-state directories, preserves existing
+configuration, verifies target artifacts, and rejects drain/kill/resume commands.
+The helper suite separately checks corrupt archives and read-only verification
+of disk/running drift. Custom Ansible configuration discovery is covered.
+
+Container CI introduces unit/environment/symlink/plugin drift before the HA
+in-place upgrade while retaining job survival, supervisor identity, leader order
+and no-drain assertions. Native-auth CI changes all executable checksums and
+checks auth/daemon restarts, key permissions, CLI configuration and PMIx delivery.
+Its small shared-library fixture tests delivery, not MPI runtime behavior.

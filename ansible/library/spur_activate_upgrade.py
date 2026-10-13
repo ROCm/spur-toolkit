@@ -1,5 +1,5 @@
 #!/usr/bin/python
-"""Activate and verify a staged binary bundle without provisioning the host."""
+"""Verify target artifacts after provisioning, or activate a standalone bundle."""
 
 import subprocess
 import tarfile
@@ -21,6 +21,7 @@ def main():
             "plugin_dir": {"type": "path", "default": "/usr/lib/spur"},
             "auth": {"type": "bool", "default": False},
             "cluster": {"type": "str", "required": True},
+            "verify_only": {"type": "bool", "default": False},
         },
         supports_check_mode=True,
     )
@@ -35,7 +36,9 @@ def main():
     try:
         result = activate(**params, check=module.check_mode)
     except ConfigurationRequired as error:
-        module.warn("Using provisioning fallback: %s" % error)
+        if params["verify_only"] and not module.check_mode:
+            module.fail_json(msg="Installation verification failed: %s" % error)
+        module.warn("Configuration reconciliation required: %s" % error)
         module.exit_json(changed=False, configuration_required=str(error))
     except ActivationFailed as error:
         module.fail_json(changed=True, msg=str(error))

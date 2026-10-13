@@ -82,7 +82,7 @@
     mpi_source: >-
       {{ (spur_install_dir ~ '/spur_mpi_pmix.so')
          if (spur_binary_src | default('') | length > 0 and
-             hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].mpi_source | length > 0)
+             'spur_mpi_pmix.so' in spur_install_artifact.manifest)
          else ((spur_install_dir | regex_replace('/[^/]+$', '')) ~ '/lib/spur/spur_mpi_pmix.so')
          if spur_binary_src | default('') | length == 0 else '' }}
 

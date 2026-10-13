@@ -25,10 +25,14 @@ class FailurePolicy(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "tasks").symlink_to(
-                ANSIBLE / "playbooks/tasks", target_is_directory=True
-            )
+            shutil.copytree(ANSIBLE / "playbooks/tasks", root / "tasks")
+            (root / "tasks/upgrade_agent_full.yml").write_text("[]\n")
             (root / "library").mkdir()
+            (root / "library/spur_validate_upgrade.py").write_text(
+                "from ansible.module_utils.basic import AnsibleModule\n"
+                "m = AnsibleModule(argument_spec={'archive': {}, 'manifest': {'type': 'dict'}, 'role': {}, 'auth': {'type': 'bool'}})\n"
+                "m.exit_json(changed=False)\n"
+            )
             # Keep the actual module interface; substitute only daemon activation.
             module = (ANSIBLE / "library/spur_activate_upgrade.py").read_text()
             module = module.replace(

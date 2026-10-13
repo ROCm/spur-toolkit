@@ -100,6 +100,57 @@ class UpgradeTests(unittest.TestCase):
         )
         return install, state, args
 
+    def test_staged_archive_validation_rejects_corruption_and_unsafe_members(self):
+        _, _, args = self.activation_fixture()
+        upgrade.validate_archive(args["archive"], args["manifest"])
+        bad_manifest = dict(args["manifest"], spurd="0" * 64)
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            upgrade.validate_archive(args["archive"], bad_manifest)
+        with tarfile.open(args["archive"], "w:gz") as bundle:
+            member = tarfile.TarInfo("../spurd")
+            bundle.addfile(member)
+        with self.assertRaisesRegex(ValueError, "manifest"):
+            upgrade.validate_archive(args["archive"], args["manifest"])
+
+    def test_final_verification_is_read_only_and_fails_on_disk_or_running_drift(self):
+        install, state, args = self.activation_fixture()
+        args["verify_only"] = True
+        Path(args["archive"]).unlink()
+        with (
+            patch.object(upgrade, "service", return_value=state),
+            patch.object(
+                upgrade, "process_args", return_value=["spurd", "--hostname", "a"]
+            ),
+            patch.object(
+                upgrade, "running_digest", return_value=args["manifest"]["spurd"]
+            ) as running,
+            patch.object(upgrade, "command", return_value="new") as command,
+            patch.object(upgrade, "wait_ready", return_value=state),
+            patch.object(
+                upgrade.tempfile,
+                "mkstemp",
+                side_effect=AssertionError("verification wrote a file"),
+            ),
+            patch.object(
+                upgrade.os,
+                "replace",
+                side_effect=AssertionError("verification replaced a file"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "Installed binary"):
+                upgrade.activate(**args)
+            command.assert_not_called()
+            shutil.copyfile(self.source / "spurd", install / "spurd")
+            running.return_value = "stale"
+            with self.assertRaisesRegex(ValueError, "Running daemon"):
+                upgrade.activate(**args)
+            command.assert_not_called()
+            running.return_value = args["manifest"]["spurd"]
+            result = upgrade.activate(**args)
+            self.assertFalse(result["changed"])
+            self.assertEqual(result["restarted"], [])
+            command.assert_called_once_with([str(install / "spurd"), "-V"])
+
     def test_controller_health_uses_preserved_daemon_config_not_stale_cli_auth(self):
         self.spec["roles"] = ["controller"]
         (self.source / "spur").write_text(
@@ -526,13 +577,23 @@ int main(int argc, char **argv) {
 """
 
 SYSTEMCTL = r"""#!/usr/bin/env python3
-import json, os, signal, subprocess, sys, time
+import json, os, shlex, signal, subprocess, sys, time
 from pathlib import Path
 root = Path(os.environ['SPUR_TEST_STATE'])
-action, name = sys.argv[1:3]
+action = sys.argv[1]
+if action in ('daemon-reload', 'enable'):
+    with (root / 'service-operations').open('a') as log: log.write(' '.join(sys.argv[1:]) + '\n')
+    if action == 'daemon-reload':
+        for unit in (root / 'system-units').glob('*.service'):
+            (root / (unit.stem + '.loaded')).write_text(unit.read_text())
+    sys.exit(0)
+name = sys.argv[-1] if '--value' in sys.argv else sys.argv[2]
 path = root / (name + '.json')
 data = json.loads(path.read_text())
 if action == 'show':
+    if '--value' in sys.argv:
+        print(data['pid'])
+        sys.exit(0)
     print('MainPID=' + str(data['pid']))
     print('ActiveState=active')
     print('KillMode=' + data.get('kill_mode', 'process'))
@@ -543,13 +604,17 @@ elif action == 'restart':
     for attempt in range(500):
         try:
             state = Path('/proc', str(data['pid']), 'stat').read_text().rsplit(') ', 1)[1].split()[0]
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             break
         if state in ('Z', 'X'):
             break
         time.sleep(0.01)
     else:
         sys.exit('fixture daemon did not stop')
+    unit = (root / (name + '.loaded')).read_text()
+    args = shlex.split(next(line.split('=', 1)[1] for line in unit.splitlines() if line.startswith('ExecStart=')))
+    args.append(data['args'][-1])
+    data['args'] = args
     process = subprocess.Popen(data['args'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, start_new_session=True)
     data['pid'] = process.pid
@@ -565,7 +630,7 @@ from pathlib import Path
 with (Path(os.environ['SPUR_TEST_STATE']) / 'cli-calls').open('a') as log:
     log.write(' '.join(sys.argv[1:]) + '\n')
 if sys.argv[1:] == ['nodes']: print('healthy')
-elif sys.argv[1:] == ['show', 'node']:
+elif sys.argv[1:3] == ['show', 'node']:
     print('NodeName=registered-worker\nState=ALLOCATED\nCPUAlloc=1')
 else: sys.exit('unexpected state mutation')
 """
@@ -576,9 +641,23 @@ else: sys.exit('unexpected state mutation')
     "requires ansible-core and a C compiler",
 )
 class PlaybookTests(unittest.TestCase):
-    def test_real_playbook_preserves_provisioning_and_avoids_noop_restarts(self):
+    def test_real_playbook_reconciles_units_plugin_and_binaries_without_draining(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            ansible = root / "ansible"
+            shutil.copytree(ROOT / "ansible", ansible, symlinks=True)
+            (root / "system-units").mkdir()
+            environment_file = root / "environment"
+            environment_file.write_text(
+                'PATH="/usr/bin"\nKEEP=unchanged\nSPUR_ACCOUNTING_ADDR=stale\n'
+            )
+            # Exercise actual roles while confining every absolute config write.
+            for task in (ansible / "roles").rglob("*.yml"):
+                task.write_text(
+                    task.read_text()
+                    .replace("/etc/environment", str(environment_file))
+                    .replace("/etc/systemd/system", str(root / "system-units"))
+                )
             (root / "fake-bin").mkdir()
             (root / "fake-bin/systemctl").write_text(SYSTEMCTL)
             (root / "fake-bin/systemctl").chmod(0o755)
@@ -588,6 +667,7 @@ class PlaybookTests(unittest.TestCase):
                 SPUR_TEST_STATE=str(root),
                 PATH=str(root / "fake-bin") + os.pathsep + os.environ["PATH"],
                 ANSIBLE_NOCOLOR="1",
+                ANSIBLE_CONFIG=str(ansible / "ansible.cfg"),
             )
             source = root / "source"
             source.mkdir()
@@ -607,6 +687,7 @@ class PlaybookTests(unittest.TestCase):
                 binary.chmod(0o755)
             (source / "spur").write_text(CLI)
             (source / "spur").chmod(0o755)
+            (source / "spur_mpi_pmix.so").write_bytes(b"target pmix plugin")
             hosts, processes, saved = {}, [], {}
             try:
                 for name, daemon in (
@@ -616,6 +697,11 @@ class PlaybookTests(unittest.TestCase):
                     home = root / name
                     (home / "bin").mkdir(parents=True)
                     (home / "etc").mkdir()
+                    (home / "plugins").mkdir()
+                    (home / "plugins/spur_mpi_pmix.so").write_bytes(b"old plugin")
+                    (root / "system-units" / (daemon + ".service")).write_text(
+                        "stale unit\n"
+                    )
                     config = home / "etc/spur.conf"
                     config.write_text(
                         '[auth]\nplugin = "jwt"\n[cgroup]\nenabled = true\n'
@@ -647,6 +733,10 @@ class PlaybookTests(unittest.TestCase):
                         json.dumps({"pid": proc.pid, "args": args})
                     )
                     hosts[name] = {
+                        "ansible_host": "127.0.0.1",
+                        "spur_node_name": "registered-worker",
+                        "spur_agent_state_dir": str(home / "agent-state"),
+                        "spur_mpi_plugin_dir": str(home / "plugins"),
                         "ansible_connection": "local",
                         "ansible_become": False,
                         "ansible_python_interpreter": shutil.which("python3"),
@@ -681,7 +771,7 @@ class PlaybookTests(unittest.TestCase):
                         {
                             "spur_in_place_upgrade": True,
                             "spur_binary_src": str(source),
-                            "spur_mpi_plugin_enabled": False,
+                            "spur_mpi_plugin_enabled": True,
                         }
                     ),
                 ]
@@ -707,7 +797,7 @@ class PlaybookTests(unittest.TestCase):
                     restart_log = restarts.read_bytes() if restarts.exists() else b""
                     result = subprocess.run(
                         command + ["--check"],
-                        cwd=ROOT / "ansible",
+                        cwd=ansible,
                         env=env,
                         text=True,
                         stdout=subprocess.PIPE,
@@ -716,7 +806,7 @@ class PlaybookTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stdout)
                     activations = result.stdout.split(
-                        "TASK [Activate and verify the staged binary upgrade]"
+                        "TASK [Verify installed and running binaries against the staged build]"
                     )[1:]
                     self.assertEqual(len(activations), 2, result.stdout)
                     for host, activation in zip(hosts, activations):
@@ -742,7 +832,7 @@ class PlaybookTests(unittest.TestCase):
                 for run in range(2):
                     result = subprocess.run(
                         command,
-                        cwd=ROOT / "ansible",
+                        cwd=ansible,
                         env=env,
                         text=True,
                         stdout=subprocess.PIPE,
@@ -751,26 +841,57 @@ class PlaybookTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stdout)
                     self.assertIn("2/2 nodes verified", result.stdout)
-                    self.assertNotIn("spur_install :", result.stdout)
-                    self.assertNotIn("spur_auth :", result.stdout)
-                    self.assertNotIn("TASK [Gathering Facts]", result.stdout)
-                    agent_play = result.stdout.split(
-                        "PLAY [Rolling upgrade — agents", 1
-                    )[1].split("\nPLAY [", 1)[0]
-                    self.assertEqual(agent_play.count("TASK ["), 5)
+                    for role in ("spur_install", "spur_controller", "spur_agent"):
+                        self.assertIn(role + " :", result.stdout)
+                    self.assertIn("spur_in_place_upgrade=true", result.stdout)
                     self.assertEqual(
                         result.stdout.count("TASK [Stage binary bundles"), 2
                     )
                     self.assertEqual(
                         (root / "restarts").read_text().splitlines(),
-                        ["spurctld", "spurd"],
+                        ["spurctld", "spurd"] * (run + 1),
+                    )
+                    for name, host in hosts.items():
+                        daemon = "spurctld" if name == "controller" else "spurd"
+                        binaries = ["spur", daemon] + (
+                            ["spurstepd"] if daemon == "spurd" else []
+                        )
+                        for binary in binaries:
+                            self.assertEqual(
+                                upgrade.digest(Path(host["spur_install_dir"]) / binary),
+                                upgrade.digest(source / binary),
+                            )
+                        unit = (
+                            root / "system-units" / (daemon + ".service")
+                        ).read_text()
+                        self.assertIn("ExecStart=" + host["spur_install_dir"], unit)
+                        self.assertEqual(
+                            (root / (daemon + ".loaded")).read_text(), unit
+                        )
+                        self.assertTrue(
+                            (Path(host["spur_install_dir"]) / "squeue").is_symlink()
+                        )
+                    worker = hosts["worker-alias"]
+                    self.assertEqual(
+                        (
+                            Path(worker["spur_mpi_plugin_dir"]) / "spur_mpi_pmix.so"
+                        ).read_bytes(),
+                        (source / "spur_mpi_pmix.so").read_bytes(),
+                    )
+                    self.assertTrue(Path(worker["spur_agent_state_dir"]).is_dir())
+                    operations = (root / "service-operations").read_text().splitlines()
+                    self.assertEqual(operations.count("daemon-reload"), 2 * (run + 1))
+                    self.assertEqual(operations.count("enable spurd"), run + 1)
+                    self.assertIn("KEEP=unchanged", environment_file.read_text())
+                    self.assertNotIn(
+                        "SPUR_ACCOUNTING_ADDR", environment_file.read_text()
                     )
                     for path, content in saved.items():
                         self.assertEqual(path.read_bytes(), content)
                     calls = (root / "cli-calls").read_text()
                     self.assertNotIn("drain", calls)
                     self.assertNotIn("RESUME", calls)
-                    self.assertEqual(calls.splitlines().count("show node"), run + 1)
+                    self.assertNotIn("cancel", calls)
                 check_without_staged_archives(changed=False)
                 for extra in (
                     ["--limit", "worker-alias"],
@@ -778,7 +899,7 @@ class PlaybookTests(unittest.TestCase):
                 ):
                     result = subprocess.run(
                         command + extra,
-                        cwd=ROOT / "ansible",
+                        cwd=ansible,
                         env=env,
                         text=True,
                         stdout=subprocess.PIPE,
@@ -788,7 +909,7 @@ class PlaybookTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout)
                     self.assertEqual(
                         (root / "restarts").read_text().splitlines(),
-                        ["spurctld", "spurd"],
+                        ["spurctld", "spurd"] * 2 + ["spurd"],
                     )
                 # A bound, non-listening loopback socket deterministically refuses SSH.
                 with socket.socket() as refused:
@@ -802,7 +923,7 @@ class PlaybookTests(unittest.TestCase):
                     (root / "inventory.yml").write_text(json.dumps(inventory))
                     result = subprocess.run(
                         command + ["-e", "spur_ignore_unreachable_agents=true"],
-                        cwd=ROOT / "ansible",
+                        cwd=ansible,
                         env=env,
                         text=True,
                         stdout=subprocess.PIPE,
@@ -813,7 +934,7 @@ class PlaybookTests(unittest.TestCase):
                     self.assertIn("2/3 nodes verified", result.stdout)
                     self.assertEqual(
                         (root / "restarts").read_text().splitlines(),
-                        ["spurctld", "spurd"],
+                        ["spurctld", "spurd"] * 2 + ["spurd", "spurctld", "spurd"],
                     )
             finally:
                 for path in root.glob("*.json"):

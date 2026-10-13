@@ -73,17 +73,27 @@
   delegate_facts: true
   become: false
   run_once: true
+  when: spur_install_staged_artifact is not defined
+
+- name: Select this host's prepared installation artifact
+  ansible.builtin.set_fact:
+    spur_install_artifact: >-
+      {{ spur_install_staged_artifact if spur_install_staged_artifact is defined
+         else hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname] }}
+  when: spur_binary_src | default('') | length > 0
 
 - name: Copy the binaries tarball to the remote host
   vars:
-    spur_bin_tarball_local: "{{ hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].archive }}"
+    spur_bin_tarball_local: "{{ spur_install_artifact.archive }}"
     spur_bin_hash: "{{ spur_bin_tarball_local | basename | regex_replace('\\.tar\\.gz$', '') }}"
   ansible.builtin.copy:
     src: "{{ spur_bin_tarball_local }}"
     dest: "{{ spur_install_dir }}/.bins-{{ spur_bin_hash }}.tar.gz"
     mode: "0644"
   register: spur_bin_copy
-  when: spur_binary_src | default('') | length > 0
+  when:
+    - spur_binary_src | default('') | length > 0
+    - spur_install_staged_artifact is not defined
 
 - name: Install Spur via upstream installer
   ansible.builtin.shell: |
@@ -108,6 +118,7 @@
 # per-symlink over the wire.
 - name: Extract changed binaries, verify components, and maintain CLI symlinks
   vars:
+    spur_install_archive: "{{ spur_install_staged_archive | default(spur_bin_copy.dest | default('')) }}"
     # spurstepd is only *required* when the operator says this build ships it
     # (spur_require_stepd) — an older release has none, and a hard requirement
     # would break those deploys. It's reported either way by the task below.
@@ -127,16 +138,16 @@
     {% if spur_binary_src | default('') | length > 0 and not (spur_bin_copy.unreachable | default(false)) %}
     extract={{ spur_bin_copy.changed | default(false) | bool | lower }}
     if [ "$extract" = false ]; then
-    {% for name, checksum in hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].manifest.items() %}
+    {% for name, checksum in spur_install_artifact.manifest.items() %}
       [ "$(sha256sum {{ (spur_install_dir ~ '/' ~ name) | quote }} 2>/dev/null | cut -d ' ' -f1)" = {{ checksum | quote }} ] || extract=true
     {% endfor %}
     fi
     if [ "$extract" = true ]; then
-    tar --no-same-owner -xzf {{ spur_bin_copy.dest | quote }} -C {{ spur_install_dir | quote }}
-    {% for name in hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].manifest %}
+    tar --no-same-owner -xzf {{ spur_install_archive | quote }} -C {{ spur_install_dir | quote }}
+    {% for name in spur_install_artifact.manifest %}
     chmod 0755 {{ (spur_install_dir ~ '/' ~ name) | quote }}
     {% endfor %}
-    find {{ spur_install_dir | quote }} -maxdepth 1 -name '.bins-*.tar.gz' ! -name {{ spur_bin_copy.dest | basename | quote }} -delete
+    find {{ spur_install_dir | quote }} -maxdepth 1 -name '.bins-*.tar.gz' ! -name {{ spur_install_archive | basename | quote }} -delete
     echo BINARIES_EXTRACTED
     fi
     {% endif %}
