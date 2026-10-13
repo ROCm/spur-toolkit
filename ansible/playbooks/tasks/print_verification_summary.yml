@@ -23,8 +23,8 @@
       {%- set h = hostvars[name] -%}
       {%- if h.spur_verify_row is defined -%}
       {%- set row = h.spur_verify_row.copy() -%}
-      {%- if h.ru_registration.stdout is defined -%}
-      {%- set _ = row.update({'registered_state': h.ru_registration.stdout | trim}) -%}
+      {%- if h.ru_registration.nodes is defined and h.ru_activated.node_name is defined -%}
+      {%- set _ = row.update({'registered_state': h.ru_registration.nodes.get(h.ru_activated.node_name, '')}) -%}
       {%- endif -%}
       {%- set _ = rows.append(row) -%}
       {%- endif -%}

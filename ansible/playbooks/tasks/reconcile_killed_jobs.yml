@@ -1,0 +1,59 @@
+---
+- name: Extract job IDs this kill just emptied
+  ansible.builtin.set_fact:
+    dckj_affected_job_ids: >-
+      {{ ((dckj_kill_result.stdout | regex_search('AFFECTED_JOB_IDS:(.*)', '\1')) or [''])[0]
+         | trim | split }}
+
+- name: Show job IDs extracted from this kill (debug visibility)
+  ansible.builtin.debug:
+    msg: "dckj_affected_job_ids={{ dckj_affected_job_ids }}"
+
+# spur's cancel authorization checks the job's OWNER as recorded on the
+# controller at submit time — not the OS uid the workload happens to run
+# under on the agent, which a plain un-salloc'd srun step can leave owned by
+# root there regardless of who actually submitted it. Look the real owner up
+# from the controller's own job record so the cancel below authenticates as
+# that user rather than as whoever ansible connects as. Best-effort: an
+# already-gone/unreadable job leaves this empty and the cancel below just
+# falls back to the play's normal become target instead of failing the play.
+- name: Look up each affected job's owner on the controller
+  ansible.builtin.shell: "{{ spur_install_dir }}/spur show job {{ item }} 2>/dev/null | grep -oE 'UserId=[^ ]+' | head -n 1 | cut -d= -f2 | xargs -r getent passwd | cut -d: -f1"
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  loop: "{{ dckj_affected_job_ids }}"
+  loop_control:
+    label: "{{ item }}"
+  register: dckj_job_owners
+  changed_when: false
+  failed_when: false
+  when: dckj_affected_job_ids | length > 0
+
+# The kill above only ever touches processes — it can't tell the CONTROLLER a
+# job is done, and a plain un-salloc'd srun step's "extern" supervisor doesn't
+# reliably self-report that its workload died (see this file's header
+# comment). Left alone, the controller keeps such a job JobState=RUNNING and
+# the node's resources allocated forever. Cancelling from here doesn't wait on
+# agent/stepd acknowledgment — it's a controller-side state change — so it
+# clears the job regardless of whether the local supervisor ever notices.
+# Idempotent: cancelling an already-terminal or nonexistent job id exits 0
+# with an informational stderr line, never fails the play.
+- name: Force-cancel jobs this kill just emptied (controller-side, no agent ack needed)
+  ansible.builtin.command:
+    argv: "{{ [spur_install_dir ~ '/spur', 'cancel', '-s', 'KILL', item.item] }}"
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  loop: "{{ dckj_job_owners.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  become: true
+  become_user: >-
+    {{ (item.stdout | default('') | trim)
+       if ((item.stdout | default('') | trim) | length > 0) else omit }}
+  when: dckj_affected_job_ids | length > 0
+  register: dckj_cancel_result
+  changed_when: true
+  failed_when: false
+
+- name: Show force-cancel result (debug visibility)
+  ansible.builtin.debug:
+    var: dckj_cancel_result
+  when: dckj_affected_job_ids | length > 0

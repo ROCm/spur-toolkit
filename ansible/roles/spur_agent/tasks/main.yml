@@ -5,6 +5,15 @@
       {{ spur_wg_address if spur_transport == 'wireguard'
          else (ansible_host | default(ansible_default_ipv4.address)) }}
     spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
+    spur_controller_endpoints: >-
+      {%- set endpoints = [] -%}
+      {%- for name in groups['spur_controllers'] -%}
+      {%- set h = hostvars[name] -%}
+      {%- set address = h.spur_wg_address if spur_transport == 'wireguard'
+          else (h.ansible_host | default(h.ansible_default_ipv4.address)) -%}
+      {%- set _ = endpoints.append('http://' ~ address ~ ':' ~ spur_controller_port) -%}
+      {%- endfor -%}
+      {{ endpoints }}
 
 # cgroup-v2 readiness: spurd enforces [cgroup] limits by creating cgroups under
 # /sys/fs/cgroup/spur, which needs the unified (v2) hierarchy and the memory/
@@ -56,18 +65,6 @@
     - spur_cgroup_enabled | default(true) | bool
     - (spur_cgroup_v2_probe.stdout | default('OK') | trim) != 'OK'
     - not ((spur_cgroup_require_v2 | default(false) | bool) or (spur_cgroup_required | default(false) | bool))
-
-- name: Resolve controller endpoint(s) agents will talk to
-  ansible.builtin.set_fact:
-    spur_controller_endpoints: >-
-      {%- set endpoints = [] -%}
-      {%- for name in groups['spur_controllers'] -%}
-      {%- set h = hostvars[name] -%}
-      {%- set address = h.spur_wg_address if spur_transport == 'wireguard'
-          else (h.ansible_host | default(h.ansible_default_ipv4.address)) -%}
-      {%- set _ = endpoints.append('http://' ~ address ~ ':' ~ spur_controller_port) -%}
-      {%- endfor -%}
-      {{ endpoints }}
 
 # Every agent gets the CLI now (spur_install always installs it), so this is
 # unconditional — CLI on agents must target the controller over the same

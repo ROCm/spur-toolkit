@@ -32,6 +32,29 @@ health = helper("spur_health")
 
 
 class FleetHelpers(unittest.TestCase):
+    def test_workload_cleanup_ignores_pids_hidden_by_the_pid_namespace(self):
+        task = yaml.safe_load(
+            (ANSIBLE / "playbooks/tasks/kill_workload_processes.yml").read_text()
+        )[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "cgroup.procs").write_text("0\n1\n")
+            (root / "find").write_text(
+                "#!/bin/sh\nprintf '%s\\n' '" + str(root / "cgroup.procs") + "'\n"
+            )
+            (root / "find").chmod(0o755)
+            result = subprocess.run(
+                ["bash", "-c", task["ansible.builtin.shell"]],
+                env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"]),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                start_new_session=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("nothing to kill", result.stdout)
+            self.assertNotIn("AFFECTED_JOB_IDS", result.stdout)
+
     def test_install_hashes_once_with_mixed_sources_roles_and_optional_binaries(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source"
@@ -246,6 +269,35 @@ class LocalPlaybooks(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout + result.stderr
 
+    def test_idle_cleanup_does_not_expand_job_reconciliation_tasks(self):
+        procs = self.root / "cgroup.procs"
+        procs.write_text("0\n")
+        self.executable("find", "print(" + repr(str(procs)) + ")\n")
+        self.inventory_file({"ctl": {}, "worker": {}})
+        playbook = self.root / "cleanup.yml"
+        playbook.write_text(
+            yaml.safe_dump(
+                [
+                    dict(
+                        hosts="worker",
+                        gather_facts=False,
+                        tasks=[
+                            {
+                                "ansible.builtin.include_tasks": str(
+                                    ANSIBLE
+                                    / "playbooks/tasks/kill_workload_processes.yml"
+                                )
+                            }
+                        ],
+                    )
+                ]
+            )
+        )
+        output = self.run_play(playbook)
+        self.assertNotIn("Extract job IDs", output)
+        self.assertNotIn("Look up each affected job", output)
+        self.assertNotIn("Force-cancel jobs", output)
+
     def test_auth_preflight_keeps_warnings_and_fails_missing_binary_in_check_mode(self):
         self.executable("timedatectl", "print('no')\n")
         self.executable("systemctl", "import sys\nsys.exit(1)\n")
@@ -387,9 +439,10 @@ class LocalPlaybooks(unittest.TestCase):
             (ANSIBLE / "roles/spur_install/tasks/main.yml").read_text()
         )
         names = [
+            "Determine which Spur components this host needs",
             "Prepare local install artifacts for this batch",
             "Copy the binaries tarball to the remote host",
-            "Extract the binaries (only when the tarball actually changed)",
+            "Extract changed binaries, verify components, and maintain CLI symlinks",
         ]
         role_tasks = {
             "spur_install": [t for t in install if t["name"] in names],
@@ -439,6 +492,46 @@ class LocalPlaybooks(unittest.TestCase):
         marker_time = marker.stat().st_mtime_ns
         self.run_play(playbook, "-e", "new_nodes=worker,second")
         self.assertEqual(marker.stat().st_mtime_ns, marker_time)
+
+    def test_verification_accepts_reextracted_identical_binary_but_rejects_stale_bytes(
+        self,
+    ):
+        self.executable("systemctl", "print(%r)\n" % str(os.getpid()))
+        shutil.copyfile("/proc/self/exe", self.bin / "spurd")
+        (self.bin / "spurd").chmod(0o755)
+        self.inventory_file({"ctl": {}, "worker": {}})
+        playbook = self.root / "verify-identical.yml"
+        playbook.write_text(
+            yaml.safe_dump(
+                [
+                    dict(
+                        hosts="worker",
+                        gather_facts=False,
+                        tasks=[
+                            {
+                                "ansible.builtin.include_tasks": str(
+                                    ANSIBLE
+                                    / "playbooks/tasks/collect_verification_facts.yml"
+                                ),
+                                "vars": {
+                                    "spur_verify_daemon_name": "spurd",
+                                    "spur_verify_daemon_port": 1,
+                                    "spur_verify_role_label": "agent",
+                                },
+                            },
+                            {
+                                "ansible.builtin.assert": {
+                                    "that": "spur_verify_row.binary_current == (expected_current | bool)"
+                                }
+                            },
+                        ],
+                    )
+                ]
+            )
+        )
+        self.run_play(playbook, "-e", "expected_current=true")
+        self.executable("spurd", "print('stale build')\n")
+        self.run_play(playbook, "-e", "expected_current=false")
 
     def test_verification_queries_once_and_clears_stale_registration_on_failure(self):
         calls, fail = self.root / "queries", self.root / "fail-query"
@@ -576,9 +669,10 @@ class LocalPlaybooks(unittest.TestCase):
             (ANSIBLE / "roles/spur_install/tasks/main.yml").read_text()
         )
         names = [
+            "Determine which Spur components this host needs",
             "Prepare local install artifacts for this batch",
             "Copy the binaries tarball to the remote host",
-            "Extract the binaries (only when the tarball actually changed)",
+            "Extract changed binaries, verify components, and maintain CLI symlinks",
         ]
         chosen = [t for t in tasks if t["name"] in names]
         self.assertEqual(len(chosen), len(names))

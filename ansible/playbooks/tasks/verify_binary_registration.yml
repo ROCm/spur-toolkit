@@ -1,19 +1,36 @@
 ---
-- name: Check registration without draining or resuming the agent
-  ansible.builtin.shell: |
-    set -o pipefail
-    {{ (hostvars[groups['spur_controllers'][0]].spur_install_dir ~ '/spur') | quote }} show node {{ ru_activated.node_name | quote }} \
-      | awk -v n={{ ru_activated.node_name | quote }} '/^NodeName=/{p=($0=="NodeName="n)} p' \
-      | grep -oE 'State=[A-Z+]+' | head -1 | cut -d= -f2
-  args:
-    executable: /bin/bash
+- name: Query upgraded agent registrations once per batch
+  spur_node_snapshot:
+    binary: "{{ hostvars[groups['spur_controllers'][0]].spur_install_dir }}/spur"
+    expected: >-
+      {%- set names = [] -%}
+      {%- for name in ansible_play_batch -%}
+      {%- if hostvars[name].ru_activated.node_name is defined -%}
+      {%- set _ = names.append(hostvars[name].ru_activated.node_name) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ names }}
+    timeout: 30
+  environment:
+    SPUR_CONF: "{{ hostvars[groups['spur_controllers'][0]].spur_home }}/etc/spur.conf"
+    SPUR_CONTROLLER_ADDR: "http://127.0.0.1:{{ hostvars[groups['spur_controllers'][0]].spur_controller_port }}"
   delegate_to: "{{ groups['spur_controllers'][0] }}"
   ignore_unreachable: false
+  run_once: true
   register: ru_registration
-  changed_when: false
-  retries: 30
-  delay: 1
-  until: ru_registration.rc == 0 and ru_registration.stdout | trim | length > 0
+  # Attribute missing registrations to their agents below, keeping the existing failure policy.
+  failed_when: false
+  when:
+    - ru_upgrade_role == 'agent'
+    - not ansible_check_mode
+
+- name: Verify this upgraded agent registered
+  ansible.builtin.assert:
+    that:
+      - ru_registration.nodes is defined
+      - ru_registration.nodes.get(ru_activated.node_name, '') | length > 0
+    quiet: true
+    fail_msg: "{{ ru_activated.node_name }} did not register: {{ ru_registration.msg | default(ru_registration.pending | default([])) }}"
   when:
     - ru_upgrade_role == 'agent'
     - not ansible_check_mode

@@ -85,23 +85,6 @@
   register: spur_bin_copy
   when: spur_binary_src | default('') | length > 0
 
-- name: Extract the binaries (only when the tarball actually changed)
-  ansible.builtin.shell: |
-    set -e
-    tar --no-same-owner -xzf "{{ spur_bin_copy.dest }}" -C "{{ spur_install_dir }}"
-    {% for name in hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].manifest %}
-    chmod 0755 {{ (spur_install_dir ~ '/' ~ name) | quote }}
-    {% endfor %}
-    find "{{ spur_install_dir }}" -maxdepth 1 -name '.bins-*.tar.gz' ! -name '.bins-{{ spur_bin_hash }}.tar.gz' -delete
-  args:
-    executable: /bin/bash
-  vars:
-    spur_bin_hash: "{{ hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].archive | basename | regex_replace('\\.tar\\.gz$', '') }}"
-  changed_when: true
-  when:
-    - spur_binary_src | default('') | length > 0
-    - spur_bin_copy.changed
-
 - name: Install Spur via upstream installer
   ansible.builtin.shell: |
     set -euo pipefail
@@ -123,7 +106,7 @@
 # every needed binary is present, and creates all 18 Slurm-compatible
 # symlinks. One round-trip instead of a stat-per-binary and a module-call-
 # per-symlink over the wire.
-- name: Remove unneeded binaries, verify needed binaries, symlink Slurm-compatible CLI names
+- name: Extract changed binaries, verify components, and maintain CLI symlinks
   vars:
     # spurstepd is only *required* when the operator says this build ships it
     # (spur_require_stepd) — an older release has none, and a hard requirement
@@ -141,6 +124,14 @@
          + (['spurd', 'spurstepd'] if not spur_needs_agent_bin else []) }}
   ansible.builtin.shell: |
     set -e
+    {% if spur_binary_src | default('') | length > 0 and spur_bin_copy.changed | default(false) %}
+    tar --no-same-owner -xzf {{ spur_bin_copy.dest | quote }} -C {{ spur_install_dir | quote }}
+    {% for name in hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].manifest %}
+    chmod 0755 {{ (spur_install_dir ~ '/' ~ name) | quote }}
+    {% endfor %}
+    find {{ spur_install_dir | quote }} -maxdepth 1 -name '.bins-*.tar.gz' ! -name {{ spur_bin_copy.dest | basename | quote }} -delete
+    echo BINARIES_EXTRACTED
+    {% endif %}
     rm -f "{{ spur_install_dir }}/spurdbd"
     {% for b in spur_unneeded_bins %}
     rm -f "{{ spur_install_dir }}/{{ b }}"
@@ -167,7 +158,7 @@
   args:
     executable: /bin/bash
   register: spur_ver
-  changed_when: "'SYMLINKS_UPDATED' in spur_ver.stdout"
+  changed_when: "'SYMLINKS_UPDATED' in spur_ver.stdout or 'BINARIES_EXTRACTED' in spur_ver.stdout"
   failed_when: spur_ver.rc != 0
 
 # Loud, because the failure mode it predicts is total and looks unrelated:

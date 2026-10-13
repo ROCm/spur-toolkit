@@ -219,8 +219,10 @@
     - name: Drain + guard already-registered agents against job loss
       ansible.builtin.include_tasks: tasks/drain_and_guard_agent.yml
       when: deploy_agent_registered
-  roles:
-    - role: spur_agent
+  tasks:
+    - name: Configure agents selected for deployment
+      ansible.builtin.include_role:
+        name: spur_agent
       when: >-
         not deploy_agent_registered or
         not (spur_node_busy | default(false)) or
@@ -247,8 +249,10 @@
   serial: 0      # parallel
   vars: *deploy_agents_vars
   pre_tasks: *deploy_agents_pre_tasks
-  roles:
-    - role: spur_agent
+  tasks:
+    - name: Configure agents selected for deployment
+      ansible.builtin.include_role:
+        name: spur_agent
       when: >-
         not deploy_agent_registered or
         not (spur_node_busy | default(false)) or

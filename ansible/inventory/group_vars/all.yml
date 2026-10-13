@@ -116,6 +116,8 @@ spur_force_reinstall: false
 # IMPORTANT: this only ever loosens the agent plays. Controllers are Raft members
 # (skipping one silently breaks quorum) and the accounting host runs the shared
 # DB, so those plays stay strict regardless of this flag.
+# Rolling upgrades also finish other agents/batches after a reachable agent fails,
+# then report each failed upgrade with a nonzero exit. Controllers remain strict.
 spur_ignore_unreachable_agents: false
 
 # Submit a real test job at the end of deploy.yml / rolling_upgrade.yml to

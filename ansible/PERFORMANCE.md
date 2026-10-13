@@ -14,7 +14,7 @@ tasks, and combine independent probes without removing safety barriers.
 |---|---|---|
 | `deploy.yml` | Shared installation preparation, MPI discovery, endpoint construction and batched registration verification; merged auth preflight and controller identity facts. | Full convergence, config preservation/overwrite, default force behavior, skip-busy option, controller auth-switch barrier and unreachable-agent policy. |
 | `add_nodes.yml` | Skip the entire mesh play on direct transport; dynamically include only required roles; one registration query for the candidates and one fleet query per readiness attempt. | Existing agents are not restarted; resolved node names, including inventory aliases, are checked; controller config refresh and full mesh updates remain. |
-| `rolling_upgrade.yml` | Existing binary fast path retained; configuration fallback benefits from shared role changes. Controller health uses the preserved daemon config, with underlying errors included in timeouts. An unhealthy existing service fails immediately instead of entering provisioning. | Controller serialization/leader ordering, batching, native-auth carry-forward, binary identity verification and the original provisioning fallback. |
+| `rolling_upgrade.yml` | Existing binary fast path retained; configuration fallback benefits from shared role changes. Controller health uses the preserved daemon config, with underlying errors included in timeouts. An unhealthy existing service fails immediately instead of entering provisioning. The existing agent-tolerance flag continues later batches and reports failures at the end. | Controller serialization/leader ordering, batching, native-auth carry-forward, binary identity verification and the original provisioning fallback. |
 | `remove_nodes.yml` | One shared drain polling window instead of a sequential timeout per node; identity-only facts; cleanup tasks expand only on selected agents; no mesh play under direct transport or repeated mesh fact gather. | Refuse/skip/force decisions, workload cleanup before daemon stop, supervisor cleanup after stop, authoritative removal and surviving mesh-member updates. |
 | `teardown.yml` | Combine service stop and stray-daemon cleanup; omit native-auth cleanup tasks on non-wiping or non-auth runs. | k0s reset before stopping Spur, optional drain, workload/daemon/supervisor order, session preservation without wipe and shared-key protection. |
 | `healthcheck.yml` | One remote probe per host role. Controller tasks: 10 → 2; agent tasks: 11 → 3; accounting tasks: 4 → 2, with the disabled accounting play omitted. | Service/port, controller/queue/accounting, auth socket/key, cgroup, optional supervisor binary and disk checks; failures remain nonzero, and only explicitly ignored unreachable agents are skipped. |
@@ -24,16 +24,17 @@ tasks, and combine independent probes without removing safety barriers.
 
 ## Shared costs removed
 
-- Installation has 11 task definitions instead of 14. Optional binary discovery,
+- Installation has 10 task definitions instead of 14; extraction and binary
+  housekeeping share one remote call. Optional binary discovery,
   initial file hashing and packaging run once per distinct source/component set
   in a batch. A delegated fact holds the result instead of copying the entire
   manifest into every host's facts. Bundle assembly still verifies source bytes.
 - MPI discovery no longer launches four local `stat` modules for each agent:
   a 200-agent batch sharing one source avoids 800 repeated local probes.
-- Agent controller endpoints are constructed in one expression, without one
+- Agent address and controller endpoints are resolved together, without one
   `set_fact` result per controller per agent. Repeated role use does not append
   duplicate endpoints.
-- Verification uses one `show node` query per batch, rather than one delegated
+- Verification, including the in-place activation path, uses one `show node` query per batch, rather than one delegated
   query per agent. Failed snapshots clear previous state instead of reporting
   stale registrations. Retryable query failures share the configured deadline.
 - Authentication's clock, NSS and binary checks share one read-only remote call.
@@ -75,10 +76,55 @@ connections and fixture commands replacing live services. Coverage includes:
   stale executable, unsafe unit, corrupt archive and provisioning fallback tests;
 - controller health using its preserved daemon config despite stale CLI auth
   configuration, informative readiness errors, and early refusal of unhealthy
-  existing services without re-provisioning or changing their binaries.
+  existing services without re-provisioning or changing their binaries;
+- ordinary agent failures with serial batches of one and two: strict aborts,
+  opt-in continuation through later batches, and a nonzero final result.
 
 All existing CI job commands/assertions remain. A healthcheck container smoke
 test is added to `integration-conf`; a compatibility job runs the local suite on
-Ansible 2.17 and 2.19 alongside the existing default-version lint job. The live
-container integration jobs are retained but require CI execution; local fixture
-results do not establish fleet timing, HA behavior or workload survival.
+Ansible 2.17 and 2.19 alongside the existing default-version lint job. All hosted CI jobs remain pending execution. The lab validation below is
+separate from the deterministic fixture suite.
+
+## Additional regression coverage
+
+The existing CI jobs and their shell commands/assertions are retained. The
+container configuration job now also stops one agent deliberately and checks
+that an in-place run with the existing tolerance flag processes later serial
+batches, leaves the failed agent stopped, and returns a nonzero final result.
+Local fixtures cover this policy with batches of one and two.
+
+Workload cleanup rejects PID 0, PID 1 and negative PIDs before signaling or
+identifying jobs for cancellation. This matters with shared cgroup mounts:
+processes outside a container's PID namespace appear as zero, which would
+otherwise signal the cleanup process group. An isolated process-group test
+exercises the production cleanup script. Another real-task fixture checks that
+idle cleanup does not expand controller reconciliation tasks.
+
+## Live validation
+
+The scale fixture had three HA controllers, 200 workers and 100 running jobs.
+An unchanged-binary in-place rerun took 5m32s with the original inventory order
+and 3m00s with hosts interleaved across the four physical machines, using the
+same batch size of 200 and 40 forks. Staging fell from 139s to 73s and activation
+from 161s to 76s. These are warm-rerun measurements, not timings for replacing
+binaries across the whole fleet. The latter was tested separately on an isolated
+worker with a live job: its agent PID changed, the supervisor PID stayed the
+same, and job output continued across a real release-to-target replacement.
+
+Removal and re-addition of one idle worker through the full inventory passed
+(1m03s and 1m41s). The full deployment test with busy-node skipping passed:
+100 busy workers kept their daemon/supervisor PIDs and jobs; 100 idle workers
+restarted. That deployment measured 13m32s before the last extraction/fact/task
+merges. Final health and binary verification passed on all 203 hosts. Binary
+verification accepts a re-extracted identical executable despite its new inode,
+while still rejecting different running bytes.
+
+A separate container cluster exercised fresh deployment, native authentication,
+PMIx deployment, PostgreSQL account/QoS/user creation and deletion, Kubernetes
+startup and worker addition, cross-worker pod traffic, force-upgrade workload
+termination, and Kubernetes reset before teardown. Full cleanup used the real
+teardown playbook. Default JWT Kubernetes operations passed; native-auth worker
+addition exposed an upstream CLI authentication defect and remains blocked on
+that binary fix. Shared host cgroup mounts also exposed an upstream daemon
+cleanup bug (signaling PID zero). Isolating test-container cgroups avoids that
+fixture collision; the playbook cleanup now rejects zero/negative PIDs itself.

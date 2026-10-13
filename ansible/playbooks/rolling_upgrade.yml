@@ -283,8 +283,13 @@
   ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   max_fail_percentage: "{{ 100 if (spur_ignore_unreachable_agents | default(false) | bool) else 0 }}"
   tasks:
-    - name: Stage this host's bundles
-      ansible.builtin.import_tasks: tasks/stage_upgrade.yml
+    - name: Stage agent bundles with the configured failure policy
+      block:
+        - name: Stage this host's bundles
+          ansible.builtin.import_tasks: tasks/stage_upgrade.yml
+      rescue:
+        - name: Record or stop on this agent failure
+          ansible.builtin.include_tasks: tasks/handle_upgrade_failure.yml
 
 - name: Gather facts for upgrades that configure hosts
   hosts: "{{ hostvars[groups['spur_controllers'][0]].ru_configuration_hosts | default([]) }}"
@@ -423,12 +428,18 @@
     dckj_force_flag: spur_force_upgrade_busy_agents
     dckj_in_place: "{{ spur_in_place_upgrade | default(false) | bool }}"
   tasks:
-    - name: Run the selected upgrade path
-      ansible.builtin.include_tasks: >-
-        {{ 'tasks/upgrade_binary_host.yml' if (inventory_hostname in hostvars['localhost'].ru_prepared.artifacts)
-           else 'tasks/upgrade_agent_full.yml' }}
-      vars:
-        ru_upgrade_role: agent
+    - name: Upgrade agents with the configured failure policy
+      when: ru_upgrade_failure is not defined
+      block:
+        - name: Run the selected upgrade path
+          ansible.builtin.include_tasks: >-
+            {{ 'tasks/upgrade_binary_host.yml' if (inventory_hostname in hostvars['localhost'].ru_prepared.artifacts)
+               else 'tasks/upgrade_agent_full.yml' }}
+          vars:
+            ru_upgrade_role: agent
+      rescue:
+        - name: Record or stop on this agent failure
+          ansible.builtin.include_tasks: tasks/handle_upgrade_failure.yml
 
 - name: Verify the upgraded cluster still schedules work
   # Opt-in (see spur_verify_enabled) — submits a real job, so it's off by
@@ -445,3 +456,19 @@
   gather_facts: no
   tasks:
     - ansible.builtin.include_tasks: tasks/print_verification_summary.yml
+
+# Target only failed hosts, including when --limit excludes the controllers.
+- name: Report failed agents after completing the remaining upgrades
+  hosts: >-
+    {%- set names = [] -%}
+    {%- for name in groups['spur_agents'] -%}
+    {%- if hostvars[name].ru_upgrade_failure is defined -%}
+    {%- set _ = names.append(name) -%}
+    {%- endif -%}
+    {%- endfor -%}
+    {{ names | join(':') if names else 'all:!all' }}
+  gather_facts: false
+  tasks:
+    - name: Fail the final result for this agent
+      ansible.builtin.fail:
+        msg: "Upgrade failed (remaining hosts were processed): {{ ru_upgrade_failure }}"

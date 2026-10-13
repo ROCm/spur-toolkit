@@ -1399,6 +1399,36 @@ jobs:
 
       # TODO(next): manage_accounts.yml / healthcheck.yml
 
+      - name: Failed in-place agent does not prevent later serial batches
+        working-directory: ansible
+        run: |
+          set -euo pipefail
+          trap 'docker exec gpu-1 systemctl start spurd' EXIT
+          docker exec gpu-1 systemctl stop spurd
+          set +e
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            --limit gpu-1,gpu-2,gpu-3 \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
+            -e spur_accounting_enabled=false -e spur_in_place_upgrade=true \
+            -e spur_rolling_batch_size=1 -e spur_ignore_unreachable_agents=true \
+            > /tmp/failed-agent-upgrade.log 2>&1
+          result=$?
+          set -e
+          cat /tmp/failed-agent-upgrade.log
+          test "$result" -eq 2
+          grep -F 'Upgrade failed (remaining hosts were processed)' /tmp/failed-agent-upgrade.log
+          grep -E '^gpu-1 +:.*failed=1' /tmp/failed-agent-upgrade.log
+          for node in gpu-2 gpu-3; do
+            grep -F "for $node" /tmp/failed-agent-upgrade.log
+            grep -E "^$node +:.*failed=0" /tmp/failed-agent-upgrade.log
+            docker exec "$node" systemctl is-active --quiet spurd
+          done
+          if docker exec gpu-1 systemctl is-active --quiet spurd; then
+            echo 'An unhealthy agent unexpectedly entered provisioning'
+            exit 1
+          fi
+
       - name: Dump logs on failure
         if: failure()
         run: |

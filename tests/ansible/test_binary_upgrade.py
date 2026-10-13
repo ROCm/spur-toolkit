@@ -383,7 +383,7 @@ from pathlib import Path
 with (Path(os.environ['SPUR_TEST_STATE']) / 'cli-calls').open('a') as log:
     log.write(' '.join(sys.argv[1:]) + '\n')
 if sys.argv[1:] == ['nodes']: print('healthy')
-elif sys.argv[1:] == ['show', 'node', 'registered-worker']:
+elif sys.argv[1:] == ['show', 'node']:
     print('NodeName=registered-worker\nState=ALLOCATED\nCPUAlloc=1')
 else: sys.exit('unexpected state mutation')
 """
@@ -525,7 +525,7 @@ class PlaybookTests(unittest.TestCase):
                     agent_play = result.stdout.split(
                         "PLAY [Rolling upgrade — agents", 1
                     )[1].split("\nPLAY [", 1)[0]
-                    self.assertEqual(agent_play.count("TASK ["), 4)
+                    self.assertEqual(agent_play.count("TASK ["), 5)
                     self.assertEqual(
                         result.stdout.count("TASK [Stage binary bundles"), 2
                     )
@@ -538,7 +538,7 @@ class PlaybookTests(unittest.TestCase):
                     calls = (root / "cli-calls").read_text()
                     self.assertNotIn("drain", calls)
                     self.assertNotIn("RESUME", calls)
-                    self.assertIn("show node registered-worker", calls)
+                    self.assertEqual(calls.splitlines().count("show node"), run + 1)
                 for extra in (
                     ["--limit", "worker-alias"],
                     ["--limit", "worker-alias", "--check"],
