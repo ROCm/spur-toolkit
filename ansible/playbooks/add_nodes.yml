@@ -88,7 +88,10 @@
 # Existing members whose conf already exists just restore it (A1 guard) — no re-key. The new node
 # MUST have spur_wg_address in inventory. Single-controller clusters collapse to controller + node.
 - name: Join new node(s) to the WireGuard mesh
-  hosts: "spur_controllers:spur_agents:spur_login:{{ new_nodes | default('') | split(',') | map('trim') | select | join(':') }}"
+  hosts: >-
+    {{ 'spur_controllers:spur_agents:spur_login' ~ (''
+       if (hostvars[groups['spur_controllers'][0]].spur_transport | default('direct') == 'wireguard')
+       else ':!all') }}
   become: true
   gather_facts: no
   # Not any_errors_fatal: an unrelated unreachable existing member shouldn't abort
@@ -119,38 +122,41 @@
       ansible.builtin.set_fact:
         spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
 
-    - name: Is this node already registered with the controller?
-      # `spur show node <name>` does NOT filter server-side — it prints every node
-      # and returns rc=0 regardless of the name. So grep the exact `NodeName=<name>`
-      # line to tell whether THIS node is actually registered; rc alone is useless.
-      ansible.builtin.shell: |
-        {{ spur_install_dir }}/spur show node {{ spur_node_name }} 2>/dev/null \
-          | grep -qx "NodeName={{ spur_node_name }}"
-      args:
-        executable: /bin/bash
+    - name: Query existing registrations once for all new nodes
+      spur_node_snapshot:
+        binary: "{{ hostvars[groups['spur_controllers'][0]].spur_install_dir }}/spur"
       delegate_to: "{{ groups['spur_controllers'][0] }}"
-      register: an_registered
-      changed_when: false
-      failed_when: false
+      delegate_facts: true
+      run_once: true  # noqa run-once[task]
+
+    - name: Is this node already registered with the controller?
+      ansible.builtin.set_fact:
+        an_registered: "{{ spur_node_name in hostvars[groups['spur_controllers'][0]].spur_node_snapshot.nodes }}"
 
     - name: Note already-registered nodes (will be skipped)
       ansible.builtin.debug:
         msg: "{{ spur_node_name }} is already registered — skipping install/start (idempotent)."
-      when: an_registered.rc == 0
-  roles:
-    - role: spur_install
-      when: an_registered.rc != 0
+      when: an_registered
+  tasks:
+    - name: Install unregistered agents
+      ansible.builtin.include_role:
+        name: spur_install
+      when: not an_registered
     # A new agent joining an auth-enabled cluster needs its keys + spurauthd
     # before spurd starts (spurd mints its register call). Keys come from the
     # control-node spur_auth_keys_dir (already the source of truth), so nothing
     # is regenerated. Gated on spur_auth_enabled and the same not-already-
     # registered guard as the roles around it.
-    - role: spur_auth
+    - name: Provision authentication on unregistered agents
+      ansible.builtin.include_role:
+        name: spur_auth
       when:
         - spur_auth_enabled | default(false) | bool
-        - an_registered.rc != 0
-    - role: spur_agent
-      when: an_registered.rc != 0
+        - not an_registered
+    - name: Start unregistered agents
+      ansible.builtin.include_role:
+        name: spur_agent
+      when: not an_registered
 
 # --- Refresh spur.conf on the controllers WITHOUT restarting them ---
 # Same preserve-by-default behavior as deploy.yml/rolling_upgrade.yml: an
@@ -177,30 +183,13 @@
   vars:
     add_list: "{{ new_nodes | default('') | split(',') | map('trim') | select | list }}"
   tasks:
-    - name: Wait for each new node to appear in the cluster
-      # grep the exact NodeName= line — `spur show node` doesn't filter, so a bare
-      # rc check would pass even if the node never registered.
-      #
-      # Check by spur_node_name (the name the agent actually registered
-      # under — ansible_hostname, resolved per-host in "Bring new agents
-      # online" above), NOT the bare inventory alias (item/add_list). Those
-      # two are only the same when the inventory alias happens to match the
-      # machine's real hostname — not guaranteed, and when they differ this
-      # loop was checking for a NodeName that could never appear, reporting
-      # "did not register" for a node that actually registered fine, just
-      # under its real name.
-      ansible.builtin.shell: |
-        for i in $(seq 1 30); do
-          {{ spur_install_dir }}/spur show node {{ hostvars[item].spur_node_name | default(item) }} 2>/dev/null \
-            | grep -qx "NodeName={{ hostvars[item].spur_node_name | default(item) }}" && exit 0
-          sleep 1
-        done
-        echo "{{ item }} ({{ hostvars[item].spur_node_name | default(item) }}) did not register within 30s"
-        exit 1
-      args:
-        executable: /bin/bash
-      loop: "{{ add_list }}"
-      changed_when: false
+    - name: Wait for all new nodes to appear using one fleet query per attempt
+      spur_node_snapshot:
+        binary: "{{ spur_install_dir }}/spur"
+        expected: "{{ add_list | map('extract', hostvars, 'spur_node_name') | list }}"
+        timeout: 30
+      register: an_wait
+      failed_when: an_wait.pending is not defined or an_wait.pending | length > 0
 
     - name: Show cluster nodes
       ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"

@@ -70,34 +70,18 @@
       loop: "{{ remove_list }}"
       changed_when: true
 
-    # Also accept DOWN: a genuinely unreachable node may independently cross
-    # its heartbeat timeout and flip to DOWN, an equally valid "stopped
-    # scheduling here" outcome — same acceptance as drain_and_guard_agent.yml.
-    - name: Wait for each node to fully drain
-      ansible.builtin.shell: |
-        for i in $(seq 1 {{ spur_drain_wait_secs | default(120) }}); do
-          st=$({{ spur_install_dir }}/spur show node {{ item }} 2>/dev/null \
-               | awk -v n="{{ item }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
-               | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2)
-          case "$st" in
-            DRAINED|DOWN) exit 0 ;;
-          esac
-          sleep 1
-        done
-        echo "timed out waiting for {{ item }} to drain (last state: $st)"
-        exit 1
-      args:
-        executable: /bin/bash
-      loop: "{{ remove_list }}"
+    # Every drained node gets the same polling window; no N-times-timeout serial loop.
+    - name: Wait for the requested nodes to drain using fleet snapshots
+      spur_node_snapshot:
+        binary: "{{ spur_install_dir }}/spur"
+        expected: "{{ remove_list }}"
+        states: [DRAINED, DOWN]
+        timeout: "{{ spur_drain_wait_secs | default(120) }}"
       register: rn_drain_wait
-      changed_when: false
-      # Non-fatal here — a still-busy node is an expected case handled below
-      # via rn_busy_nodes, not an error.
-      failed_when: false
 
     - name: Determine which nodes are busy (reachable but still draining)
       ansible.builtin.set_fact:
-        rn_busy_nodes: "{{ rn_drain_wait.results | selectattr('rc', 'ne', 0) | map(attribute='item') | list }}"
+        rn_busy_nodes: "{{ rn_drain_wait.pending }}"
 
     - name: Refuse to remove busy nodes unless skip or force is set
       ansible.builtin.fail:
@@ -150,7 +134,7 @@
   hosts: spur_agents
   become: true
   gather_facts: yes
-  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  gather_subset: ["!all", "!min", "platform"]
   # An unrelated agent being down must not abort the removal (the play already
   # intends to skip unreachable nodes). Opt in with spur_ignore_unreachable_agents.
   # An unreachable host has no gathered facts, so the when: guards below fall back
@@ -163,136 +147,20 @@
     # hostvars[] explicitly (same lesson as spur_accounting_listen_ip).
     rn_actual_remove_list: "{{ hostvars[groups['spur_controllers'][0]].rn_actual_remove_list | default([]) }}"
   tasks:
-    # Only nodes actually being removed — a node left in the cluster via
-    # spur_skip_busy_agents must NOT have spurd touched at all, or it would
-    # gracefully deregister on SIGTERM despite being "left in the cluster".
-    - name: Kill workloads still running on a node being force-removed
-      ansible.builtin.include_tasks: tasks/kill_workload_processes.yml
-      when: >-
-        (spur_force_remove_busy_nodes | default(false) | bool)
-        and (rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0)
-
-    - name: Stop + disable spurd on nodes being removed
-      ansible.builtin.systemd:
-        name: spurd
-        state: stopped
-        enabled: false
+    - name: Clean up only agents selected for removal
+      ansible.builtin.include_tasks: tasks/remove_agent.yml
       when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
-      failed_when: false
-
-    # The decommissioned host no longer belongs to any cluster, so its credential
-    # mint should stop too. No-op (ignored) if auth was never enabled here.
-    - name: Stop + disable spurauthd on nodes being removed (native auth)
-      ansible.builtin.systemd:
-        name: spurauthd
-        state: stopped
-        enabled: false
-      failed_when: false
-      when:
-        - spur_auth_enabled | default(false) | bool
-        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
-
-    # CLI conf is always host-local (per spur_auth's own doc), so safe to remove
-    # on any single node regardless of where spur_auth_key_dir points.
-    - name: Remove native-auth CLI config on nodes being removed
-      ansible.builtin.file:
-        path: "{{ spur_auth_conf_dir }}/spur.conf"
-        state: absent
-      when:
-        - spur_auth_enabled | default(false) | bool
-        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
-
-    # Unlike teardown.yml (whole cluster coming down), this playbook removes ONE
-    # node from an otherwise-live cluster — so only wipe *.jwks when key_dir is
-    # still the per-host default; a relocated (likely shared) dir is left alone
-    # to avoid deleting keys the surviving cluster still needs.
-    - name: Remove native-auth keys on nodes being removed (skipped on a shared key dir)
-      ansible.builtin.shell: |
-        rm -f {{ spur_auth_key_dir }}/*.jwks
-      args:
-        executable: /bin/bash
-      changed_when: true
-      failed_when: false
-      when:
-        - spur_auth_enabled | default(false) | bool
-        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
-        - spur_auth_key_dir == spur_auth_conf_dir
-
-    - name: Note native-auth keys were left in place (spur_auth_key_dir looks shared)
-      ansible.builtin.debug:
-        msg: >-
-          {{ spur_auth_key_dir }} differs from spur_auth_conf_dir — treating it as a
-          shared/relocated key location and leaving its *.jwks files in place to avoid
-          deleting keys the surviving cluster still needs. Clean them up manually if
-          this host truly had its own local copy.
-      when:
-        - spur_auth_enabled | default(false) | bool
-        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
-        - spur_auth_key_dir != spur_auth_conf_dir
-
-    - name: Remove native-auth env vars from /etc/environment on nodes being removed
-      ansible.builtin.lineinfile:
-        path: /etc/environment
-        regexp: "{{ item }}"
-        state: absent
-      loop:
-        - '^SPUR_AUTH_PLUGIN='
-        - '^SPUR_CLUSTER_NAME='
-      when:
-        - spur_auth_enabled | default(false) | bool
-        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
-
-    # A job supervisor is built to outlive its agent (own session, reparented
-    # to init, spared by the unit's KillMode=process), so stopping spurd above
-    # leaves one running on a host that is no longer part of any cluster. The
-    # node is being decommissioned and nothing will ever re-adopt its sessions,
-    # so the on-disk state goes with them. A cleanly drained node has neither,
-    # and the task is a no-op there.
-    - name: Reap job supervisors and session state on nodes being removed
-      ansible.builtin.include_tasks: tasks/reap_stepd_supervisors.yml
-      vars:
-        stepd_purge_sessions: true
-      ignore_errors: true
-      when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
-
-    # A supervisor surviving SIGKILL must not be swallowed by ignore_errors above —
-    # the final play's "removed" message needs to know so it isn't misleading.
-    - name: Record whether this node's supervisor reap failed
-      ansible.builtin.set_fact:
-        rn_reap_failed: "{{ inventory_hostname if (stepd_reap.rc | default(0) | int != 0) else '' }}"
-      when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
-
-    # Mesh cleanup (wireguard only). Capture this node's pubkey so the controller can drop it as a
-    # peer, then tear down its interface so it doesn't linger as a ghost peer or rejoin on reboot.
-    - name: Read removed node's WG pubkey (for controller peer removal)
-      ansible.builtin.command: "wg show {{ spur_wg_interface }} public-key"
-      register: rn_wg_pubkey
-      changed_when: false
-      failed_when: false
-      when:
-        - spur_transport | default('direct') == 'wireguard'
-        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
-
-    - name: Tear down the mesh interface on the removed node
-      ansible.builtin.shell: |
-        systemctl disable wg-quick@{{ spur_wg_interface }} 2>/dev/null || true
-        wg-quick down {{ spur_wg_interface }} 2>/dev/null || ip link del {{ spur_wg_interface }} 2>/dev/null || true
-        rm -f /etc/wireguard/{{ spur_wg_interface }}.conf
-      args:
-        executable: /bin/bash
-      changed_when: true
-      when:
-        - spur_transport | default('direct') == 'wireguard'
-        - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
 
 # Drop the removed node's WG peer from every SURVIVING member (wireguard only), not just controllers:
 # net mesh peered it with every node and wg-quick save persisted that, so it lingers as a ghost peer
 # elsewhere otherwise. Survivors only — a node being removed already had its interface torn down above.
 - name: Remove each node's WG peer from every surviving mesh member
-  hosts: spur_controllers:spur_agents:spur_login
+  hosts: >-
+    {{ 'spur_controllers:spur_agents:spur_login' ~ (''
+       if (hostvars[groups['spur_controllers'][0]].spur_transport | default('direct') == 'wireguard')
+       else ':!all') }}
   become: true
-  gather_facts: yes
-  gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
+  gather_facts: no
   # A down member just isn't refreshed for this removal (reconcile/next deploy fixes it).
   ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   vars:

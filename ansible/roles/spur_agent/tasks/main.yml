@@ -58,18 +58,16 @@
     - not ((spur_cgroup_require_v2 | default(false) | bool) or (spur_cgroup_required | default(false) | bool))
 
 - name: Resolve controller endpoint(s) agents will talk to
-  # spurd --controller accepts a comma-separated endpoint list and rotates past a
-  # dead one (spur-client endpoint rotation), so every controller is listed here —
-  # not just the first — for real client-side failover in HA mode. Non-leader
-  # controllers forward writes to the leader via Raft either way.
-  vars:
-    controller_ip: >-
-      {{ hostvars[item]['spur_wg_address'] if spur_transport == 'wireguard'
-         else (hostvars[item]['ansible_host'] | default(hostvars[item]['ansible_default_ipv4']['address'])) }}
   ansible.builtin.set_fact:
     spur_controller_endpoints: >-
-      {{ (spur_controller_endpoints | default([])) + ["http://" ~ controller_ip ~ ":" ~ spur_controller_port] }}
-  loop: "{{ groups['spur_controllers'] }}"
+      {%- set endpoints = [] -%}
+      {%- for name in groups['spur_controllers'] -%}
+      {%- set h = hostvars[name] -%}
+      {%- set address = h.spur_wg_address if spur_transport == 'wireguard'
+          else (h.ansible_host | default(h.ansible_default_ipv4.address)) -%}
+      {%- set _ = endpoints.append('http://' ~ address ~ ':' ~ spur_controller_port) -%}
+      {%- endfor -%}
+      {{ endpoints }}
 
 # Every agent gets the CLI now (spur_install always installs it), so this is
 # unconditional — CLI on agents must target the controller over the same
@@ -89,24 +87,9 @@
     mode: "0755"
   when: spur_mpi_plugin_enabled | default(true) | bool
 
-- name: Locate MPI plugin in spur_binary_src on control node
-  ansible.builtin.stat:
-    path: "{{ item }}"
-  register: spur_mpi_src_stats
-  loop:
-    - "{{ spur_binary_src }}/spur_mpi_pmix.so"
-    - "{{ spur_binary_src }}/libspur_mpi_pmix.so"
-    - "{{ spur_binary_src }}/lib/spur/spur_mpi_pmix.so"
-    - "{{ spur_binary_src | dirname }}/lib/spur/spur_mpi_pmix.so"
-  delegate_to: localhost
-  become: false
-  when:
-    - spur_mpi_plugin_enabled | default(true) | bool
-    - spur_binary_src | default('') | length > 0
-
-- name: Pick MPI plugin source from spur_binary_src
+- name: Reuse the MPI source discovered during installation
   ansible.builtin.set_fact:
-    spur_mpi_plugin_src: "{{ spur_mpi_src_stats.results | selectattr('stat.exists') | map(attribute='item') | first | default('') }}"
+    spur_mpi_plugin_src: "{{ hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].mpi_source }}"
   when:
     - spur_mpi_plugin_enabled | default(true) | bool
     - spur_binary_src | default('') | length > 0

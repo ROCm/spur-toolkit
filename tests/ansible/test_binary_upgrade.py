@@ -99,6 +99,105 @@ class UpgradeTests(unittest.TestCase):
         )
         return install, state, args
 
+    def test_controller_health_uses_preserved_daemon_config_not_stale_cli_auth(self):
+        self.spec["roles"] = ["controller"]
+        (self.source / "spur").write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys\n"
+            "assert 'SPUR_AUTH_PLUGIN' not in os.environ\n"
+            "assert 'SPUR_CLUSTER_NAME' not in os.environ\n"
+            "assert pathlib.Path(os.environ['SPUR_CONF']).read_text() == 'preserved'\n"
+            "assert os.environ['SPUR_CONTROLLER_ADDR'] == 'http://127.0.0.1:1234'\n"
+            "print('healthy')\n"
+        )
+        bundle = upgrade.prepare({"ctl": self.spec}, self.root / "cache")["artifacts"][
+            "ctl"
+        ]["controller"]
+        install = self.root / "installed"
+        shutil.copytree(self.source, install)
+        (self.root / "etc").mkdir()
+        (self.root / "etc/spur.conf").write_text("preserved")
+        real_command = upgrade.command
+
+        def command(argv, **kwargs):
+            if argv[0] == str(install / "spur"):
+                return real_command(argv, **kwargs)
+            if argv[-1] == "-V":
+                return "fixture version"
+            self.fail("A matching controller binary must not be restarted: %r" % argv)
+
+        with (
+            patch.object(upgrade, "service", return_value={"pid": 123}),
+            patch.object(
+                upgrade, "running_digest", return_value=bundle["manifest"]["spurctld"]
+            ),
+            patch.object(upgrade.socket, "create_connection"),
+            patch.object(upgrade, "command", side_effect=command),
+            patch.dict(
+                os.environ,
+                {
+                    "SPUR_AUTH_PLUGIN": "spur",
+                    "SPUR_CLUSTER_NAME": "stale",
+                    "SPUR_CONF": "/wrong/config",
+                },
+            ),
+        ):
+            result = upgrade.activate(
+                **bundle,
+                install_dir=str(install),
+                home=str(self.root),
+                role="controller",
+                port=1234,
+                timeout=1,
+                plugin_dir=str(install),
+                auth=False,
+                cluster="fixture",
+            )
+        self.assertFalse(result["changed"])
+        self.assertTrue(result["binary_current"])
+        self.assertEqual(result["restarted"], [])
+        self.assertEqual((self.root / "etc/spur.conf").read_text(), "preserved")
+
+    def test_unhealthy_existing_service_fails_without_provisioning_or_binary_changes(
+        self,
+    ):
+        install, _, args = self.activation_fixture()
+        before = (install / "spurd").read_bytes()
+        with patch.object(
+            upgrade,
+            "command",
+            return_value=(
+                "ActiveState=activating\nSubState=auto-restart\nMainPID=0\n"
+                "Result=signal\nExecMainStatus=9\n"
+            ),
+        ) as commands:
+            with self.assertRaisesRegex(RuntimeError, "spurd is unhealthy.*exit=9"):
+                upgrade.activate(**args)
+        self.assertEqual(commands.call_count, 1)
+        self.assertEqual(commands.call_args.args[0][:3], ["systemctl", "show", "spurd"])
+        self.assertEqual((install / "spurd").read_bytes(), before)
+        self.assertEqual(list(install.glob(".spur-upgrade-*")), [])
+
+    def test_readiness_timeout_reports_the_underlying_cli_error(self):
+        cli = self.root / "failing-cli"
+        cli.write_text(
+            "#!/bin/sh\necho 'controller did not advertise a native auth audience' >&2\nexit 1\n"
+        )
+        cli.chmod(0o755)
+        with (
+            patch.object(upgrade, "service", return_value={"pid": 123}),
+            patch.object(upgrade, "running_digest", return_value="expected"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "native auth audience"):
+                upgrade.wait_ready(
+                    "spurctld",
+                    "expected",
+                    "/fake/spurctld",
+                    None,
+                    0,
+                    health_command=[str(cli)],
+                )
+
     def test_stale_process_restarts_even_when_disk_matches_and_rerun_is_noop(self):
         install, state, args = self.activation_fixture()
         shutil.copyfile(self.source / "spurd", install / "spurd")

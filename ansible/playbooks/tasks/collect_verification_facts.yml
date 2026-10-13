@@ -54,17 +54,12 @@
   register: spur_verify_probe
   changed_when: false
 
-- name: "Verify: this node's registration state"
-  ansible.builtin.shell: |
-    set -o pipefail
-    {{ spur_install_dir }}/spur show node {{ spur_node_name | default(ansible_hostname) }} 2>/dev/null \
-      | awk -v n="{{ spur_node_name | default(ansible_hostname) }}" '/^NodeName=/{p=($0=="NodeName="n)} p' \
-      | grep -oE 'State=[A-Z]+' | head -1 | cut -d= -f2
-  args:
-    executable: /bin/bash
+- name: "Verify: query registration once for the batch"
+  spur_node_snapshot:
+    binary: "{{ hostvars[groups['spur_controllers'][0]].spur_install_dir }}/spur"
   delegate_to: "{{ groups['spur_controllers'][0] }}"
-  register: spur_verify_node_state
-  changed_when: false
+  delegate_facts: true
+  run_once: true
   failed_when: false
   when: spur_verify_check_registration | default(false)
 
@@ -89,4 +84,7 @@
           ==
           ((spur_verify_probe.get('stdout_lines', []) | select('match', '^ONDISK_INODE=') | first | default('=-2')) | regex_replace('^ONDISK_INODE=', ''))
         }}
-      registered_state: "{{ spur_verify_node_state.get('stdout', '') | trim }}"
+      registered_state: >-
+        {{ (hostvars[groups['spur_controllers'][0]].spur_node_snapshot.nodes | default({})).get(
+            spur_node_name | default(ansible_hostname | default(inventory_hostname)), '')
+           if (spur_verify_check_registration | default(false)) else '' }}

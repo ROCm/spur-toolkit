@@ -73,37 +73,19 @@
         var: k8s_up_out.stdout_lines
 
     - name: Wait for the cluster to reach ready
-      # pipefail so a failing `spur k8s status` (e.g. controller unreachable) surfaces instead of
-      # awk swallowing it and looking identical to "not ready yet".
-      ansible.builtin.shell: |
-        set -o pipefail
-        {{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }} 2>/dev/null \
-          | awk '/^phase:/ {print $2}'
-      args:
-        executable: /bin/bash
+      ansible.builtin.command:
+        argv: ["{{ spur_install_dir }}/spur", k8s, status, --controller, "{{ ctrl_addr }}"]
       register: k8s_phase
       # Fold the terminal 'degraded' state into `until` so a degraded result fails fast instead of
       # burning the whole retry budget (failed_when is only evaluated after the loop ends).
-      until: k8s_phase.stdout | trim in ['ready', 'degraded']
+      until: >-
+        k8s_phase.stdout is search('(?m)^phase: (ready|degraded)\s*$')
       retries: "{{ k8s_ready_retries }}"
       delay: "{{ k8s_ready_delay }}"
       changed_when: false
-      # Anything but a clean rc==0 + stdout=='ready' is a failure. rc != 0 catches `spur k8s
-      # status` failing (e.g. controller unreachable) even on an attempt whose stdout still
-      # happens to carry a stale/partial 'phase:' line from before the failure — pipefail alone
-      # stops that from being masked by awk, but a custom failed_when has to check it explicitly
-      # too, or it's right back to swallowing a real failure (SPUR-347). stdout != 'ready' covers
-      # both the explicit 'degraded' terminal state and the retry budget being exhausted without
-      # ever reaching a terminal phase (e.g. spurctld unreachable/timeout/empty stdout on every
-      # attempt).
       failed_when: >-
-        k8s_phase.rc != 0 or k8s_phase.stdout | trim != 'ready'
-
-    - name: Final cluster status
-      ansible.builtin.command: "{{ spur_install_dir }}/spur k8s status --controller {{ ctrl_addr }}"
-      register: k8s_final
-      changed_when: false
+        k8s_phase.rc != 0 or not (k8s_phase.stdout is search('(?m)^phase: ready\s*$'))
 
     - name: Result
       ansible.builtin.debug:
-        var: k8s_final.stdout_lines
+        var: k8s_phase.stdout_lines

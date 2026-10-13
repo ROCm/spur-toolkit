@@ -35,6 +35,7 @@ def main():
     try:
         result = activate(**params, check=module.check_mode)
     except ConfigurationRequired as error:
+        module.warn("Using provisioning fallback: %s" % error)
         module.exit_json(changed=False, configuration_required=str(error))
     except ActivationFailed as error:
         module.fail_json(changed=True, msg=str(error))

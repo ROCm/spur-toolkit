@@ -52,102 +52,32 @@
     msg: "{{ pf_preflight.stdout_lines | select('match', '^(spurctld|spurd|spurrestd) running') | list | default(['no spur daemons running']) }}"
   when: not (pf_preflight.unreachable | default(false))
 
-# spurstepd only exists in builds from ROCm/spur#754 onward, so it can't be
-# copied unconditionally — an older pinned release has no such file and the
-# copy below would abort the run. Probing the source (rather than assuming)
-# also catches a local build where `-p spur-stepd` was left off the cargo
-# invocation, which is otherwise silent until the first job fails to launch.
-- name: Does the install source ship spurstepd?
-  ansible.builtin.stat:
-    path: "{{ spur_binary_src }}/spurstepd"
-  register: spur_stepd_src
+# One delegated result holds the fleet manifest; each source/component set is built once.
+- name: Prepare local install artifacts for this batch
+  spur_prepare_install:
+    targets: >-
+      {%- set targets = {} -%}
+      {%- for name in ansible_play_hosts -%}
+      {%- set h = hostvars[name] -%}
+      {%- if not (h.an_registered | default(false) | bool) -%}
+      {%- set _ = targets.update({name: {
+          'source': h.spur_binary_src | default(spur_binary_src | default('')),
+          'roles': (['controller'] if name in groups['spur_controllers'] else [])
+                   + (['agent'] if name in groups['spur_agents'] else []),
+          'auth': h.spur_auth_enabled | default(spur_auth_enabled | default(false)) | bool,
+          'mpi': h.spur_mpi_plugin_enabled | default(spur_mpi_plugin_enabled | default(true)) | bool}}) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ targets }}
   delegate_to: localhost
+  delegate_facts: true
   become: false
-  when:
-    - spur_needs_agent_bin
-    - spur_binary_src | default('') | length > 0
+  run_once: true
 
-# spurauthd (native auth mint) is needed on EVERY host when auth is enabled —
-# controllers (so root's CLI can mint), agents (spurd/srun mint), and login
-# nodes (users mint) — so it's probed regardless of role, unlike spurstepd.
-# install.sh already ships it (ROCm/spur#919); a spur_binary_src build must add
-# `-p spurauthd`, which this probe catches instead of failing silently later.
-- name: Does the install source ship spurauthd? (native auth)
-  ansible.builtin.stat:
-    path: "{{ spur_binary_src }}/spurauthd"
-  register: spur_authd_src
-  delegate_to: localhost
-  become: false
-  when:
-    - spur_auth_enabled | default(false) | bool
-    - spur_binary_src | default('') | length > 0
-
-# Two install sources:
-#   1. spur_binary_src (a directory on the Ansible control node holding pre-built
-#      spur/spurctld/spurd, and spurstepd on builds that have it) — used for
-#      air-gapped installs and when the upstream repo has no published GitHub
-#      release yet. Takes precedence.
-#   2. upstream install.sh — downloads the latest published release.
-# Both are unconditional when spur_force_reinstall is set (rolling upgrades need
-# to overwrite an already-installed binary with a newer build of the same name).
-# Only the components this host role needs are copied (see spur_needs_*).
-#
-# spurstepd rides the same copy as spurd so the two always come from one build:
-# a supervisor written by one build is not adopted by another, so the pair must
-# never be rolled independently.
-- name: Resolve which binaries this host needs copied
-  ansible.builtin.set_fact:
-    spur_bin_list: >-
-      {{ ['spur']
-         + (['spurctld'] if spur_needs_ctld else [])
-         + (['spurd'] if spur_needs_agent_bin else [])
-         + (['spurstepd'] if (spur_stepd_src.stat.exists | default(false)) else [])
-         + (['spurauthd'] if (spur_authd_src.stat.exists | default(false)) else []) }}
-  when: spur_binary_src | default('') | length > 0
-
-# One tarball transfer instead of one `copy` call per binary (up to 5). The
-# tarball is named by a hash of its contents (computed locally, zero network
-# cost) so `copy`'s own checksum comparison below still skips the transfer
-# entirely on an unchanged re-run — same idempotency as before, fewer round
-# trips either way.
-- name: Build a local tarball of the binaries to copy (control node only)
-  # Multiple hosts needing the identical binary set run this concurrently
-  # (serial: 0 agent plays) and reuse the same tarball once one of them builds
-  # it — write-to-temp-then-rename keeps that reuse race-free, since a reader
-  # never sees a partially-written file.
-  ansible.builtin.shell: |
-    set -e -o pipefail
-    cache_dir="${HOME}/.cache/spur-ansible-bins"
-    mkdir -p "$cache_dir" && chmod 0700 "$cache_dir"
-    cd "{{ spur_binary_src }}"
-    hash=$(sha256sum {{ spur_bin_list | join(' ') }} | sha256sum | cut -d' ' -f1)
-    tarball="$cache_dir/spur-bins-${hash}.tar.gz"
-    if [ ! -f "$tarball" ]; then
-      tmp="${tarball}.tmp.$$"
-      # Fixed mtime + gzip -n: byte-identical output for byte-identical
-      # inputs, so a lost local cache rebuilds to the same checksum instead
-      # of forcing a spurious re-copy.
-      tar --mtime=@0 -cf - {{ spur_bin_list | join(' ') }} | gzip -n > "$tmp"
-      mv -f "$tmp" "$tarball"
-    fi
-    echo "HASH=$hash"
-    echo "TARBALL=$tarball"
-  args:
-    executable: /bin/bash
-  delegate_to: localhost
-  become: false
-  register: spur_bin_tar
-  changed_when: false
-  when: spur_binary_src | default('') | length > 0
-
-# Kept remotely (named by content hash, not deleted after extraction) so this
-# copy's own checksum comparison is the idempotency check on every future
-# run — deleting it here would mean every subsequent deploy re-transfers and
-# re-extracts unconditionally, even with unchanged binaries.
 - name: Copy the binaries tarball to the remote host
   vars:
-    spur_bin_hash: "{{ spur_bin_tar.stdout_lines | select('match', '^HASH=') | first | regex_replace('^HASH=', '') }}"
-    spur_bin_tarball_local: "{{ spur_bin_tar.stdout_lines | select('match', '^TARBALL=') | first | regex_replace('^TARBALL=', '') }}"
+    spur_bin_tarball_local: "{{ hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].archive }}"
+    spur_bin_hash: "{{ spur_bin_tarball_local | basename | regex_replace('\\.tar\\.gz$', '') }}"
   ansible.builtin.copy:
     src: "{{ spur_bin_tarball_local }}"
     dest: "{{ spur_install_dir }}/.bins-{{ spur_bin_hash }}.tar.gz"
@@ -159,12 +89,14 @@
   ansible.builtin.shell: |
     set -e
     tar --no-same-owner -xzf "{{ spur_bin_copy.dest }}" -C "{{ spur_install_dir }}"
-    chmod 0755 {{ spur_bin_list | map('regex_replace', '^', spur_install_dir ~ '/') | join(' ') }}
+    {% for name in hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].manifest %}
+    chmod 0755 {{ (spur_install_dir ~ '/' ~ name) | quote }}
+    {% endfor %}
     find "{{ spur_install_dir }}" -maxdepth 1 -name '.bins-*.tar.gz' ! -name '.bins-{{ spur_bin_hash }}.tar.gz' -delete
   args:
     executable: /bin/bash
   vars:
-    spur_bin_hash: "{{ spur_bin_tar.stdout_lines | select('match', '^HASH=') | first | regex_replace('^HASH=', '') }}"
+    spur_bin_hash: "{{ hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].archive | basename | regex_replace('\\.tar\\.gz$', '') }}"
   changed_when: true
   when:
     - spur_binary_src | default('') | length > 0

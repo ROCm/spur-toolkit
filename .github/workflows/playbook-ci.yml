@@ -67,7 +67,8 @@
 #   skip-flags, and the fail/--partial paths.
 #
 # Single-controller HA/accounting/login-node coverage lives in deploy.yml's own
-# path. manage_accounts.yml / healthcheck.yml are still TODO.
+# path. healthcheck.yml also has local failure-path fixtures and a container smoke test.
+# manage_accounts.yml integration coverage is still TODO.
 # ============================================================================
 name: playbook-ci
 
@@ -119,8 +120,26 @@ jobs:
             echo "== syntax-check $pb =="
             ansible-playbook --syntax-check -i inventory/ci.ini $DUMMY "$pb" || exit 1
           done
-      - name: Test binary upgrade modules and local playbook fixtures
+      - name: Test upgrade modules, fleet operations, and local playbook fixtures
         run: python3 -m unittest discover -s tests/ansible -v
+
+  unit-compatibility:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible: ['>=2.17,<2.18', '>=2.19,<2.20']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Test local fixtures on supported Ansible versions
+        env:
+          ANSIBLE_VERSION: ${{ matrix.ansible }}
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install "ansible-core${ANSIBLE_VERSION}" PyYAML
+          PATH="$PWD/.venv/bin:$PATH" .venv/bin/python -m unittest discover -s tests/ansible -v
 
   # ---------------------------------------------------------------------------
   # Job 1: rolling upgrade resilience + force upgrade + container kill
@@ -1173,6 +1192,12 @@ jobs:
           echo "PASS: agent template renders [cluster]/k8s block correctly when spur_k8s_enabled=true"
 
       # --- spur.conf preservation test (controller AND agent) ---------------
+      - name: healthcheck.yml on the deployed cluster
+        working-directory: ansible
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/healthcheck.yml \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur
+
       - name: Stamp a sentinel line into spur.conf on ctl-0 and gpu-1 to detect overwrites
         run: |
           for h in ctl-0 gpu-1; do

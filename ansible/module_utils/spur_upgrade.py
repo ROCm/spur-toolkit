@@ -30,11 +30,77 @@ def digest(path):
     return result.hexdigest()
 
 
+class ArtifactBuilder:
+    """Share source hashing and archive creation across a fleet's specifications."""
+
+    def __init__(self, cache_dir):
+        self.cache = Path(cache_dir).expanduser()
+        self.cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.hashes = {}
+        self.bundles = {}
+
+    def bundle(self, files):
+        for path in files.values():
+            if not path.is_file():
+                raise ValueError("Missing Spur artifact: %s" % path)
+            if path not in self.hashes:
+                self.hashes[path] = digest(path)
+        manifest = {name: self.hashes[path] for name, path in files.items()}
+        key = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        if key not in self.bundles:
+            archive = self.cache / (key + ".tar.gz")
+            # Rebuild once per run so damaged cache files cannot mask source bytes.
+            fd, temporary = tempfile.mkstemp(dir=self.cache, prefix=".build-")
+            try:
+                with os.fdopen(fd, "wb") as raw:
+                    with gzip.GzipFile(
+                        fileobj=raw, mode="wb", mtime=0, filename="", compresslevel=1
+                    ) as zipped:
+                        with tarfile.open(fileobj=zipped, mode="w") as tar:
+                            for name, path in sorted(files.items()):
+                                data = path.read_bytes()
+                                if hashlib.sha256(data).hexdigest() != manifest[name]:
+                                    raise ValueError(
+                                        "Build changed during packaging: %s" % path
+                                    )
+                                info = tarfile.TarInfo(name)
+                                info.size, info.mode = len(data), 0o755
+                                tar.addfile(info, io.BytesIO(data))
+                os.replace(temporary, archive)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            self.bundles[key] = {"archive": str(archive), "manifest": manifest}
+        return self.bundles[key]
+
+    def result(self, artifacts):
+        return {
+            "artifacts": artifacts,
+            "source_files_hashed": len(self.hashes),
+            "bundles_built": len(self.bundles),
+        }
+
+
+def mpi_source(source):
+    return next(
+        (
+            p
+            for p in (
+                source / "spur_mpi_pmix.so",
+                source / "libspur_mpi_pmix.so",
+                source / "lib/spur/spur_mpi_pmix.so",
+                source.parent / "lib/spur/spur_mpi_pmix.so",
+            )
+            if p.is_file()
+        ),
+        None,
+    )
+
+
 def prepare(targets, cache_dir):
-    """Hash each source once and build each distinct bundle once per invocation."""
-    cache = Path(cache_dir).expanduser()
-    cache.mkdir(mode=0o700, parents=True, exist_ok=True)
-    hashes, bundles, artifacts, prepared_specs = {}, {}, {}, {}
+    """Prepare separate activation bundles for each daemon role."""
+    builder = ArtifactBuilder(cache_dir)
+    artifacts, prepared_specs = {}, {}
     for host, spec in targets.items():
         if not spec["in_place"] or spec["overwrite_conf"] or not spec["source"]:
             raise ValueError(
@@ -44,86 +110,71 @@ def prepare(targets, cache_dir):
         artifacts[host] = {}
         for role in spec["roles"]:
             spec_key = (source, role, spec["auth"], spec["mpi"])
-            if spec_key in prepared_specs:
-                artifacts[host][role] = prepared_specs[spec_key]
-                continue
-            names = ["spur", "spurctld"] if role == "controller" else ["spur", "spurd"]
-            if role == "agent" and (source / "spurstepd").is_file():
-                names.append("spurstepd")
+            if spec_key not in prepared_specs:
+                names = (
+                    ["spur", "spurctld"] if role == "controller" else ["spur", "spurd"]
+                )
+                if role == "agent" and (source / "spurstepd").is_file():
+                    names.append("spurstepd")
+                if spec["auth"] and (source / "spurauthd").is_file():
+                    names.append("spurauthd")
+                files = {name: source / name for name in names}
+                if role == "agent" and spec["mpi"]:
+                    plugin = mpi_source(source)
+                    if plugin:
+                        files["spur_mpi_pmix.so"] = plugin
+                prepared_specs[spec_key] = builder.bundle(files)
+            artifacts[host][role] = prepared_specs[spec_key]
+    return builder.result(artifacts)
+
+
+def prepare_install(targets, cache_dir):
+    """Prepare role unions for provisioning, retaining optional older binaries."""
+    builder = ArtifactBuilder(cache_dir)
+    artifacts, prepared_specs = {}, {}
+    for host, spec in targets.items():
+        if not spec["source"]:
+            continue
+        source = Path(spec["source"]).absolute()
+        roles = tuple(sorted(spec["roles"]))
+        key = (source, roles, spec["auth"], spec["mpi"])
+        if key not in prepared_specs:
+            names = ["spur"]
+            if "controller" in roles:
+                names.append("spurctld")
+            if "agent" in roles:
+                names.append("spurd")
+                if (source / "spurstepd").is_file():
+                    names.append("spurstepd")
             if spec["auth"] and (source / "spurauthd").is_file():
                 names.append("spurauthd")
-            files = {name: source / name for name in names}
-            if role == "agent" and spec["mpi"]:
-                candidates = [
-                    source / "spur_mpi_pmix.so",
-                    source / "libspur_mpi_pmix.so",
-                    source / "lib/spur/spur_mpi_pmix.so",
-                    source.parent / "lib/spur/spur_mpi_pmix.so",
-                ]
-                plugin = next((p for p in candidates if p.is_file()), None)
-                if plugin:
-                    files["spur_mpi_pmix.so"] = plugin
-            for name, path in files.items():
-                if not path.is_file():
-                    raise ValueError("Missing upgrade artifact: %s" % path)
-                if path not in hashes:
-                    hashes[path] = digest(path)
-            manifest = {name: hashes[path] for name, path in files.items()}
-            key = hashlib.sha256(
-                json.dumps(manifest, sort_keys=True).encode()
-            ).hexdigest()
-            if key not in bundles:
-                archive = cache / (key + ".tar.gz")
-                # Rebuild once per run: cached bytes must never mask a damaged artifact.
-                fd, temporary = tempfile.mkstemp(dir=cache, prefix=".build-")
-                try:
-                    with os.fdopen(fd, "wb") as raw:
-                        with gzip.GzipFile(
-                            fileobj=raw,
-                            mode="wb",
-                            mtime=0,
-                            filename="",
-                            compresslevel=1,
-                        ) as zipped:
-                            with tarfile.open(fileobj=zipped, mode="w") as tar:
-                                for name, path in sorted(files.items()):
-                                    data = path.read_bytes()
-                                    if (
-                                        hashlib.sha256(data).hexdigest()
-                                        != manifest[name]
-                                    ):
-                                        raise ValueError(
-                                            "Build changed during packaging: %s" % path
-                                        )
-                                    info = tarfile.TarInfo(name)
-                                    info.size, info.mode = len(data), 0o755
-                                    tar.addfile(info, io.BytesIO(data))
-                    os.replace(temporary, archive)
-                finally:
-                    if os.path.exists(temporary):
-                        os.unlink(temporary)
-                bundles[key] = {"archive": str(archive), "manifest": manifest}
-            artifacts[host][role] = bundles[key]
-            prepared_specs[spec_key] = bundles[key]
-    return {
-        "artifacts": artifacts,
-        "source_files_hashed": len(hashes),
-        "bundles_built": len(bundles),
-    }
+            plugin = mpi_source(source) if "agent" in roles and spec["mpi"] else None
+            prepared_specs[key] = dict(
+                builder.bundle({name: source / name for name in names}),
+                mpi_source=str(plugin) if plugin else "",
+            )
+        artifacts[host] = prepared_specs[key]
+    return builder.result(artifacts)
 
 
-def command(argv, timeout=30):
+def command(argv, timeout=30, environment=None):
     result = subprocess.run(
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         timeout=timeout,
+        env=environment,
         check=False,
     )
     if result.returncode:
         raise RuntimeError(
-            "Command failed: %s (exit %s)" % (argv[0], result.returncode)
+            "Command failed: %s (exit %s): %s"
+            % (
+                argv[0],
+                result.returncode,
+                (result.stderr or result.stdout).strip()[-2000:],
+            )
         )
     return result.stdout.strip()
 
@@ -134,13 +185,24 @@ def service(name):
             "systemctl",
             "show",
             name,
-            "--property=MainPID,KillMode,Environment,ActiveState",
+            "--property=MainPID,KillMode,Environment,ActiveState,SubState,Result,ExecMainStatus",
         ]
     )
     properties = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     pid = int(properties.get("MainPID", "0"))
     if properties.get("ActiveState") != "active" or pid <= 0:
-        raise ValueError("%s must already be active for a binary-only upgrade" % name)
+        raise RuntimeError(
+            "%s is unhealthy before binary activation (state=%s/%s, MainPID=%s, result=%s, exit=%s). "
+            "Repair the service before retrying; an unhealthy service does not require full provisioning."
+            % (
+                name,
+                properties.get("ActiveState", "unknown"),
+                properties.get("SubState", "unknown"),
+                pid,
+                properties.get("Result", "unknown"),
+                properties.get("ExecMainStatus", "unknown"),
+            )
+        )
     properties["pid"] = pid
     return properties
 
@@ -176,6 +238,7 @@ def wait_ready(
     timeout,
     health_command=None,
     auth_socket=None,
+    health_environment=None,
 ):
     deadline = time.monotonic() + timeout
     while True:
@@ -192,13 +255,15 @@ def wait_ready(
                     connection.connect(auth_socket)
             if health_command:
                 command(
-                    health_command, timeout=max(1, min(5, deadline - time.monotonic()))
+                    health_command,
+                    timeout=max(1, min(5, deadline - time.monotonic())),
+                    environment=health_environment,
                 )
             return state
-        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
             if time.monotonic() >= deadline:
                 raise RuntimeError(
-                    "%s did not become healthy on the target binary" % name
+                    "%s did not become healthy on the target binary: %s" % (name, error)
                 )
             time.sleep(0.2)
 
@@ -337,6 +402,14 @@ def activate(
             command(["systemctl", "restart", daemon], timeout=timeout)
             restarted.append(daemon)
         health = [str(install / "spur"), "nodes"] if role == "controller" else None
+        health_environment = None
+        if health:
+            # Match the preserved daemon config, not a leftover CLI auth configuration.
+            health_environment = dict(os.environ)
+            health_environment.pop("SPUR_AUTH_PLUGIN", None)
+            health_environment.pop("SPUR_CLUSTER_NAME", None)
+            health_environment["SPUR_CONF"] = str(Path(home) / "etc/spur.conf")
+            health_environment["SPUR_CONTROLLER_ADDR"] = "http://127.0.0.1:%s" % port
         state = wait_ready(
             daemon,
             manifest[daemon],
@@ -344,6 +417,7 @@ def activate(
             port,
             timeout,
             health_command=health,
+            health_environment=health_environment,
         )
         return {
             "changed": bool(replacements or restarted),
