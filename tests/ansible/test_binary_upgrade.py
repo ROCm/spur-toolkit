@@ -893,6 +893,9 @@ class PlaybookTests(unittest.TestCase):
                     self.assertNotIn("RESUME", calls)
                     self.assertNotIn("cancel", calls)
                 check_without_staged_archives(changed=False)
+                # An excluded controller without ansible_host still supplies endpoints.
+                del hosts["controller"]["ansible_host"]
+                (root / "inventory.yml").write_text(json.dumps(inventory))
                 for extra in (
                     ["--limit", "worker-alias"],
                     ["--limit", "worker-alias", "--check"],
@@ -911,6 +914,7 @@ class PlaybookTests(unittest.TestCase):
                         (root / "restarts").read_text().splitlines(),
                         ["spurctld", "spurd"] * 2 + ["spurd"],
                     )
+                hosts["controller"]["ansible_host"] = "127.0.0.1"
                 # A bound, non-listening loopback socket deterministically refuses SSH.
                 with socket.socket() as refused:
                     refused.bind(("127.0.0.1", 0))

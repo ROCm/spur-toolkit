@@ -282,6 +282,7 @@
           ansible.builtin.include_tasks: tasks/handle_upgrade_failure.yml
 
 - name: Gather facts for upgrades that configure hosts
+  strategy: linear
   hosts: "{{ hostvars[groups['spur_controllers'][0]].ru_configuration_hosts | default([]) }}"
   become: true
   gather_facts: false
@@ -290,6 +291,20 @@
     - name: Gather facts needed to render configuration
       ansible.builtin.setup:
         gather_subset: "{{ spur_gather_subset }}"
+
+    - name: Gather missing controller addresses even when limited to agents
+      ansible.builtin.setup:
+        gather_subset: "{{ spur_gather_subset }}"
+      delegate_to: "{{ item }}"
+      delegate_facts: true
+      loop: >-
+        {{ groups['spur_controllers'] | map('extract', hostvars)
+           | rejectattr('ansible_host', 'defined')
+           | rejectattr('ansible_default_ipv4', 'defined')
+           | map(attribute='inventory_hostname') | list }}
+      run_once: true
+      ignore_unreachable: false
+      any_errors_fatal: true
 
 # Upgrading the Raft leader LAST keeps a mixed-version cluster safe. WalOperation
 # is an externally-tagged serde enum with no tolerant unknown-variant path, and
