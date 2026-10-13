@@ -106,16 +106,31 @@
 # template's | default(0) fallback (see spur.conf.j2) makes skipping it safe:
 # a still-unreachable agent gets cpus=0/memory_mb=0 in its [[nodes]] entry —
 # identical to what a failed retry would have produced anyway.
+# Both loops below filter the agent list into the loop itself rather than
+# iterating the whole fleet and discarding most items with `when:`. A skipped
+# loop item is still built, dispatched and reported, so the `when:` form costs
+# one result — and one "skipping: [ctl] => (item=...)" line — per agent per
+# controller. The controllers play is serial:1, so that is C x N results for C
+# controllers and N agents: roughly 3000 on a 3-controller, 500-agent fleet,
+# nearly all of them no-ops. Filtering the loop means those items never exist.
+# `forks` does not help here: run_once pins the whole loop to one host.
 - name: Gather facts for any agent missing them (needed for spur.conf [[nodes]] block)
   ansible.builtin.setup:
     gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
   delegate_to: "{{ item }}"
   delegate_facts: true
-  loop: "{{ groups['spur_agents'] }}"
+  vars:
+    sc_agents_missing_facts: >-
+      {{ groups['spur_agents'] | map('extract', hostvars)
+         | rejectattr('ansible_processor_vcpus', 'defined')
+         | map(attribute='inventory_hostname') | list }}
+  # Empty list when the caller disabled this (rolling_upgrade.yml pins it
+  # false), so the task collapses to one skip line instead of N.
+  loop: >-
+    {{ sc_agents_missing_facts
+       if (spur_controller_gather_missing_agent_facts | default(true) | bool)
+       else [] }}
   run_once: true
-  when: >-
-    (spur_controller_gather_missing_agent_facts | default(true) | bool) and
-    hostvars[item].ansible_processor_vcpus is not defined
   ignore_unreachable: true
   ignore_errors: true
 
@@ -126,9 +141,13 @@
          | default(hostvars[item].inventory_hostname) }}
   delegate_to: "{{ item }}"
   delegate_facts: true
-  loop: "{{ groups['spur_agents'] }}"
+  vars:
+    sc_agents_needing_name: >-
+      {{ groups['spur_agents'] | map('extract', hostvars)
+         | rejectattr('spur_node_name', 'defined')
+         | map(attribute='inventory_hostname') | list }}
+  loop: "{{ sc_agents_needing_name }}"
   run_once: true
-  when: hostvars[item].spur_node_name is not defined
 
 # Client env so the CLI (squeue/sinfo/scontrol and sacct/sacctmgr/sreport/sshare —
 # accounting is served on the same port as the controller API, no separate flag/env
