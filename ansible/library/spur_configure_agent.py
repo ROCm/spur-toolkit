@@ -80,7 +80,7 @@ def main():
                     with os.fdopen(fd, "wb") as stream:
                         stream.write(data)
                     destination = os.path.realpath(path) if follow else str(path)
-                    module.atomic_move(temporary, destination, keep_dest_attrs=True)
+                    module.atomic_move(temporary, destination)
                 finally:
                     if os.path.exists(temporary):
                         os.unlink(temporary)

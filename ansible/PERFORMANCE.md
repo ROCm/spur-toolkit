@@ -121,11 +121,12 @@ connections and fixture commands replacing live services. Coverage includes:
 
 All existing CI job commands/assertions remain. A healthcheck container smoke
 test is added to `integration-conf`; a compatibility job runs the local suite on
-Ansible 2.17 and 2.19 alongside the existing default-version lint job. The lab
+Ansible 2.14, 2.17 and 2.19 alongside the existing default-version lint job. The lab
 validation below is separate from the deterministic fixture suite.
 
-The final local suite passes all 40 tests on Ansible 2.17 and 2.19; all nine
-playbooks also pass syntax checks on both versions.
+The final local suite passes all 41 tests on Ansible 2.14, 2.17 and 2.19; all nine
+playbooks also pass syntax checks on these versions. Ansible 2.14 uses Ubuntu
+22.04's Python 3.10 in CI to stay within its supported control-node Python range.
 
 ## Additional regression coverage
 

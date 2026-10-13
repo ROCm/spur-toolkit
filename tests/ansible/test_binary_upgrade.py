@@ -401,6 +401,69 @@ class UpgradeTests(unittest.TestCase):
                 with self.assertRaises(upgrade.ConfigurationRequired):
                     upgrade.activate(**args)
 
+    def test_all_agent_artifacts_and_plugin_only_updates_keep_restart_contract(self):
+        self.spec.update(auth=True, mpi=True)
+        (self.source / "spur_mpi_pmix.so").write_bytes(b"new plugin")
+        install, state, args = self.activation_fixture()
+        args["auth"] = True
+        plugin_dir = self.root / "plugins"
+        plugin_dir.mkdir()
+        args["plugin_dir"] = str(plugin_dir)
+        manifest = args["manifest"]
+        self.assertEqual(
+            set(manifest),
+            {"spur", "spurd", "spurstepd", "spurauthd", "spur_mpi_pmix.so"},
+        )
+        destinations = {
+            name: (plugin_dir if name == "spur_mpi_pmix.so" else install) / name
+            for name in manifest
+        }
+        for changed, restarts in (
+            (set(manifest), ["spurauthd", "spurd"]),
+            ({"spur_mpi_pmix.so"}, ["spurd"]),
+            ({"spurauthd"}, ["spurauthd"]),
+            ({"spurstepd"}, []),
+        ):
+            with self.subTest(changed=changed):
+                for name, destination in destinations.items():
+                    shutil.copyfile(self.source / name, destination)
+                    destination.chmod(0o755)
+                    if name in changed:
+                        destination.write_text("old " + name)
+                with (
+                    patch.object(upgrade, "service", return_value=state),
+                    patch.object(
+                        upgrade,
+                        "process_args",
+                        return_value=["spurd", "--hostname=worker"],
+                    ),
+                    patch.object(
+                        upgrade,
+                        "running_digest",
+                        side_effect=lambda _, path: (
+                            "old" if path.name in changed else manifest[path.name]
+                        ),
+                    ),
+                    patch.object(
+                        upgrade, "command", return_value="version"
+                    ) as commands,
+                    patch.object(upgrade, "wait_ready", return_value=state) as ready,
+                ):
+                    result = upgrade.activate(**args)
+                self.assertEqual(set(result["replaced"]), changed)
+                self.assertEqual(result["restarted"], restarts)
+                self.assertEqual(
+                    [call.args[0] for call in commands.call_args_list][1:],
+                    [["systemctl", "restart", name] for name in restarts],
+                )
+                self.assertEqual(
+                    [call.args[0] for call in ready.call_args_list],
+                    (["spurauthd"] if "spurauthd" in restarts else []) + ["spurd"],
+                )
+                for name, destination in destinations.items():
+                    self.assertEqual(upgrade.digest(destination), manifest[name])
+                self.assertEqual((self.root / "etc/spur.conf").read_text(), "preserved")
+
     def test_incompatible_build_fails_before_replacing_any_binary(self):
         install, state, args = self.activation_fixture()
         before = (install / "spurd").read_bytes()

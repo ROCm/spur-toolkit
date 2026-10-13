@@ -124,11 +124,14 @@ jobs:
         run: python3 -m unittest discover -s tests/ansible -v
 
   unit-compatibility:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
-        ansible: ['>=2.17,<2.18', '>=2.19,<2.20']
+        ansible: ['>=2.14,<2.15', '>=2.17,<2.18', '>=2.19,<2.20']
+        include:
+          - ansible: '>=2.14,<2.15'
+            os: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
