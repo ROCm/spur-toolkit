@@ -67,6 +67,8 @@ in-place upgrade may have replaced those files since the last deployment.
 Installation checks their hashes against the prepared manifest in its existing
 remote call and re-extracts a cached archive when files differ or are missing.
 The mixed-source fixture covers this transition and damaged staged MPI files.
+A separate fixture checks that ignored unreachable copy results, which have no
+archive destination, do not become fatal template errors.
 
 Cgroup validation still precedes configuration, and deployment still restarts
 selected agents even if every file is already current. Drain/kill/skip decisions,
@@ -120,7 +122,7 @@ test is added to `integration-conf`; a compatibility job runs the local suite on
 Ansible 2.17 and 2.19 alongside the existing default-version lint job. The lab
 validation below is separate from the deterministic fixture suite.
 
-The final local suite passes all 38 tests on Ansible 2.17 and 2.19; all nine
+The final local suite passes all 39 tests on Ansible 2.17 and 2.19; all nine
 playbooks also pass syntax checks on both versions.
 
 ## Additional regression coverage

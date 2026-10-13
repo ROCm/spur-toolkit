@@ -652,6 +652,26 @@ class LocalPlaybooks(unittest.TestCase):
             )
         )
 
+    def test_install_can_render_an_ignored_unreachable_copy_without_a_destination(self):
+        tasks = yaml.safe_load(
+            (ANSIBLE / "roles/spur_install/tasks/main.yml").read_text()
+        )
+        task = next(
+            t for t in tasks if t["name"].startswith("Extract changed binaries")
+        )
+        self.inventory_file(
+            {"ctl": {}, "worker": {}},
+            spur_binary_src="/unused/local/build",
+            spur_bin_copy={"unreachable": True},
+            spur_needs_ctld=False,
+            spur_needs_agent_bin=True,
+        )
+        playbook = self.root / "unreachable-copy.yml"
+        playbook.write_text(
+            yaml.safe_dump([dict(hosts="worker", gather_facts=False, tasks=[task])])
+        )
+        self.run_play(playbook, "--check")
+
     def test_install_tasks_use_per_host_sources_and_do_not_recopy_on_rerun(self):
         source = self.root / "source"
         source.mkdir()

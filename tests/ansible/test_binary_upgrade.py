@@ -406,7 +406,7 @@ int main(int argc, char **argv) {
 """
 
 SYSTEMCTL = r"""#!/usr/bin/env python3
-import json, os, signal, subprocess, sys
+import json, os, signal, subprocess, sys, time
 from pathlib import Path
 root = Path(os.environ['SPUR_TEST_STATE'])
 action, name = sys.argv[1:3]
@@ -419,6 +419,17 @@ if action == 'show':
     print('Environment=SPUR_STEPD_STATE_DIR=' + str(root / 'state'))
 elif action == 'restart':
     os.kill(data['pid'], signal.SIGTERM)
+    # Match systemctl's stop-before-start contract before rebinding the port.
+    for attempt in range(500):
+        try:
+            state = Path('/proc', str(data['pid']), 'stat').read_text().rsplit(') ', 1)[1].split()[0]
+        except FileNotFoundError:
+            break
+        if state in ('Z', 'X'):
+            break
+        time.sleep(0.01)
+    else:
+        sys.exit('fixture daemon did not stop')
     process = subprocess.Popen(data['args'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, start_new_session=True)
     data['pid'] = process.pid

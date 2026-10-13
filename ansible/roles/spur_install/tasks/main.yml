@@ -124,7 +124,7 @@
          + (['spurd', 'spurstepd'] if not spur_needs_agent_bin else []) }}
   ansible.builtin.shell: |
     set -e
-    {% if spur_binary_src | default('') | length > 0 %}
+    {% if spur_binary_src | default('') | length > 0 and not (spur_bin_copy.unreachable | default(false)) %}
     extract={{ spur_bin_copy.changed | default(false) | bool | lower }}
     if [ "$extract" = false ]; then
     {% for name, checksum in hostvars['localhost'].spur_install_prepared.artifacts[inventory_hostname].manifest.items() %}
