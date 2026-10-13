@@ -1,0 +1,27 @@
+---
+- name: Activate and verify the staged binary upgrade
+  spur_activate_upgrade:
+    archive: "{{ spur_install_dir }}/.spur-upgrade-{{ ru_upgrade_role }}.tar.gz"
+    manifest: "{{ hostvars['localhost'].ru_prepared.artifacts[inventory_hostname][ru_upgrade_role].manifest }}"
+    install_dir: "{{ spur_install_dir }}"
+    home: "{{ spur_home }}"
+    role: "{{ ru_upgrade_role }}"
+    node: "{{ inventory_hostname }}"
+    port: "{{ spur_controller_port if ru_upgrade_role == 'controller' else spur_agent_port }}"
+    timeout: "{{ spur_controller_start_timeout_secs if ru_upgrade_role == 'controller' else 200 }}"
+    plugin_dir: "{{ spur_mpi_plugin_dir }}"
+    auth: "{{ spur_auth_enabled }}"
+    cluster: "{{ spur_cluster_name }}"
+  register: ru_activated
+  when:
+    - not ansible_check_mode
+    - not (ru_staged.unreachable | default(false))
+
+- name: Finish the in-place upgrade
+  ansible.builtin.include_tasks: >-
+    {{ 'upgrade_existing_configuration.yml' if ru_activated.configuration_required is defined
+       else 'verify_binary_registration.yml' }}
+  when:
+    - not ansible_check_mode
+    - not (ru_activated.unreachable | default(false))
+    - not (ru_activated.skipped | default(false))

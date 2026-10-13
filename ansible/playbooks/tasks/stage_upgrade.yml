@@ -1,0 +1,10 @@
+---
+- name: Stage binary bundles before the serial restart window
+  ansible.builtin.copy:
+    src: "{{ item.value.archive }}"
+    dest: "{{ spur_install_dir }}/.spur-upgrade-{{ item.key }}.tar.gz"
+    mode: '0600'
+  loop: "{{ hostvars['localhost'].ru_prepared.artifacts.get(inventory_hostname, {}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: ru_staged

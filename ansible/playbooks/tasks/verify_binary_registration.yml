@@ -1,0 +1,20 @@
+---
+- name: Check registration without draining or resuming the agent
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ (hostvars[groups['spur_controllers'][0]].spur_install_dir ~ '/spur') | quote }} show node {{ ru_activated.node_name | quote }} \
+      | awk -v n={{ ru_activated.node_name | quote }} '/^NodeName=/{p=($0=="NodeName="n)} p' \
+      | grep -oE 'State=[A-Z+]+' | head -1 | cut -d= -f2
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  ignore_unreachable: false
+  register: ru_registration
+  changed_when: false
+  retries: 30
+  delay: 1
+  until: ru_registration.rc == 0 and ru_registration.stdout | trim | length > 0
+  when:
+    - ru_upgrade_role == 'agent'
+    - not ansible_check_mode
+    - ru_activated.node_name is defined

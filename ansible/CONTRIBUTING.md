@@ -37,6 +37,8 @@ These are hard-won findings from validation: real bugs and non-obvious Spur/Ansi
 - **`ansible.builtin.command` runs without a shell** — `command -v X` fails (bash builtin). Use `ansible.builtin.shell` with `executable: /bin/bash`.
 
 ## Rolling upgrade (`rolling_upgrade.yml`)
+- **Local in-place binary upgrades use `spur_prepare_upgrade` and `spur_activate_upgrade`.** Preparation runs before serial plays, once across the targeted hosts; activation preserves provisioning and requires an existing supervisor-ready installation. Hosts needing provisioning automatically use the existing role path.
+- **Run `python3 -m unittest discover -s tests/ansible -v` from the repository root.** The tests exercise the actual playbook with isolated local processes and a fixture `systemctl`, plus archive validation, source sharing, refusal, and stale-process recovery. They require `ansible-core` and a C compiler and never operate on real systemd services.
 - **`spur node drain` doesn't kill running jobs** — it stops new scheduling and transitions the node `DRAINING → DRAINED` once its running jobs finish on their own. The playbook polls for `DRAINED` before touching the agent's binary or restarting `spurd`.
 - **`spurd` deregisters gracefully on SIGTERM**, so `systemctl restart spurd` doesn't leave a stale node entry — but only after the node is drained, or its running jobs get evicted (`NODE_FAIL`).
 - **A drained node stays drained after `spurd` restarts** — draining is server-side state, not tied to the agent process. The playbook explicitly `RESUME`s each node after its upgrade; skip that and upgraded capacity sits idle.

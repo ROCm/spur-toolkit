@@ -1,0 +1,16 @@
+---
+# Only hosts needing provisioning enter this path; modern fleets do no setup calls.
+- name: Gather missing facts required by the existing configuration roles
+  ansible.builtin.setup:
+    gather_subset: "{{ spur_gather_subset }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: >-
+    {{ (groups['spur_controllers']
+        + (groups['spur_agents'] if ru_upgrade_role == 'controller' else [inventory_hostname]))
+       | unique | map('extract', hostvars)
+       | rejectattr('ansible_processor_vcpus', 'defined')
+       | map(attribute='inventory_hostname') | list }}
+
+- name: Complete provisioning with the existing upgrade safeguards
+  ansible.builtin.include_tasks: "upgrade_{{ ru_upgrade_role }}_full.yml"

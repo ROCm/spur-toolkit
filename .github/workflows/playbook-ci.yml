@@ -78,11 +78,13 @@ on:
       - main
     paths:
       - 'ansible/**'
+      - 'tests/ansible/**'
       - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
   pull_request:
     paths:
       - 'ansible/**'
+      - 'tests/ansible/**'
       - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
 
@@ -117,6 +119,8 @@ jobs:
             echo "== syntax-check $pb =="
             ansible-playbook --syntax-check -i inventory/ci.ini $DUMMY "$pb" || exit 1
           done
+      - name: Test binary upgrade modules and local playbook fixtures
+        run: python3 -m unittest discover -s tests/ansible -v
 
   # ---------------------------------------------------------------------------
   # Job 1: rolling upgrade resilience + force upgrade + container kill

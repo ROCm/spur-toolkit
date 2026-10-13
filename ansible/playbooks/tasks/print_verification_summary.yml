@@ -18,34 +18,33 @@
   ansible.builtin.set_fact:
     spur_summary_expected: "{{ spur_verify_targeted_hosts_resolved }}"
     spur_summary_rows: >-
-      {{
-        spur_verify_targeted_hosts_resolved
-        | map('extract', hostvars, 'spur_verify_row')
-        | select('defined') | list
-      }}
+      {%- set rows = [] -%}
+      {%- for name in spur_verify_targeted_hosts_resolved -%}
+      {%- set h = hostvars[name] -%}
+      {%- if h.spur_verify_row is defined -%}
+      {%- set row = h.spur_verify_row.copy() -%}
+      {%- if h.ru_registration.stdout is defined -%}
+      {%- set _ = row.update({'registered_state': h.ru_registration.stdout | trim}) -%}
+      {%- endif -%}
+      {%- set _ = rows.append(row) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ rows }}
 
-- name: "Verify: build the table body"
+- name: "Verify: format all summary rows in one task"
   ansible.builtin.set_fact:
-    spur_summary_lines: []
-    spur_summary_ok_count: 0
-
-- name: "Verify: append one line per node"
-  ansible.builtin.set_fact:
+    spur_summary_ok_count: >-
+      {{ spur_summary_rows | selectattr('listening') | selectattr('binary_current') | list | length }}
     spur_summary_lines: >-
-      {{ spur_summary_lines + [
-           '%-14s %-11s %-14s %-9s %-24s %-s' | format(
-             item.node,
-             item.role,
-             ('OK (' ~ item.port ~ ')' if item.listening else 'FAIL'),
-             ('OK' if item.binary_current else 'STALE'),
-             item.version | default('?'),
-             (item.registered_state if item.registered_state | length > 0 else '-')
-           )
-      ] }}
-    spur_summary_ok_count: "{{ (spur_summary_ok_count | int) + (1 if (item.listening and item.binary_current) else 0) }}"
-  loop: "{{ spur_summary_rows }}"
-  loop_control:
-    label: "{{ item.node }}"
+      {%- set lines = [] -%}
+      {%- for item in spur_summary_rows -%}
+      {%- set _ = lines.append('%-14s %-11s %-14s %-9s %-24s %-s' | format(
+          item.node, item.role,
+          ('OK (' ~ item.port ~ ')' if item.listening else 'FAIL'),
+          ('OK' if item.binary_current else 'STALE'), item.version | default('?'),
+          (item.registered_state if item.registered_state | length > 0 else '-'))) -%}
+      {%- endfor -%}
+      {{ lines }}
 
 - name: "Verify: print the summary table"
   ansible.builtin.debug:
