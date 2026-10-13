@@ -9,9 +9,6 @@ Playbooks for the whole cluster lifecycle:
 
 Daemons run as **systemd services**, Slurm-compatible CLI names are symlinked, and optional **PostgreSQL accounting** (embedded in `spurctld`) is on by default.
 
-See [Fleet task and remote-call review](PERFORMANCE.md) for the work shared across
-hosts, task reductions, retained safety boundaries, and CI coverage.
-
 ## Quick start
 
 Run everything from this repo's `ansible/` directory.
