@@ -7,6 +7,8 @@
 version: 2
 updates:
   - package-ecosystem: "github-actions"
+    cooldown:
+      default-days: 7
     # "/" covers .github/workflows; composite actions keep their own `uses:`
     # pins, so .github/actions has to be listed separately to get bumped.
     directories:

@@ -1,3 +1,14 @@
 ---
 spur_mpi_plugin_dir: /usr/lib/spur
 spur_mpi_plugin_enabled: true
+
+# Lifecycle hooks — absolute paths to scripts. Empty = not rendered.
+# Only hooks consumed by spurd or srun belong here; controller-side hooks
+# (prolog_slurmctld, epilog_slurmctld, job_submit, job_submit_lua) live in
+# spur_controller/defaults/main.yml.
+spur_hook_prolog: ""
+spur_hook_epilog: ""
+spur_hook_task_prolog: ""
+spur_hook_task_epilog: ""
+spur_hook_srun_prolog: ""
+spur_hook_srun_epilog: ""

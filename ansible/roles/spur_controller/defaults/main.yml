@@ -1,1 +1,8 @@
 ---
+
+# Controller-side lifecycle hooks — absolute paths to scripts. Empty = not rendered.
+# These are read by spurctld only; agent-side hooks live in spur_agent/defaults.
+spur_hook_prolog_slurmctld: ""
+spur_hook_epilog_slurmctld: ""
+spur_hook_job_submit: ""
+spur_hook_job_submit_lua: ""
