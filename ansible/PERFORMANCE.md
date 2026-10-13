@@ -115,14 +115,16 @@ connections and fixture commands replacing live services. Coverage includes:
 - ordinary agent failures with serial batches of one and two: strict aborts,
   opt-in continuation through later batches, and a nonzero final result;
 - unchanged activation without temporary binary writes, and rejection of corrupt
-  archive bytes even when every installed binary already matches the manifest.
+  archive bytes even when every installed binary already matches the manifest;
+- check-mode comparison of installed and running binaries without a staged remote
+  archive, executable writes, restarts, or post-upgrade verification.
 
 All existing CI job commands/assertions remain. A healthcheck container smoke
 test is added to `integration-conf`; a compatibility job runs the local suite on
 Ansible 2.17 and 2.19 alongside the existing default-version lint job. The lab
 validation below is separate from the deterministic fixture suite.
 
-The final local suite passes all 39 tests on Ansible 2.17 and 2.19; all nine
+The final local suite passes all 40 tests on Ansible 2.17 and 2.19; all nine
 playbooks also pass syntax checks on both versions.
 
 ## Additional regression coverage

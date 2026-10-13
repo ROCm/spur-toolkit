@@ -344,6 +344,19 @@ def activate(
             raise ConfigurationRequired(
                 "Binary-only upgrade does not replace symlinked executables: %s" % dest
             )
+    # Check mode compares the prepared manifest without requiring a remote archive.
+    # Return before extraction so even temporary executable writes are avoided.
+    if check:
+        return {
+            "changed": bool(
+                any(
+                    digest(dest) != manifest[name]
+                    for name, dest in destinations.items()
+                )
+                or current_hash != manifest[daemon]
+                or (auth and auth_hash != manifest["spurauthd"])
+            )
+        }
     staged, replacements, restarted = {}, [], []
     mutated = False
     try:
@@ -379,14 +392,6 @@ def activate(
                         os.fchmod(out.fileno(), 0o755)
                 if checksum.hexdigest() != manifest[member.name]:
                     raise ValueError("Archive checksum mismatch: %s" % member.name)
-        if check:
-            return {
-                "changed": bool(
-                    replacements
-                    or current_hash != manifest[daemon]
-                    or (auth and auth_hash != manifest["spurauthd"])
-                )
-            }
         # Catch an incompatible executable before changing the installed service.
         version_output = command([staged.get(daemon, str(destinations[daemon])), "-V"])
         if not version_output:

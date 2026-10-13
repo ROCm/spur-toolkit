@@ -603,7 +603,7 @@ This path does not gather hardware/network facts or rewrite configuration, servi
 
 Hosts that already have the required executables, active daemon, and `spur.conf` avoid provisioning. Agents also need `spurstepd` beside `spurd`, plus an effective systemd unit with `KillMode=process` and `SPUR_STEPD_STATE_DIR`. A host needing provisioning automatically uses the existing role path, including its busy-node safety checks, before any binary is replaced. This also handles first-time MPI plugin installation and older builds without `spurstepd`. The build directory must remain unchanged during the run.
 
-`-e spur_overwrite_conf=true` selects the existing full configuration path. Upgrades through the upstream installer also retain that path. There is no additional upgrade option. In-place mode still never drains on either path. `--check` prepares and compares staging artifacts but does not activate or verify running daemons.
+`-e spur_overwrite_conf=true` selects the existing full configuration path. Upgrades through the upstream installer also retain that path. There is no additional upgrade option. In-place mode still never drains on either path. On the binary-only path, `--check` prepares artifacts locally and compares installed files and running daemon hashes with the target manifest, without staging or replacing remote binaries or restarting services. It does not validate a remote archive or perform post-upgrade readiness and registration checks; those run when applying the upgrade.
 
 The fast path reduces per-host work without increasing restart concurrency. An unchanged rerun still validates installed and running binary hashes: the presence of a cached archive alone is not evidence that an upgrade completed.
 

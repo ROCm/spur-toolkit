@@ -278,6 +278,63 @@ class UpgradeTests(unittest.TestCase):
         temporary.assert_not_called()
         commands.assert_called_once_with([str(install / "spurd"), "-V"])
 
+    def test_check_compares_disk_and_running_hashes_without_archive_or_writes(self):
+        self.spec["auth"] = True
+        install, state, args = self.activation_fixture()
+        args["auth"] = True
+        plugin = install / "spur_mpi_pmix.so"
+        plugin.write_bytes(b"plugin")
+        args["manifest"][plugin.name] = upgrade.digest(plugin)
+        shutil.copyfile(self.source / "spurd", install / "spurd")
+        Path(args["archive"]).unlink()
+        for drift in (
+            None,
+            "spur",
+            "spurstepd",
+            "spur_mpi_pmix.so",
+            "spurd",
+            "spurauthd",
+        ):
+            with self.subTest(drift=drift):
+                disk_drift = drift in ("spur", "spurstepd", "spur_mpi_pmix.so")
+                if disk_drift:
+                    original = (install / drift).read_bytes()
+                    (install / drift).write_bytes(b"old bytes")
+                before = {
+                    p: (p.read_bytes(), p.stat().st_ino) for p in install.iterdir()
+                }
+                with (
+                    patch.object(upgrade, "service", return_value=state),
+                    patch.object(
+                        upgrade,
+                        "process_args",
+                        return_value=["spurd", "--hostname=worker"],
+                    ),
+                    patch.object(
+                        upgrade,
+                        "running_digest",
+                        side_effect=lambda _, path: (
+                            "old" if path.name == drift else args["manifest"][path.name]
+                        ),
+                    ),
+                    patch.object(upgrade.tarfile, "open") as archive,
+                    patch.object(upgrade.tempfile, "mkstemp") as temporary,
+                    patch.object(upgrade, "command") as commands,
+                    patch.object(upgrade, "wait_ready") as ready,
+                ):
+                    result = upgrade.activate(**args, check=True)
+                self.assertEqual(result["changed"], drift is not None)
+                archive.assert_not_called()
+                temporary.assert_not_called()
+                commands.assert_not_called()
+                ready.assert_not_called()
+                self.assertEqual(
+                    {p: (p.read_bytes(), p.stat().st_ino) for p in install.iterdir()},
+                    before,
+                )
+                if disk_drift:
+                    (install / drift).write_bytes(original)
+
     def test_unchanged_install_still_rejects_corrupt_archive_bytes(self):
         install, state, args = self.activation_fixture()
         shutil.copyfile(self.source / "spurd", install / "spurd")
@@ -569,6 +626,56 @@ class PlaybookTests(unittest.TestCase):
                 defaults = ROOT / "ansible/inventory/group_vars/all.yml"
                 (root / "group_vars").mkdir()
                 shutil.copyfile(defaults, root / "group_vars/all.yml")
+
+                def check_without_staged_archives(changed):
+                    for host in hosts.values():
+                        for archive in Path(host["spur_install_dir"]).glob(
+                            ".spur-upgrade-*.tar.gz"
+                        ):
+                            archive.unlink()
+                    paths = [
+                        p
+                        for host in hosts.values()
+                        for p in Path(host["spur_home"]).rglob("*")
+                        if p.is_file()
+                    ] + list(root.glob("*.json"))
+                    before = {p: (p.read_bytes(), p.stat().st_ino) for p in paths}
+                    restarts = root / "restarts"
+                    restart_log = restarts.read_bytes() if restarts.exists() else b""
+                    result = subprocess.run(
+                        command + ["--check"],
+                        cwd=ROOT / "ansible",
+                        env=env,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        timeout=90,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    activations = result.stdout.split(
+                        "TASK [Activate and verify the staged binary upgrade]"
+                    )[1:]
+                    self.assertEqual(len(activations), 2, result.stdout)
+                    for host, activation in zip(hosts, activations):
+                        self.assertIn(
+                            ("changed" if changed else "ok") + ": [" + host + "]",
+                            activation.split("\nTASK [", 1)[0],
+                        )
+                    self.assertEqual(
+                        {p: (p.read_bytes(), p.stat().st_ino) for p in paths}, before
+                    )
+                    self.assertEqual(
+                        restarts.read_bytes() if restarts.exists() else b"", restart_log
+                    )
+                    for host in hosts.values():
+                        self.assertEqual(
+                            list(
+                                Path(host["spur_install_dir"]).glob(".spur-upgrade-*")
+                            ),
+                            [],
+                        )
+
+                check_without_staged_archives(changed=True)
                 for run in range(2):
                     result = subprocess.run(
                         command,
@@ -601,6 +708,7 @@ class PlaybookTests(unittest.TestCase):
                     self.assertNotIn("drain", calls)
                     self.assertNotIn("RESUME", calls)
                     self.assertEqual(calls.splitlines().count("show node"), run + 1)
+                check_without_staged_archives(changed=False)
                 for extra in (
                     ["--limit", "worker-alias"],
                     ["--limit", "worker-alias", "--check"],

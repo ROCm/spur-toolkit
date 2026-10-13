@@ -14,7 +14,6 @@
     cluster: "{{ spur_cluster_name }}"
   register: ru_activated
   when:
-    - not ansible_check_mode
     - not (ru_staged.unreachable | default(false))
 
 - name: Finish the in-place upgrade
