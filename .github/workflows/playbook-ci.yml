@@ -1154,7 +1154,7 @@ jobs:
           done
           echo "PASS: agents' spur.conf is minimal (no controller/accounting/nodes/partitions content)"
 
-          docker exec gpu-1 journalctl -u spurd --no-pager | grep -q "loaded spur.conf" \
+          docker exec gpu-1 journalctl -u spurd --no-pager | grep "loaded spur.conf" >/dev/null \
             && echo "PASS: spurd log confirms it loaded spur.conf" \
             || { echo "FAIL: spurd never logged loading spur.conf"; docker exec gpu-1 journalctl -u spurd --no-pager | tail -20; exit 1; }
 
