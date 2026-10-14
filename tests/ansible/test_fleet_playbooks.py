@@ -628,6 +628,129 @@ class LocalPlaybooks(unittest.TestCase):
         self.run_play(playbook)
         self.assertEqual(calls.read_text().splitlines(), ["query", "query"])
 
+    def test_snapshot_rpc_error_returns_consistent_empty_result(self):
+        self.executable("spur", "import sys\nsys.exit('controller unavailable')\n")
+        self.inventory_file({"ctl": {}, "worker": {}})
+        playbook = self.root / "snapshot-error.yml"
+        playbook.write_text(
+            yaml.safe_dump(
+                [
+                    {
+                        "hosts": "ctl",
+                        "gather_facts": False,
+                        "tasks": [
+                            {
+                                "spur_node_snapshot": {
+                                    "binary": str(self.bin / "spur"),
+                                    "expected": ["worker"],
+                                },
+                                "register": "snapshot_result",
+                                "ignore_errors": True,
+                            },
+                            {
+                                "ansible.builtin.assert": {
+                                    "that": [
+                                        "snapshot_result is failed",
+                                        "snapshot_result.nodes == {}",
+                                        "snapshot_result.pending == ['worker']",
+                                        "snapshot_result.ansible_facts.spur_node_snapshot.nodes == snapshot_result.nodes",
+                                        "snapshot_result.ansible_facts.spur_node_snapshot.pending == snapshot_result.pending",
+                                        "'controller unavailable' in snapshot_result.msg",
+                                    ]
+                                }
+                            },
+                        ],
+                    }
+                ]
+            )
+        )
+        self.run_play(playbook)
+
+    def test_registration_rpc_failure_stops_later_batches_even_when_tolerated(self):
+        plays = yaml.safe_load((ANSIBLE / "playbooks/rolling_upgrade.yml").read_text())
+        rolling = next(
+            p
+            for p in plays
+            if p.get("hosts") == "spur_agents" and "Rolling upgrade" in p["name"]
+        )
+        tasks = self.root / "tasks"
+        shutil.copytree(ANSIBLE / "playbooks/tasks", tasks)
+        verification = tasks / "verify_binary_registration.yml"
+        content = yaml.safe_load(verification.read_text())
+        content[0]["spur_node_snapshot"]["timeout"] = 0
+        verification.write_text(yaml.safe_dump(content))
+        (tasks / "upgrade_binary_host.yml").write_text(
+            yaml.safe_dump(
+                [
+                    {
+                        "ansible.builtin.file": {
+                            "path": str(
+                                self.root / "activated-{{ inventory_hostname }}"
+                            ),
+                            "state": "touch",
+                        }
+                    },
+                    {
+                        "ansible.builtin.set_fact": {
+                            "ru_activated": {"node_name": "{{ inventory_hostname }}"}
+                        }
+                    },
+                    {"ansible.builtin.include_tasks": "verify_binary_registration.yml"},
+                ]
+            )
+        )
+        self.inventory_file(
+            {
+                "ctl": {},
+                "first": {},
+                "peer": {},
+                "zlater": {},
+                "localhost": {
+                    "ru_prepared": {
+                        "artifacts": {name: {} for name in ["first", "peer", "zlater"]}
+                    }
+                },
+            },
+            agents=["first", "peer", "zlater"],
+            spur_ignore_unreachable_agents=True,
+        )
+        playbook = self.root / "registration-policy.yml"
+        playbook.write_text(yaml.safe_dump([rolling, plays[-1]]))
+        for rpc_error in [False, True]:
+            self.executable(
+                "spur",
+                (
+                    "import sys\nsys.exit('controller unavailable')\n"
+                    if rpc_error
+                    else "print('NodeName=peer\\n State=IDLE\\nNodeName=zlater\\n State=IDLE')\n"
+                ),
+            )
+            for batch in [1, 2]:
+                with self.subTest(rpc_error=rpc_error, batch=batch):
+                    for path in self.root.glob("activated-*"):
+                        path.unlink()
+                    output = self.run_play(
+                        playbook,
+                        "-e",
+                        "spur_rolling_batch_size=%s" % batch,
+                        success=False,
+                    )
+                    self.assertTrue((self.root / "activated-first").exists())
+                    self.assertEqual(
+                        (self.root / "activated-zlater").exists(), not rpc_error, output
+                    )
+                    if rpc_error:
+                        self.assertIn("controller unavailable", output)
+                        self.assertNotIn("did not register:", output)
+                        self.assertNotIn(
+                            "Upgrade failed (remaining hosts were processed)", output
+                        )
+                    else:
+                        self.assertIn("first did not register:", output)
+                        self.assertIn(
+                            "Upgrade failed (remaining hosts were processed)", output
+                        )
+
     def test_real_remove_guard_preserves_refuse_skip_and_force(self):
         self.executable(
             "spur",

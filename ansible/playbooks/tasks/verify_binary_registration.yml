@@ -18,8 +18,7 @@
   ignore_unreachable: false
   run_once: true
   register: ru_registration
-  # Attribute missing registrations to their agents below, keeping the existing failure policy.
-  failed_when: false
+  # Successful snapshots attribute missing registrations to agents; query failures stay fatal.
   when:
     - ru_upgrade_role == 'agent'
     - not ansible_check_mode

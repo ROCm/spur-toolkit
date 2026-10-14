@@ -1,4 +1,10 @@
 ---
+- name: Stop the rollout when the controller registration query fails
+  ansible.builtin.fail:
+    msg: "Controller registration query failed: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
+  any_errors_fatal: true
+  when: ansible_failed_task.action == 'spur_node_snapshot'
+
 - name: Stop on an agent failure unless fleet continuation was requested
   ansible.builtin.fail:
     msg: "{{ ansible_failed_result.msg | default(ansible_failed_result) }}"

@@ -8,10 +8,11 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
@@ -111,6 +112,50 @@ class UpgradeTests(unittest.TestCase):
             bundle.addfile(member)
         with self.assertRaisesRegex(ValueError, "manifest"):
             upgrade.validate_archive(args["archive"], args["manifest"])
+
+    def test_truncated_archive_returns_structured_failure_before_changes(self):
+        install, state, args = self.activation_fixture()
+        archive = Path(args["archive"])
+        archive.write_bytes(archive.read_bytes()[:20])
+        with self.assertRaises(EOFError):
+            upgrade.validate_archive(str(archive), args["manifest"])
+        before = {p.name: p.read_bytes() for p in install.iterdir()}
+        for name in ["spur_validate_upgrade", "spur_activate_upgrade"]:
+            with self.subTest(module=name):
+                spec = importlib.util.spec_from_file_location(
+                    name, ROOT / "ansible/library" / (name + ".py")
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                result = Mock()
+                result.params = dict(args, node="a")
+                result.check_mode = False
+                result.fail_json.side_effect = SystemExit(1)
+                with (
+                    patch.object(module, "AnsibleModule", return_value=result),
+                    patch.dict(
+                        sys.modules, {"ansible.module_utils.spur_upgrade": upgrade}
+                    ),
+                    patch.object(upgrade, "service", return_value=state) as service,
+                    patch.object(upgrade, "running_digest", return_value="old"),
+                    patch.object(
+                        upgrade,
+                        "process_args",
+                        return_value=["spurd", "--hostname", "a"],
+                    ),
+                    patch.object(upgrade, "command") as command,
+                ):
+                    with self.assertRaises(SystemExit):
+                        module.main()
+                result.fail_json.assert_called_once()
+                self.assertIn("end-of-stream", result.fail_json.call_args.kwargs["msg"])
+                result.exit_json.assert_not_called()
+                command.assert_not_called()
+                if name == "spur_validate_upgrade":
+                    service.assert_not_called()
+                self.assertEqual(
+                    before, {p.name: p.read_bytes() for p in install.iterdir()}
+                )
 
     def test_final_verification_is_read_only_and_fails_on_disk_or_running_drift(self):
         install, state, args = self.activation_fixture()

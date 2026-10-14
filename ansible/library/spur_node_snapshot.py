@@ -22,14 +22,12 @@ def main():
     try:
         result = snapshot(**module.params)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        result = {"nodes": {}, "pending": module.params["expected"]}
         module.fail_json(
+            changed=False,
             msg=str(error),
-            ansible_facts={
-                "spur_node_snapshot": {
-                    "nodes": {},
-                    "pending": module.params["expected"],
-                }
-            },
+            **result,
+            ansible_facts={"spur_node_snapshot": result},
         )
     module.exit_json(
         changed=False, **result, ansible_facts={"spur_node_snapshot": result}

@@ -28,6 +28,7 @@ def main():
         OSError,
         ValueError,
         RuntimeError,
+        EOFError,
         subprocess.TimeoutExpired,
         tarfile.TarError,
     ) as error:
