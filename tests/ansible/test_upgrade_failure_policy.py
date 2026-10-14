@@ -30,7 +30,7 @@ class FailurePolicy(unittest.TestCase):
             (root / "library").mkdir()
             (root / "library/spur_validate_upgrade.py").write_text(
                 "from ansible.module_utils.basic import AnsibleModule\n"
-                "m = AnsibleModule(argument_spec={'archive': {}, 'manifest': {'type': 'dict'}, 'role': {}, 'auth': {'type': 'bool'}})\n"
+                "m = AnsibleModule(argument_spec={'archive': {}, 'manifest': {'type': 'dict'}, 'role': {}, 'auth': {'type': 'bool'}, 'stepd_path': {'type': 'path'}})\n"
                 "m.exit_json(changed=False)\n"
             )
             # Keep the actual module interface; substitute only daemon activation.

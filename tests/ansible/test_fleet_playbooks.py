@@ -305,6 +305,63 @@ class LocalPlaybooks(unittest.TestCase):
         self.assertNotIn("Look up each affected job", output)
         self.assertNotIn("Force-cancel jobs", output)
 
+    def test_busy_guard_reuses_preflight_without_weakening_missing_stepd_refusal(self):
+        self.executable(
+            "spur", "print('NodeName=worker\\nState=ALLOCATED\\nCPUAlloc=1')\n"
+        )
+        self.inventory_file({"ctl": {}, "worker": {}})
+        playbook = self.root / "busy-guard.yml"
+        playbook.write_text(
+            yaml.safe_dump(
+                [
+                    {
+                        "hosts": "worker",
+                        "gather_facts": False,
+                        "vars": {
+                            "dckj_action": "upgrade",
+                            "dckj_in_place": True,
+                            "dckj_skip_busy": False,
+                            "dckj_force_busy": False,
+                            "dckj_force_flag": "spur_force_upgrade_busy_agents",
+                        },
+                        "tasks": [
+                            {
+                                "ansible.builtin.include_tasks": str(
+                                    ANSIBLE
+                                    / "playbooks/tasks/drain_and_guard_agent.yml"
+                                )
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+        stepd = self.bin / "spurstepd"
+        for supplied in [False, True]:
+            for exists in [False, True]:
+                with self.subTest(supplied=supplied, exists=exists):
+                    stepd.unlink(missing_ok=True)
+                    if exists != supplied:
+                        stepd.touch()
+                    variables = (
+                        {"spur_install_staged_preflight": {"stepd_exists": exists}}
+                        if supplied
+                        else {}
+                    )
+                    output = self.run_play(
+                        playbook, "-e", json.dumps(variables), success=exists
+                    )
+                    if supplied:
+                        section = output.split(
+                            "TASK [Check whether this busy node already has a spurstepd supervisor]",
+                            1,
+                        )[1]
+                        self.assertIn(
+                            "skipping: [worker]", section.split("\nTASK [", 1)[0]
+                        )
+                    if not exists:
+                        self.assertIn("has no spurstepd", output)
+
     def test_auth_preflight_keeps_warnings_and_fails_missing_binary_in_check_mode(self):
         self.executable("timedatectl", "print('no')\n")
         self.executable("systemctl", "import sys\nsys.exit(1)\n")

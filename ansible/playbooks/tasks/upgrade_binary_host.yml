@@ -5,6 +5,8 @@
     auth: "{{ spur_auth_enabled }}"
     archive: "{{ spur_install_dir }}/.spur-upgrade-{{ ru_upgrade_role }}.tar.gz"
     manifest: "{{ hostvars['localhost'].ru_prepared.artifacts[inventory_hostname][ru_upgrade_role].manifest }}"
+    stepd_path: "{{ (spur_install_dir ~ '/spurstepd') if ru_upgrade_role == 'agent' else omit }}"
+  register: ru_validated
   when:
     - not ansible_check_mode
     - not (ru_staged.unreachable | default(false))
@@ -14,6 +16,7 @@
   vars:
     spur_install_staged_artifact: "{{ hostvars['localhost'].ru_prepared.artifacts[inventory_hostname][ru_upgrade_role] }}"
     spur_install_staged_archive: "{{ spur_install_dir }}/.spur-upgrade-{{ ru_upgrade_role }}.tar.gz"
+    spur_install_staged_preflight: "{{ ru_validated }}"
   when:
     - not ansible_check_mode
     - not (ru_staged.unreachable | default(false))

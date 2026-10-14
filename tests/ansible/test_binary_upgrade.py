@@ -157,6 +157,30 @@ class UpgradeTests(unittest.TestCase):
                     before, {p.name: p.read_bytes() for p in install.iterdir()}
                 )
 
+    def test_archive_preflight_reports_existing_and_missing_supervisor(self):
+        install, state, args = self.activation_fixture()
+        spec = importlib.util.spec_from_file_location(
+            "spur_validate_upgrade", ROOT / "ansible/library/spur_validate_upgrade.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        stepd = install / "spurstepd"
+        for exists in [True, False]:
+            if not exists:
+                stepd.unlink()
+            result = Mock()
+            result.params = dict(args, stepd_path=str(stepd))
+            result.exit_json.side_effect = SystemExit(0)
+            with (
+                patch.object(module, "AnsibleModule", return_value=result),
+                patch.dict(sys.modules, {"ansible.module_utils.spur_upgrade": upgrade}),
+                patch.object(upgrade, "service", return_value=state),
+            ):
+                with self.assertRaises(SystemExit):
+                    module.main()
+            result.fail_json.assert_not_called()
+            result.exit_json.assert_called_once_with(changed=False, stepd_exists=exists)
+
     def test_final_verification_is_read_only_and_fails_on_disk_or_running_drift(self):
         install, state, args = self.activation_fixture()
         args["verify_only"] = True
@@ -676,7 +700,9 @@ with (Path(os.environ['SPUR_TEST_STATE']) / 'cli-calls').open('a') as log:
     log.write(' '.join(sys.argv[1:]) + '\n')
 if sys.argv[1:] == ['nodes']: print('healthy')
 elif sys.argv[1:3] == ['show', 'node']:
-    print('NodeName=registered-worker\nState=ALLOCATED\nCPUAlloc=1')
+    idle = (Path(os.environ['SPUR_TEST_STATE']) / 'idle-worker').exists()
+    print('NodeName=registered-worker\nState=' + ('IDLE' if idle else 'ALLOCATED'))
+    print('CPUAlloc=' + ('0' if idle else '1'))
 else: sys.exit('unexpected state mutation')
 """
 
@@ -874,7 +900,13 @@ class PlaybookTests(unittest.TestCase):
                         )
 
                 check_without_staged_archives(changed=True)
-                for run in range(2):
+                for run in range(3):
+                    if run == 2:
+                        (root / "idle-worker").touch()
+                        (
+                            Path(hosts["worker-alias"]["spur_install_dir"])
+                            / "spurstepd"
+                        ).unlink()
                     result = subprocess.run(
                         command,
                         cwd=ansible,
@@ -888,7 +920,13 @@ class PlaybookTests(unittest.TestCase):
                     self.assertIn("2/2 nodes verified", result.stdout)
                     for role in ("spur_install", "spur_controller", "spur_agent"):
                         self.assertIn(role + " :", result.stdout)
-                    self.assertIn("spur_in_place_upgrade=true", result.stdout)
+                    if run < 2:
+                        self.assertIn("spur_in_place_upgrade=true", result.stdout)
+                    if run == 2:
+                        self.assertIn(
+                            "has no spurstepd yet and this run's source has one",
+                            result.stdout,
+                        )
                     self.assertEqual(
                         result.stdout.count("TASK [Stage binary bundles"), 2
                     )
@@ -934,6 +972,22 @@ class PlaybookTests(unittest.TestCase):
                     for path, content in saved.items():
                         self.assertEqual(path.read_bytes(), content)
                     calls = (root / "cli-calls").read_text()
+                    self.assertEqual(
+                        calls.splitlines().count("show node registered-worker"),
+                        run + 1,
+                    )
+                    self.assertNotIn(
+                        "TASK [Wait for the node to re-register", result.stdout
+                    )
+                    for task in (
+                        "Does this agent already run a spurstepd build?",
+                        "Does the new build ship spurstepd?",
+                        "Check whether this busy node already has a spurstepd supervisor",
+                    ):
+                        section = result.stdout.split("TASK [" + task + "]", 1)[1]
+                        self.assertIn(
+                            "skipping: [worker-alias]", section.split("\nTASK [", 1)[0]
+                        )
                     self.assertNotIn("drain", calls)
                     self.assertNotIn("RESUME", calls)
                     self.assertNotIn("cancel", calls)
@@ -957,7 +1011,7 @@ class PlaybookTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout)
                     self.assertEqual(
                         (root / "restarts").read_text().splitlines(),
-                        ["spurctld", "spurd"] * 2 + ["spurd"],
+                        ["spurctld", "spurd"] * 3 + ["spurd"],
                     )
                 hosts["controller"]["ansible_host"] = "127.0.0.1"
                 # A bound, non-listening loopback socket deterministically refuses SSH.
@@ -983,7 +1037,7 @@ class PlaybookTests(unittest.TestCase):
                     self.assertIn("2/3 nodes verified", result.stdout)
                     self.assertEqual(
                         (root / "restarts").read_text().splitlines(),
-                        ["spurctld", "spurd"] * 2 + ["spurd", "spurctld", "spurd"],
+                        ["spurctld", "spurd"] * 3 + ["spurd", "spurctld", "spurd"],
                     )
             finally:
                 for path in root.glob("*.json"):

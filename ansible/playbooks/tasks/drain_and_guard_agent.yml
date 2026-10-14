@@ -129,13 +129,15 @@
   ansible.builtin.stat:
     path: "{{ spur_install_dir }}/spurstepd"
   register: dckj_stepd_stat
-  when: spur_node_busy and (dckj_in_place | default(false))
+  when:
+    - spur_node_busy and (dckj_in_place | default(false))
+    - spur_install_staged_preflight.stepd_exists is not defined
 
 - name: Determine whether it's safe to trust spurstepd across this restart
   ansible.builtin.set_fact:
     spur_node_in_place: >-
       {{ spur_node_busy and (dckj_in_place | default(false))
-         and (dckj_stepd_stat.stat.exists | default(false)) }}
+         and (spur_install_staged_preflight.stepd_exists | default(dckj_stepd_stat.stat.exists | default(false))) }}
 
 - name: Refuse to disrupt a busy node unless skip, force, or a trusted supervisor covers it
   ansible.builtin.fail:

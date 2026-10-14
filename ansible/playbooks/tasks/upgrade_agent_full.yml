@@ -12,6 +12,7 @@
     path: "{{ spur_install_dir }}/spurstepd"
     get_checksum: false
   register: ru_agent_stepd_before
+  when: spur_install_staged_preflight.stepd_exists is not defined
 
 - name: Does the new build ship spurstepd?
   ansible.builtin.stat:
@@ -20,7 +21,9 @@
   delegate_to: localhost
   become: false
   register: ru_src_stepd
-  when: spur_binary_src | default('') | length > 0
+  when:
+    - spur_binary_src | default('') | length > 0
+    - spur_install_staged_artifact is not defined
 
 - name: Note this agent is getting spurstepd for the first time in this run
   ansible.builtin.debug:
@@ -29,8 +32,10 @@
       the controllers ahead of it in this rolling upgrade are already on the new build.
       Proceeding; to avoid this transition window, drain the cluster and use deploy.yml.
   when:
-    - not (ru_agent_stepd_before.stat.exists | default(false))
-    - ru_src_stepd.stat.exists | default(false)
+    - not (spur_install_staged_preflight.stepd_exists | default(ru_agent_stepd_before.stat.exists | default(false)))
+    - >-
+      (('spurstepd' in spur_install_staged_artifact.manifest)
+       if spur_install_staged_artifact is defined else (ru_src_stepd.stat.exists | default(false)))
 
 - name: Apply spur_install
   vars:
@@ -60,7 +65,9 @@
     name: spur_agent
 
 - name: Re-register + undrain the node now that it's back
+  # Staged in-place upgrades verify registration once per batch after checking artifacts.
   ansible.builtin.include_tasks: resume_and_undrain_agent.yml
+  when: spur_install_staged_artifact is not defined
 
 - name: Collect agent verification facts
   ansible.builtin.include_tasks: collect_verification_facts.yml
