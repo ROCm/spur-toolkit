@@ -79,34 +79,8 @@
     - spur_accounting_host is not defined
     - spur_conf_acct_ip.stdout | default('') | trim | length == 0
 
-# spur.conf's [[nodes]] block needs ansible_processor_vcpus, ansible_memtotal_mb,
-# and ansible_hostname for every agent. These are only available after fact-gathering.
-# add_nodes.yml only gathers facts for the new nodes by the time the controller
-# role runs, so any pre-existing agents may be missing facts entirely — this task
-# fills that real gap and must stay enabled there
-# (spur_controller_gather_missing_agent_facts, default true).
-#
-# deploy.yml/rolling_upgrade.yml already gather facts on the whole cluster up
-# front (same ignore_unreachable tolerance), so by the time this task runs it
-# only ever re-targets a host that JUST failed that same gather moments ago —
-# a retry vanishingly unlikely to succeed. rolling_upgrade.yml disables this
-# (spur_controller_gather_missing_agent_facts: false, set on the role in
-# playbooks/rolling_upgrade.yml) because it's also the costliest place to run
-# it: the controllers play is serial:1, so with C controllers and N still-down
-# agents this retries every down agent, serially, C times over — pure downside
-# once the ServerAlive keepalive fix bounds each attempt instead of letting it
-# hang, since it's now a guaranteed-bounded wait for a guaranteed failure. The
-# template's | default(0) fallback (see spur.conf.j2) makes skipping it safe:
-# a still-unreachable agent gets cpus=0/memory_mb=0 in its [[nodes]] entry —
-# identical to what a failed retry would have produced anyway.
-# Both loops below filter the agent list into the loop itself rather than
-# iterating the whole fleet and discarding most items with `when:`. A skipped
-# loop item is still built, dispatched and reported, so the `when:` form costs
-# one result — and one "skipping: [ctl] => (item=...)" line — per agent per
-# controller. The controllers play is serial:1, so that is C x N results for C
-# controllers and N agents: roughly 3000 on a 3-controller, 500-agent fleet,
-# nearly all of them no-ops. Filtering the loop means those items never exist.
-# `forks` does not help here: run_once pins the whole loop to one host.
+# add_nodes needs missing agent facts; upgrade_controller_full.yml disables repeat probes.
+# Filter before dispatch to avoid a skipped result for every known agent on every controller.
 - name: Gather facts for any agent missing them (needed for spur.conf [[nodes]] block)
   ansible.builtin.setup:
     gather_subset: "{{ spur_gather_subset | default(['!all', 'network', 'hardware', 'distribution']) }}"
@@ -117,8 +91,7 @@
       {{ groups['spur_agents'] | map('extract', hostvars)
          | rejectattr('ansible_processor_vcpus', 'defined')
          | map(attribute='inventory_hostname') | list }}
-  # Empty list when the caller disabled this (rolling_upgrade.yml pins it
-  # false), so the task collapses to one skip line instead of N.
+  # An empty loop avoids retrying hosts that failed the earlier fleet fact gather.
   loop: >-
     {{ sc_agents_missing_facts
        if (spur_controller_gather_missing_agent_facts | default(true) | bool)

@@ -1,7 +1,5 @@
 ---
-# Only nodes actually being removed — a node left in the cluster via
-# spur_skip_busy_agents must NOT have spurd touched at all, or it would
-# gracefully deregister on SIGTERM despite being "left in the cluster".
+# Do not stop skipped busy nodes: SIGTERM would deregister them from the live cluster.
 - name: Kill workloads still running on a node being force-removed
   ansible.builtin.include_tasks: kill_workload_processes.yml
   when: >-
@@ -20,12 +18,7 @@
   ansible.builtin.include_tasks: remove_agent_auth.yml
   when: spur_auth_enabled | default(false) | bool
 
-# A job supervisor is built to outlive its agent (own session, reparented
-# to init, spared by the unit's KillMode=process), so stopping spurd above
-# leaves one running on a host that is no longer part of any cluster. The
-# node is being decommissioned and nothing will ever re-adopt its sessions,
-# so the on-disk state goes with them. A cleanly drained node has neither,
-# and the task is a no-op there.
+# Supervisors outlive spurd; decommissioned nodes must also remove their sessions.
 - name: Reap job supervisors and session state on nodes being removed
   ansible.builtin.include_tasks: reap_stepd_supervisors.yml
   vars:

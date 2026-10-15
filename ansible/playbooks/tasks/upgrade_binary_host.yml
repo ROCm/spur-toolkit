@@ -1,25 +1,25 @@
 ---
-- name: Validate the staged archive before changing this host
-  spur_validate_upgrade:
-    role: "{{ ru_upgrade_role }}"
-    auth: "{{ spur_auth_enabled }}"
-    archive: "{{ spur_install_dir }}/.spur-upgrade-{{ ru_upgrade_role }}.tar.gz"
-    manifest: "{{ hostvars['localhost'].ru_prepared.artifacts[inventory_hostname][ru_upgrade_role].manifest }}"
-    stepd_path: "{{ (spur_install_dir ~ '/spurstepd') if ru_upgrade_role == 'agent' else omit }}"
-  register: ru_validated
+- name: Retry staging for an agent that was unreachable before its batch
+  ansible.builtin.include_tasks: stage_upgrade.yml
   when:
     - not ansible_check_mode
-    - not (ru_staged.unreachable | default(false))
+    - ru_stage_unreachable | default(false)
+
+- name: Report an agent that remains unreachable and was not upgraded
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} remains unreachable; its upgrade was skipped (spur_ignore_unreachable_agents=true)."
+  when: ru_stage_unreachable | default(false)
 
 - name: Reconcile the complete installation using the staged build
   ansible.builtin.include_tasks: "upgrade_{{ ru_upgrade_role }}_full.yml"
   vars:
     spur_install_staged_artifact: "{{ hostvars['localhost'].ru_prepared.artifacts[inventory_hostname][ru_upgrade_role] }}"
     spur_install_staged_archive: "{{ spur_install_dir }}/.spur-upgrade-{{ ru_upgrade_role }}.tar.gz"
-    spur_install_staged_preflight: "{{ ru_validated }}"
+    spur_install_staged_preflight: >-
+      {{ ru_validated.results | default([]) | selectattr('item.key', 'equalto', ru_upgrade_role) | first | default({}) }}
   when:
     - not ansible_check_mode
-    - not (ru_staged.unreachable | default(false))
+    - not (ru_stage_unreachable | default(false))
 
 - name: Verify installed and running binaries against the staged build
   spur_activate_upgrade:
@@ -37,7 +37,7 @@
     verify_only: true
   register: ru_activated
   when:
-    - not (ru_staged.unreachable | default(false))
+    - not (ru_stage_unreachable | default(false))
 
 - name: Finish the in-place upgrade
   ansible.builtin.include_tasks: verify_binary_registration.yml

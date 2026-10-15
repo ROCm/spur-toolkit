@@ -1,20 +1,6 @@
 ---
-- name: Stop the rollout when the controller registration query fails
+# Unreachable agents are handled by ignore_unreachable; reachable failures stop rollout.
+- name: Stop the rollout after an upgrade failure
   ansible.builtin.fail:
-    msg: "Controller registration query failed: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
+    msg: "{{ ansible_failed_result.msg | default(ru_registration.msg | default('Upgrade failed; stopping subsequent batches.')) }}"
   any_errors_fatal: true
-  when: ansible_failed_task.action == 'spur_node_snapshot'
-
-- name: Stop on an agent failure unless fleet continuation was requested
-  ansible.builtin.fail:
-    msg: "{{ ansible_failed_result.msg | default(ansible_failed_result) }}"
-  when: >-
-    not (spur_ignore_unreachable_agents | default(false) | bool)
-    or inventory_hostname in groups['spur_controllers']
-
-- name: Record the failed agent for the final upgrade result
-  ansible.builtin.set_fact:
-    ru_upgrade_failure: "{{ ansible_failed_result.msg | default(ansible_failed_result | string) }}"
-
-- name: Continue with other agents and subsequent batches
-  ansible.builtin.meta: end_host

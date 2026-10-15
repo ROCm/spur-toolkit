@@ -101,6 +101,72 @@ class UpgradeTests(unittest.TestCase):
         )
         return install, state, args
 
+    def test_auth_enabled_upgrade_requires_authd_in_source_before_staging(self):
+        (self.source / "spurauthd").unlink()
+        targets = {
+            name: dict(self.spec, roles=["controller"], auth=True)
+            for name in ["controller-a", "controller-b"]
+        }
+        with self.assertRaisesRegex(ValueError, "Missing Spur artifact: .*spurauthd"):
+            upgrade.prepare(targets, self.root / "cache")
+
+    def test_install_cache_is_reused_and_corruption_is_rebuilt(self):
+        targets = {"a": self.spec}
+        first = upgrade.prepare_install(targets, self.root / "cache")
+        bundle = first["artifacts"]["a"]
+        archive = Path(bundle["archive"])
+        before = archive.stat()
+        with patch.object(upgrade.os, "replace", wraps=os.replace) as replace:
+            self.assertEqual(
+                first, upgrade.prepare_install(targets, self.root / "cache")
+            )
+        replace.assert_not_called()
+        self.assertEqual(archive.stat().st_ino, before.st_ino)
+        self.assertEqual(archive.stat().st_mtime_ns, before.st_mtime_ns)
+        for corruption in [b"not a tarball", archive.read_bytes()[:20]]:
+            archive.write_bytes(corruption)
+            upgrade.prepare_install(targets, self.root / "cache")
+            upgrade.validate_archive(archive, bundle["manifest"])
+        (self.source / "spurd").write_text("changed source")
+        updated = upgrade.prepare_install(targets, self.root / "cache")["artifacts"][
+            "a"
+        ]
+        self.assertNotEqual(updated["archive"], bundle["archive"])
+        upgrade.validate_archive(updated["archive"], updated["manifest"])
+
+    def test_read_only_verification_accepts_matching_symlinks_and_rejects_drift(self):
+        install, state, args = self.activation_fixture()
+        args["verify_only"] = True
+        for name in args["manifest"]:
+            (install / name).unlink()
+            (install / name).symlink_to(self.source / name)
+        with (
+            patch.object(upgrade, "service", return_value=state),
+            patch.object(
+                upgrade, "process_args", return_value=["spurd", "--hostname=a"]
+            ),
+            patch.object(
+                upgrade, "running_digest", return_value=args["manifest"]["spurd"]
+            ) as running,
+            patch.object(upgrade, "command", return_value="new") as command,
+            patch.object(upgrade, "wait_ready", return_value=state),
+            patch.object(
+                upgrade.os, "replace", side_effect=AssertionError("unexpected write")
+            ),
+        ):
+            self.assertFalse(upgrade.activate(**args)["changed"])
+            self.assertFalse(upgrade.activate(**args, check=True)["changed"])
+            running.return_value = "stale"
+            with self.assertRaisesRegex(ValueError, "Running daemon"):
+                upgrade.activate(**args)
+            running.return_value = args["manifest"]["spurd"]
+            (self.source / "spurstepd").write_text("drift")
+            with self.assertRaisesRegex(ValueError, "Installed binary"):
+                upgrade.activate(**args)
+            self.assertTrue(upgrade.activate(**args, check=True)["changed"])
+        command.assert_called_once_with([str(install / "spurd"), "-V"])
+        self.assertTrue(all((install / name).is_symlink() for name in args["manifest"]))
+
     def test_staged_archive_validation_rejects_corruption_and_unsafe_members(self):
         _, _, args = self.activation_fixture()
         upgrade.validate_archive(args["archive"], args["manifest"])

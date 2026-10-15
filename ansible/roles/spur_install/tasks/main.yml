@@ -109,13 +109,8 @@
   register: install_run
   changed_when: install_run.rc == 0
 
-# One exec handles all remaining binary/symlink housekeeping: drops the
-# pre-merge spurdbd binary and any component this host role doesn't need
-# (a host upgraded from an older role revision, or moved between inventory
-# groups, can carry binaries a prior run copied unconditionally), verifies
-# every needed binary is present, and creates all 18 Slurm-compatible
-# symlinks. One round-trip instead of a stat-per-binary and a module-call-
-# per-symlink over the wire.
+# Combine extraction, obsolete-component cleanup and CLI symlinks in one remote call.
+# Staged upgrades retain ordinary install caches for the next deploy.
 - name: Extract changed binaries, verify components, and maintain CLI symlinks
   vars:
     spur_install_archive: "{{ spur_install_staged_archive | default(spur_bin_copy.dest | default('')) }}"
@@ -132,7 +127,7 @@
     # included — it is useless without the spurd that spawns it.
     spur_unneeded_bins: >-
       {{ (['spurctld'] if not spur_needs_ctld else [])
-         + (['spurd', 'spurstepd'] if not spur_needs_agent_bin else []) }}
+         + (['spurd', 'spurstepd', 'spur_mpi_pmix.so'] if not spur_needs_agent_bin else []) }}
   ansible.builtin.shell: |
     set -e
     {% if spur_binary_src | default('') | length > 0 and not (spur_bin_copy.unreachable | default(false)) %}
@@ -147,7 +142,9 @@
     {% for name in spur_install_artifact.manifest %}
     chmod 0755 {{ (spur_install_dir ~ '/' ~ name) | quote }}
     {% endfor %}
+    {% if spur_install_staged_artifact is not defined %}
     find {{ spur_install_dir | quote }} -maxdepth 1 -name '.bins-*.tar.gz' ! -name {{ spur_install_archive | basename | quote }} -delete
+    {% endif %}
     echo BINARIES_EXTRACTED
     fi
     {% endif %}

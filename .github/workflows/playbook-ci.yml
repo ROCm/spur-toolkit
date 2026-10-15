@@ -145,6 +145,13 @@ jobs:
           python3 -m venv .venv
           .venv/bin/pip install "ansible-core${ANSIBLE_VERSION}" PyYAML
           PATH="$PWD/.venv/bin:$PATH" .venv/bin/python -m unittest discover -s tests/ansible -v
+      - name: Syntax check every playbook on this Ansible version
+        working-directory: ansible
+        run: |
+          for pb in playbooks/*.yml; do
+            ../.venv/bin/ansible-playbook --syntax-check -i inventory/ci.ini \
+              -e new_nodes=ctl-0 -e remove_nodes=ctl-0 "$pb"
+          done
 
   # ---------------------------------------------------------------------------
   # Job 1: rolling upgrade resilience + force upgrade + container kill
@@ -1428,17 +1435,22 @@ jobs:
             && { echo "FAIL: gpu-4 should NOT be registered under its inventory alias"; exit 1; }
           echo "PASS: add_nodes.yml verified gpu-4 by its real hostname, not the inventory alias"
 
-      # TODO(next): manage_accounts.yml / healthcheck.yml
+      # TODO(next): manage_accounts.yml
 
-      - name: Failed in-place agent does not prevent later serial batches
+      - name: A stopped late agent fails preflight before any restart
         working-directory: ansible
         run: |
           set -euo pipefail
-          trap 'docker exec gpu-1 systemctl start spurd' EXIT
-          docker exec gpu-1 systemctl stop spurd
+          declare -A before
+          for node in ctl-0 gpu-1 gpu-2; do
+            daemon=spurd; [ "$node" != ctl-0 ] || daemon=spurctld
+            before[$node]=$(docker exec "$node" systemctl show "$daemon" -p MainPID --value)
+          done
+          trap 'docker exec gpu-3 systemctl start spurd' EXIT
+          docker exec gpu-3 systemctl stop spurd
           set +e
           ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
-            --limit gpu-1,gpu-2,gpu-3 \
+            --limit ctl-0,gpu-1,gpu-2,gpu-3 \
             -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
             -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
             -e spur_accounting_enabled=false -e spur_in_place_upgrade=true \
@@ -1448,14 +1460,14 @@ jobs:
           set -e
           cat /tmp/failed-agent-upgrade.log
           test "$result" -eq 2
-          grep -F 'Upgrade failed (remaining hosts were processed)' /tmp/failed-agent-upgrade.log
-          grep -E '^gpu-1 +:.*failed=1' /tmp/failed-agent-upgrade.log
-          for node in gpu-2 gpu-3; do
-            grep -F "for $node" /tmp/failed-agent-upgrade.log
-            grep -E "^$node +:.*failed=0" /tmp/failed-agent-upgrade.log
-            docker exec "$node" systemctl is-active --quiet spurd
+          grep -F 'spurd is unhealthy' /tmp/failed-agent-upgrade.log
+          grep -E '^gpu-3 +:.*failed=1' /tmp/failed-agent-upgrade.log
+          for node in ctl-0 gpu-1 gpu-2; do
+            daemon=spurd; [ "$node" != ctl-0 ] || daemon=spurctld
+            test "${before[$node]}" = "$(docker exec "$node" systemctl show "$daemon" -p MainPID --value)"
+            docker exec "$node" systemctl is-active --quiet "$daemon"
           done
-          if docker exec gpu-1 systemctl is-active --quiet spurd; then
+          if docker exec gpu-3 systemctl is-active --quiet spurd; then
             echo 'An unhealthy agent unexpectedly entered provisioning'
             exit 1
           fi
@@ -3261,6 +3273,32 @@ jobs:
           docker exec ctl-0 grep -q 'plugin = "spur"' /opt/spur/etc/spur.conf || { echo "::error::controller not on native plugin"; exit 1; }
           docker exec gpu-1 grep -q 'plugin = "spur"' /opt/spur/etc/spur.conf || { echo "::error::agent not on native plugin"; exit 1; }
           echo "PASS: both daemons on plugin=spur"
+
+      - name: Reject an incomplete auth build before restarting any service
+        run: |
+          set -euo pipefail
+          source_dir=$(mktemp -d)
+          trap 'rm -rf "$source_dir"' EXIT
+          cp -al spur-bin/. "$source_dir/"
+          rm "$source_dir/spurauthd"
+          snapshot() {
+            for n in $NODES; do
+              daemon=spurd; [ "$n" != ctl-0 ] || daemon=spurctld
+              docker exec "$n" systemctl show "$daemon" spurauthd -p MainPID
+              docker exec "$n" sha256sum /usr/local/bin/spur "/usr/local/bin/$daemon" /usr/local/bin/spurauthd
+            done
+          }
+          before=$(snapshot)
+          cd ansible
+          if ansible-playbook -i "$AUTH_INV" playbooks/rolling_upgrade.yml \
+            -e @inventory/group_vars/all.yml -e spur_binary_src="$source_dir" \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
+            -e spur_accounting_enabled=false -e spur_auth_enabled=true \
+            -e spur_in_place_upgrade=true -e spur_overwrite_conf=false > /tmp/missing-auth-build.log 2>&1; then
+            echo '::error::incomplete auth build was accepted'; exit 1
+          fi
+          grep -E 'Missing Spur artifact: .*spurauthd' /tmp/missing-auth-build.log
+          test "$before" = "$(snapshot)"
 
       - name: Prepare distinct target artifacts and native-auth provisioning drift
         run: |

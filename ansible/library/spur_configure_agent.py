@@ -137,7 +137,8 @@ def main():
                 )
             else:
                 module.warn(
-                    "spur_mpi_pmix.so not found; MPI plugin installation skipped"
+                    "spur_mpi_pmix.so not found; MPI plugin installation skipped. "
+                    "Set spur_mpi_plugin_enabled=false to silence this warning."
                 )
     except (OSError, ValueError) as error:
         module.fail_json(msg=str(error), changed=changed)

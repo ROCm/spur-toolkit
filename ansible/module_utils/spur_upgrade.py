@@ -50,7 +50,14 @@ class ArtifactBuilder:
         key = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
         if key not in self.bundles:
             archive = self.cache / (key + ".tar.gz")
-            # Rebuild once per run so damaged cache files cannot mask source bytes.
+            try:
+                validate_archive(archive, manifest)
+            except (OSError, ValueError, EOFError, tarfile.TarError):
+                pass
+            else:
+                self.bundles[key] = {"archive": str(archive), "manifest": manifest}
+                return self.bundles[key]
+            # Publish only complete bundles; a damaged cache is rebuilt from source.
             fd, temporary = tempfile.mkstemp(dir=self.cache, prefix=".build-")
             try:
                 with os.fdopen(fd, "wb") as raw:
@@ -143,7 +150,7 @@ def prepare(targets, cache_dir):
                 )
                 if role == "agent" and (source / "spurstepd").is_file():
                     names.append("spurstepd")
-                if spec["auth"] and (source / "spurauthd").is_file():
+                if spec["auth"]:
                     names.append("spurauthd")
                 files = {name: source / name for name in names}
                 if role == "agent" and spec["mpi"]:
@@ -334,7 +341,10 @@ def activate(
     check=False,
     verify_only=False,
 ):
-    """Stage and verify the entire bundle before replacing any executable."""
+    """Verify provisioned hosts; standalone module callers may also activate bundles.
+
+    Playbooks use verify_only; the standalone path retains its existing API.
+    """
     install = Path(install_dir)
     daemon = "spurctld" if role == "controller" else "spurd"
     required = {"spur", daemon} | (
@@ -393,7 +403,7 @@ def activate(
             raise ConfigurationRequired(
                 "Binary-only upgrade requires an existing executable: %s" % dest
             )
-        if dest.is_symlink():
+        if dest.is_symlink() and not verify_only:
             raise ConfigurationRequired(
                 "Binary-only upgrade does not replace symlinked executables: %s" % dest
             )

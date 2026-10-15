@@ -793,9 +793,7 @@ class LocalPlaybooks(unittest.TestCase):
                         success=False,
                     )
                     self.assertTrue((self.root / "activated-first").exists())
-                    self.assertEqual(
-                        (self.root / "activated-zlater").exists(), not rpc_error, output
-                    )
+                    self.assertFalse((self.root / "activated-zlater").exists(), output)
                     if rpc_error:
                         self.assertIn("controller unavailable", output)
                         self.assertNotIn("did not register:", output)
@@ -804,9 +802,7 @@ class LocalPlaybooks(unittest.TestCase):
                         )
                     else:
                         self.assertIn("first did not register:", output)
-                        self.assertIn(
-                            "Upgrade failed (remaining hosts were processed)", output
-                        )
+                        self.assertNotIn("is undefined", output)
 
     def test_real_remove_guard_preserves_refuse_skip_and_force(self):
         self.executable(

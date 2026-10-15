@@ -46,7 +46,8 @@
 - name: Warn if no time synchronization is detected
   ansible.builtin.debug:
     msg: >-
-      WARNING: {{ inventory_hostname }} shows no time sync. Native credentials last
+      WARNING: {{ inventory_hostname }} shows no time sync (NTP is unsynchronized and no
+      chrony/ntp/timesyncd service is active). Native credentials last
       {{ spur_authd_lifetime_secs | default(30) }}s and tolerate only ~5s of clock skew.
       Enable NTP/chrony before switching to spur_auth_mode=required.
   when: "'UNSYNCED' in (spur_auth_preflight.stdout | default(''))"
@@ -57,13 +58,15 @@
       WARNING: {{ inventory_hostname }} cannot resolve
       {{ spur_auth_preflight.stdout_lines | select('match', '^UNRESOLVED:') | first | regex_replace('^UNRESOLVED:', '') }}.
       RBAC binds by the caller's resolved username/groups; an unresolvable principal grants no role.
+      Users must resolve on login/compute nodes; groups on controllers and compute nodes.
   when: "'UNRESOLVED:' in (spur_auth_preflight.stdout | default(''))"
 
 - name: Fail early if spurauthd is missing
   ansible.builtin.fail:
     msg: >-
       spur_auth_enabled=true but {{ spur_install_dir }}/spurauthd is missing on {{ inventory_hostname }}.
-      Build spurauthd into spur_binary_src or use a release that includes it, then re-run.
+      Build it with `cargo build --release -p spurauthd` into spur_binary_src,
+      or use a release that includes it, then re-run.
   when: "'AUTHD_MISSING' in (spur_auth_preflight.stdout | default(''))"
 
 - name: Ensure the auth config + key directories exist

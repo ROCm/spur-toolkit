@@ -434,7 +434,6 @@
     dckj_in_place: "{{ spur_in_place_upgrade | default(false) | bool }}"
   tasks:
     - name: Upgrade agents with the configured failure policy
-      when: ru_upgrade_failure is not defined
       block:
         - name: Run the selected upgrade path
           ansible.builtin.include_tasks: >-
@@ -461,19 +460,3 @@
   gather_facts: no
   tasks:
     - ansible.builtin.include_tasks: tasks/print_verification_summary.yml
-
-# Target only failed hosts, including when --limit excludes the controllers.
-- name: Report failed agents after completing the remaining upgrades
-  hosts: >-
-    {%- set names = [] -%}
-    {%- for name in groups['spur_agents'] -%}
-    {%- if hostvars[name].ru_upgrade_failure is defined -%}
-    {%- set _ = names.append(name) -%}
-    {%- endif -%}
-    {%- endfor -%}
-    {{ names | join(':') if names else 'all:!all' }}
-  gather_facts: false
-  tasks:
-    - name: Fail the final result for this agent
-      ansible.builtin.fail:
-        msg: "Upgrade failed (remaining hosts were processed): {{ ru_upgrade_failure }}"

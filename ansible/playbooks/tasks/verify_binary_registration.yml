@@ -15,10 +15,25 @@
     SPUR_CONF: "{{ hostvars[groups['spur_controllers'][0]].spur_home }}/etc/spur.conf"
     SPUR_CONTROLLER_ADDR: "http://127.0.0.1:{{ hostvars[groups['spur_controllers'][0]].spur_controller_port }}"
   delegate_to: "{{ groups['spur_controllers'][0] }}"
-  ignore_unreachable: false
+  ignore_unreachable: true
+  ignore_errors: true  # noqa ignore-errors -- the following assertion handles the shared result
+  failed_when: false
   run_once: true
   register: ru_registration
-  # Successful snapshots attribute missing registrations to agents; query failures stay fatal.
+  # Inspect transport and RPC failures explicitly; run_once rescue metadata is not shared.
+  when:
+    - ru_upgrade_role == 'agent'
+    - not ansible_check_mode
+
+- name: Stop the rollout if the controller registration query is unavailable
+  ansible.builtin.assert:
+    that:
+      - not (ru_registration.unreachable | default(false))
+      - ru_registration.msg is not defined
+      - ru_registration.nodes is defined
+    quiet: true
+    fail_msg: "Controller {{ groups['spur_controllers'][0] }} registration query failed: {{ ru_registration.msg | default('no snapshot returned') }}"
+  any_errors_fatal: true
   when:
     - ru_upgrade_role == 'agent'
     - not ansible_check_mode

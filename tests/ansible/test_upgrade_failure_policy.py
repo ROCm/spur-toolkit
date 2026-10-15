@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -16,7 +17,9 @@ ANSIBLE = ROOT / "ansible"
 
 @unittest.skipUnless(shutil.which("ansible-playbook"), "requires ansible-core")
 class FailurePolicy(unittest.TestCase):
-    def test_failed_agent_does_not_abort_later_batches_only_when_tolerated(self):
+    def test_reachable_failures_stop_later_batches_even_when_unreachable_are_tolerated(
+        self,
+    ):
         plays = yaml.safe_load((ANSIBLE / "playbooks/rolling_upgrade.yml").read_text())
         play = next(
             p
@@ -120,14 +123,8 @@ class FailurePolicy(unittest.TestCase):
                         )
                         self.assertEqual(result.returncode, 2, result.stdout)
                         self.assertIn("fixture unhealthy spurd", result.stdout)
-                        self.assertEqual(
-                            (root / "later").exists(), tolerate, result.stdout
-                        )
-                        if tolerate:
-                            self.assertTrue((root / "good").exists(), result.stdout)
-                            self.assertIn(
-                                "Verify this upgraded agent registered", result.stdout
-                            )
+                        self.assertFalse((root / "later").exists(), result.stdout)
+                        self.assertNotIn("is undefined", result.stdout)
 
 
 if __name__ == "__main__":

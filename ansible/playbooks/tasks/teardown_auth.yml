@@ -1,7 +1,5 @@
 ---
-# Native-auth CLI config lives under spur_auth_conf_dir (/etc/spur by default),
-# outside spur_home, so the spur_home wipe above misses it. Always host-local
-# (per spur_auth's own docs), so safe to remove regardless of --limit scope.
+# CLI configuration is host-local and outside spur_home, so wipe it separately.
 - name: Remove native-auth CLI config (only when -e wipe=true)
   ansible.builtin.file:
     path: "{{ spur_auth_conf_dir }}/spur.conf"
@@ -11,10 +9,7 @@
     - (wipe | default(false) | bool)
     - spur_ok_to_disrupt
 
-# Unlike a whole-cluster teardown, `--limit` can narrow this to a subset of
-# hosts — so only wipe *.jwks when key_dir is still the per-host default;
-# a relocated (likely shared, e.g. NFS) dir is left alone so a --limit'd
-# teardown can't wipe keys the rest of the (still-live) cluster needs.
+# A limited teardown must not wipe a shared key directory used by surviving hosts.
 - name: Remove native-auth keys (only when -e wipe=true; skipped on a shared key dir)
   ansible.builtin.shell: |
     rm -f {{ spur_auth_key_dir }}/*.jwks

@@ -23,6 +23,17 @@ def main():
 
     result = {}
     try:
+        required = {
+            "spur",
+            "spurctld" if module.params["role"] == "controller" else "spurd",
+        }
+        if module.params["auth"]:
+            required.add("spurauthd")
+        if not required <= module.params["manifest"].keys():
+            raise ValueError(
+                "Missing required upgrade artifacts: %s"
+                % ", ".join(sorted(required - module.params["manifest"].keys()))
+            )
         validate_archive(module.params["archive"], module.params["manifest"])
         service("spurctld" if module.params["role"] == "controller" else "spurd")
         if module.params["auth"]:
