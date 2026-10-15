@@ -1,0 +1,79 @@
+---
+- name: Gather facts if missing
+  ansible.builtin.setup:
+    gather_subset: "{{ spur_gather_subset }}"
+  when: ansible_default_ipv4 is not defined
+
+- name: Drain + guard this node against job loss before touching its binaries
+  ansible.builtin.include_tasks: drain_and_guard_agent.yml
+
+- name: Does this agent already run a spurstepd build?
+  ansible.builtin.stat:
+    path: "{{ spur_install_dir }}/spurstepd"
+    get_checksum: false
+  register: ru_agent_stepd_before
+  when: spur_install_staged_preflight.stepd_exists is not defined
+
+- name: Does the new build ship spurstepd?
+  ansible.builtin.stat:
+    path: "{{ spur_binary_src }}/spurstepd"
+    get_checksum: false
+  delegate_to: localhost
+  become: false
+  register: ru_src_stepd
+  when:
+    - spur_binary_src | default('') | length > 0
+    - spur_install_staged_artifact is not defined
+
+- name: Note this agent is getting spurstepd for the first time in this run
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} has no spurstepd yet and this run's source has one —
+      the controllers ahead of it in this rolling upgrade are already on the new build.
+      Proceeding; to avoid this transition window, drain the cluster and use deploy.yml.
+  when:
+    - not (spur_install_staged_preflight.stepd_exists | default(ru_agent_stepd_before.stat.exists | default(false)))
+    - >-
+      (('spurstepd' in spur_install_staged_artifact.manifest)
+       if spur_install_staged_artifact is defined else (ru_src_stepd.stat.exists | default(false)))
+
+- name: Apply spur_install
+  vars:
+    spur_force_reinstall: true  # noqa var-naming[no-role-prefix]
+  when: >-
+    not (spur_node_busy | default(false)) or
+    (spur_force_upgrade_busy_agents | default(false) | bool) or
+    (spur_node_in_place | default(false))
+  ansible.builtin.include_role:
+    name: spur_install
+
+- name: Apply spur_auth
+  when: >-
+    (spur_auth_enabled | default(false) | bool)
+    and (not (spur_node_busy | default(false))
+         or (spur_force_upgrade_busy_agents | default(false) | bool)
+         or (spur_node_in_place | default(false)))
+  ansible.builtin.include_role:
+    name: spur_auth
+
+- name: Apply spur_agent
+  when: >-
+    not (spur_node_busy | default(false)) or
+    (spur_force_upgrade_busy_agents | default(false) | bool) or
+    (spur_node_in_place | default(false))
+  ansible.builtin.include_role:
+    name: spur_agent
+
+- name: Re-register + undrain the node now that it's back
+  # Staged in-place upgrades verify registration once per batch after checking artifacts.
+  ansible.builtin.include_tasks: resume_and_undrain_agent.yml
+  when: spur_install_staged_artifact is not defined
+
+- name: Collect agent verification facts
+  ansible.builtin.include_tasks: collect_verification_facts.yml
+  when: spur_install_staged_artifact is not defined
+  vars:
+    spur_verify_daemon_name: spurd
+    spur_verify_daemon_port: "{{ spur_agent_port }}"
+    spur_verify_role_label: agent
+    spur_verify_check_registration: true

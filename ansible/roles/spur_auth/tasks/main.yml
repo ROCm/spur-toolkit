@@ -16,34 +16,17 @@
     spur_auth_is_agent: "{{ inventory_hostname in groups['spur_agents'] }}"
     spur_auth_is_login: "{{ inventory_hostname in groups.get('spur_login', []) }}"
 
-# --- Preflight (non-fatal): the two prerequisites most likely to make auth fail
-# in confusing ways. Warn, don't block. ---
-- name: Preflight — is the clock synchronized? (creds live {{ spur_authd_lifetime_secs | default(30) }}s, ~5s skew tolerated)
+- name: Check clock, RBAC principals, and auth binary in one remote call
   ansible.builtin.shell: |
     set +e
-    [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && { echo OK; exit 0; }
-    for svc in chrony chronyd systemd-timesyncd ntp ntpd; do
-      systemctl is-active --quiet "$svc" 2>/dev/null && { echo OK; exit 0; }
-    done
-    echo UNSYNCED
-  args:
-    executable: /bin/bash
-  register: spur_auth_clock
-  changed_when: false
-  failed_when: false
-
-- name: Warn if no time synchronization is detected
-  ansible.builtin.debug:
-    msg: >-
-      WARNING: {{ inventory_hostname }} shows no time sync (timedatectl
-      NTPSynchronized=no and no chrony/ntp/timesyncd active). Native credentials
-      last {{ spur_authd_lifetime_secs | default(30) }}s and tolerate only ~5s of
-      clock skew — enable NTP/chrony before switching to spur_auth_mode=required.
-  when: "'UNSYNCED' in (spur_auth_clock.stdout | default(''))"
-
-- name: Preflight — do the configured RBAC principals resolve via NSS?
-  ansible.builtin.shell: |
-    set +e
+    clock_ready() {
+      [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && return 0
+      for svc in chrony chronyd systemd-timesyncd ntp ntpd; do
+        systemctl is-active --quiet "$svc" 2>/dev/null && return 0
+      done
+      return 1
+    }
+    clock_ready || echo UNSYNCED
     missing=""
     for u in {{ spur_cluster_admins | default([]) | map('quote') | join(' ') }}; do
       getent passwd "$u" >/dev/null 2>&1 || missing="$missing user:$u"
@@ -52,28 +35,39 @@
       getent group "$g" >/dev/null 2>&1 || missing="$missing group:$g"
     done
     [ -n "$missing" ] && echo "UNRESOLVED:$missing"
+    [ -e {{ (spur_install_dir ~ '/spurauthd') | quote }} ] || echo AUTHD_MISSING
     exit 0
   args:
     executable: /bin/bash
-  register: spur_auth_nss
+  register: spur_auth_preflight
   changed_when: false
-  failed_when: false
-  when: >-
-    (spur_cluster_admins | default([]) | length > 0)
-    or (spur_admin_groups | default([]) | length > 0)
-    or (spur_operator_groups | default([]) | length > 0)
+  check_mode: false
+
+- name: Warn if no time synchronization is detected
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ inventory_hostname }} shows no time sync (NTP is unsynchronized and no
+      chrony/ntp/timesyncd service is active). Native credentials last
+      {{ spur_authd_lifetime_secs | default(30) }}s and tolerate only ~5s of clock skew.
+      Enable NTP/chrony before switching to spur_auth_mode=required.
+  when: "'UNSYNCED' in (spur_auth_preflight.stdout | default(''))"
 
 - name: Warn about RBAC principals that don't resolve on this host
   ansible.builtin.debug:
     msg: >-
       WARNING: {{ inventory_hostname }} cannot resolve
-      {{ spur_auth_nss.stdout | trim | regex_replace('^UNRESOLVED:', '') }}.
-      RBAC binds by the caller's resolved username/groups, so an unresolvable
-      principal silently grants no role. Users must resolve on login/compute
-      nodes; groups on the controller and compute nodes.
-  when:
-    - spur_auth_nss is defined
-    - "'UNRESOLVED' in (spur_auth_nss.stdout | default(''))"
+      {{ spur_auth_preflight.stdout_lines | select('match', '^UNRESOLVED:') | first | regex_replace('^UNRESOLVED:', '') }}.
+      RBAC binds by the caller's resolved username/groups; an unresolvable principal grants no role.
+      Users must resolve on login/compute nodes; groups on controllers and compute nodes.
+  when: "'UNRESOLVED:' in (spur_auth_preflight.stdout | default(''))"
+
+- name: Fail early if spurauthd is missing
+  ansible.builtin.fail:
+    msg: >-
+      spur_auth_enabled=true but {{ spur_install_dir }}/spurauthd is missing on {{ inventory_hostname }}.
+      Build it with `cargo build --release -p spurauthd` into spur_binary_src,
+      or use a release that includes it, then re-run.
+  when: "'AUTHD_MISSING' in (spur_auth_preflight.stdout | default(''))"
 
 - name: Ensure the auth config + key directories exist
   # spur_auth_conf_dir holds the CLI spur.conf; spur_auth_key_dir holds the *.jwks
@@ -87,26 +81,6 @@
     group: root
     mode: "0755"
   loop: "{{ [spur_auth_conf_dir, spur_auth_key_dir] | unique }}"
-
-# spurauthd is mandatory once auth is enabled — fail with a clear message here
-# rather than letting the socket wait below time out cryptically.
-- name: Verify the spurauthd binary is installed
-  ansible.builtin.stat:
-    path: "{{ spur_install_dir }}/spurauthd"
-  register: spur_authd_bin
-
-- name: Fail early if spurauthd is missing
-  ansible.builtin.fail:
-    msg: >-
-      spur_auth_enabled=true but {{ spur_install_dir }}/spurauthd is missing on
-      {{ inventory_hostname }}. Build it (`cargo build --release -p spurauthd`
-      into spur_binary_src) or use a release/nightly that includes ROCm/spur#919,
-      then re-run.
-  # The stat above still "registers" on an unreachable host (as an unreachable
-  # result, no .stat key) — don't mistake that skip for a genuinely missing binary.
-  when:
-    - not (spur_authd_bin.unreachable | default(false))
-    - not (spur_authd_bin.stat.exists | default(false))
 
 # --- Key material (hybrid). The control-node spur_auth_keys_dir is the source of
 # truth. Generate the sets once on the first controller only if any are missing

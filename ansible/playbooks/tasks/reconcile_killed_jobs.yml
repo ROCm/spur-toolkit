@@ -1,0 +1,46 @@
+---
+- name: Extract job IDs this kill just emptied
+  ansible.builtin.set_fact:
+    dckj_affected_job_ids: >-
+      {{ ((dckj_kill_result.stdout | regex_search('AFFECTED_JOB_IDS:(.*)', '\1')) or [''])[0]
+         | trim | split }}
+
+- name: Show job IDs extracted from this kill (debug visibility)
+  ansible.builtin.debug:
+    msg: "dckj_affected_job_ids={{ dckj_affected_job_ids }}"
+
+# Cancel as the controller-recorded owner, which may differ from the workload's OS user.
+# An unavailable owner falls back to the play's become target.
+- name: Look up each affected job's owner on the controller
+  ansible.builtin.shell: "{{ spur_install_dir }}/spur show job {{ item }} 2>/dev/null | grep -oE 'UserId=[^ ]+' | head -n 1 | cut -d= -f2 | xargs -r getent passwd | cut -d: -f1"
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  loop: "{{ dckj_affected_job_ids }}"
+  loop_control:
+    label: "{{ item }}"
+  register: dckj_job_owners
+  changed_when: false
+  failed_when: false
+  when: dckj_affected_job_ids | length > 0
+
+# Process cleanup cannot release controller allocations (see kill_workload_processes.yml).
+# Best-effort cancellation also reconciles extern supervisors that did not report exit.
+- name: Force-cancel jobs this kill just emptied (controller-side, no agent ack needed)
+  ansible.builtin.command:
+    argv: "{{ [spur_install_dir ~ '/spur', 'cancel', '-s', 'KILL', item.item] }}"
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  loop: "{{ dckj_job_owners.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  become: true
+  become_user: >-
+    {{ (item.stdout | default('') | trim)
+       if ((item.stdout | default('') | trim) | length > 0) else omit }}
+  when: dckj_affected_job_ids | length > 0
+  register: dckj_cancel_result
+  changed_when: true
+  failed_when: false
+
+- name: Show force-cancel result (debug visibility)
+  ansible.builtin.debug:
+    var: dckj_cancel_result
+  when: dckj_affected_job_ids | length > 0

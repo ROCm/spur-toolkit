@@ -1,0 +1,57 @@
+---
+# Do not stop skipped busy nodes: SIGTERM would deregister them from the live cluster.
+- name: Kill workloads still running on a node being force-removed
+  ansible.builtin.include_tasks: kill_workload_processes.yml
+  when: >-
+    (spur_force_remove_busy_nodes | default(false) | bool)
+    and (rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0)
+
+- name: Stop + disable spurd on nodes being removed
+  ansible.builtin.systemd:
+    name: spurd
+    state: stopped
+    enabled: false
+  when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
+  failed_when: false
+
+- name: Clean native authentication on the removed agent
+  ansible.builtin.include_tasks: remove_agent_auth.yml
+  when: spur_auth_enabled | default(false) | bool
+
+# Supervisors outlive spurd; decommissioned nodes must also remove their sessions.
+- name: Reap job supervisors and session state on nodes being removed
+  ansible.builtin.include_tasks: reap_stepd_supervisors.yml
+  vars:
+    stepd_purge_sessions: true
+  ignore_errors: true
+  when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
+
+# A supervisor surviving SIGKILL must not be swallowed by ignore_errors above —
+# the final play's "removed" message needs to know so it isn't misleading.
+- name: Record whether this node's supervisor reap failed
+  ansible.builtin.set_fact:
+    rn_reap_failed: "{{ inventory_hostname if (stepd_reap.rc | default(0) | int != 0) else '' }}"
+  when: rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
+
+# Mesh cleanup (wireguard only). Capture this node's pubkey so the controller can drop it as a
+# peer, then tear down its interface so it doesn't linger as a ghost peer or rejoin on reboot.
+- name: Read removed node's WG pubkey (for controller peer removal)
+  ansible.builtin.command: "wg show {{ spur_wg_interface }} public-key"
+  register: rn_wg_pubkey
+  changed_when: false
+  failed_when: false
+  when:
+    - spur_transport | default('direct') == 'wireguard'
+    - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0
+
+- name: Tear down the mesh interface on the removed node
+  ansible.builtin.shell: |
+    systemctl disable wg-quick@{{ spur_wg_interface }} 2>/dev/null || true
+    wg-quick down {{ spur_wg_interface }} 2>/dev/null || ip link del {{ spur_wg_interface }} 2>/dev/null || true
+    rm -f /etc/wireguard/{{ spur_wg_interface }}.conf
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when:
+    - spur_transport | default('direct') == 'wireguard'
+    - rn_actual_remove_list | intersect([ansible_hostname | default(inventory_hostname), inventory_hostname]) | length > 0

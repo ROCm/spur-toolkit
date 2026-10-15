@@ -1,0 +1,51 @@
+---
+- name: Query upgraded agent registrations once per batch
+  spur_node_snapshot:
+    binary: "{{ hostvars[groups['spur_controllers'][0]].spur_install_dir }}/spur"
+    expected: >-
+      {%- set names = [] -%}
+      {%- for name in ansible_play_batch -%}
+      {%- if hostvars[name].ru_activated.node_name is defined -%}
+      {%- set _ = names.append(hostvars[name].ru_activated.node_name) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ names }}
+    timeout: 30
+  environment:
+    SPUR_CONF: "{{ hostvars[groups['spur_controllers'][0]].spur_home }}/etc/spur.conf"
+    SPUR_CONTROLLER_ADDR: "http://127.0.0.1:{{ hostvars[groups['spur_controllers'][0]].spur_controller_port }}"
+  delegate_to: "{{ groups['spur_controllers'][0] }}"
+  ignore_unreachable: true
+  ignore_errors: true  # noqa ignore-errors -- the following assertion handles the shared result
+  failed_when: false
+  run_once: true
+  register: ru_registration
+  # Inspect transport and RPC failures explicitly; run_once rescue metadata is not shared.
+  when:
+    - ru_upgrade_role == 'agent'
+    - not ansible_check_mode
+
+- name: Stop the rollout if the controller registration query is unavailable
+  ansible.builtin.assert:
+    that:
+      - not (ru_registration.unreachable | default(false))
+      - ru_registration.msg is not defined
+      - ru_registration.nodes is defined
+    quiet: true
+    fail_msg: "Controller {{ groups['spur_controllers'][0] }} registration query failed: {{ ru_registration.msg | default('no snapshot returned') }}"
+  any_errors_fatal: true
+  when:
+    - ru_upgrade_role == 'agent'
+    - not ansible_check_mode
+
+- name: Verify this upgraded agent registered
+  ansible.builtin.assert:
+    that:
+      - ru_registration.nodes is defined
+      - ru_registration.nodes.get(ru_activated.node_name, '') | length > 0
+    quiet: true
+    fail_msg: "{{ ru_activated.node_name }} did not register: {{ ru_registration.msg | default(ru_registration.pending | default([])) }}"
+  when:
+    - ru_upgrade_role == 'agent'
+    - not ansible_check_mode
+    - ru_activated.node_name is defined

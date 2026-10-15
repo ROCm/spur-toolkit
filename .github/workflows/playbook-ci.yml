@@ -67,7 +67,8 @@
 #   skip-flags, and the fail/--partial paths.
 #
 # Single-controller HA/accounting/login-node coverage lives in deploy.yml's own
-# path. manage_accounts.yml / healthcheck.yml are still TODO.
+# path. healthcheck.yml also has local failure-path fixtures and a container smoke test.
+# manage_accounts.yml integration coverage is still TODO.
 # ============================================================================
 name: playbook-ci
 
@@ -78,13 +79,17 @@ on:
       - main
     paths:
       - 'ansible/**'
+      - 'tests/ansible/**'
       - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
+      - '.github/scripts/upgrade_convergence.py'
   pull_request:
     paths:
       - 'ansible/**'
+      - 'tests/ansible/**'
       - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
+      - '.github/scripts/upgrade_convergence.py'
 
 permissions:
   contents: read
@@ -116,6 +121,36 @@ jobs:
           for pb in playbooks/*.yml; do
             echo "== syntax-check $pb =="
             ansible-playbook --syntax-check -i inventory/ci.ini $DUMMY "$pb" || exit 1
+          done
+      - name: Test upgrade modules, fleet operations, and local playbook fixtures
+        run: python3 -m unittest discover -s tests/ansible -v
+
+  unit-compatibility:
+    runs-on: ${{ matrix.os || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible: ['>=2.14,<2.15', '>=2.17,<2.18', '>=2.19,<2.20']
+        include:
+          - ansible: '>=2.14,<2.15'
+            os: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Test local fixtures on supported Ansible versions
+        env:
+          ANSIBLE_VERSION: ${{ matrix.ansible }}
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install "ansible-core${ANSIBLE_VERSION}" PyYAML
+          PATH="$PWD/.venv/bin:$PATH" .venv/bin/python -m unittest discover -s tests/ansible -v
+      - name: Syntax check every playbook on this Ansible version
+        working-directory: ansible
+        run: |
+          for pb in playbooks/*.yml; do
+            ../.venv/bin/ansible-playbook --syntax-check -i inventory/ci.ini \
+              -e new_nodes=ctl-0 -e remove_nodes=ctl-0 "$pb"
           done
 
   # ---------------------------------------------------------------------------
@@ -1131,7 +1166,7 @@ jobs:
           done
           echo "PASS: agents' spur.conf is minimal (no controller/accounting/nodes/partitions content)"
 
-          docker exec gpu-1 journalctl -u spurd --no-pager | grep -q "loaded spur.conf" \
+          docker exec gpu-1 journalctl -u spurd --no-pager | grep "loaded spur.conf" >/dev/null \
             && echo "PASS: spurd log confirms it loaded spur.conf" \
             || { echo "FAIL: spurd never logged loading spur.conf"; docker exec gpu-1 journalctl -u spurd --no-pager | tail -20; exit 1; }
 
@@ -1169,6 +1204,12 @@ jobs:
           echo "PASS: agent template renders [cluster]/k8s block correctly when spur_k8s_enabled=true"
 
       # --- spur.conf preservation test (controller AND agent) ---------------
+      - name: healthcheck.yml on the deployed cluster
+        working-directory: ansible
+        run: |
+          ansible-playbook -i inventory/ci.ini playbooks/healthcheck.yml \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur
+
       - name: Stamp a sentinel line into spur.conf on ctl-0 and gpu-1 to detect overwrites
         run: |
           for h in ctl-0 gpu-1; do
@@ -1235,6 +1276,16 @@ jobs:
           done
           echo "sentinel written to spur.conf on ctl-0 and gpu-1"
 
+      - name: Seed agent file drift before deployment convergence
+        run: |
+          set -euo pipefail
+          docker exec gpu-1 sh -c 'echo CI_ENV_SENTINEL=keep >> /etc/environment'
+          docker exec gpu-1 chmod 0755 /opt/spur/agent-state
+          docker exec gpu-1 sh -c 'cp /bin/true /usr/local/bin/spurd.ci-drift; mv /usr/local/bin/spurd.ci-drift /usr/local/bin/spurd'
+          docker exec gpu-1 sh -c 'printf stale > /usr/lib/spur/spur_mpi_pmix.so'
+          docker exec gpu-1 stat -c %i /etc/systemd/system/spurd.service > /tmp/ci-unit-inode
+          docker exec gpu-1 systemctl show spurd -p MainPID --value > /tmp/ci-agent-pid
+
       - name: deploy.yml (default — spur.conf must be preserved on controller and agent)
         working-directory: ansible
         env:
@@ -1246,6 +1297,22 @@ jobs:
             -e spur_home=/opt/spur \
             -e spur_drain_wait_secs=10 \
             -e spur_verify_enabled=false
+
+      - name: Assert deployment repairs drift and restarts without rewriting unchanged unit
+        run: |
+          set -euo pipefail
+          docker exec gpu-1 grep -qx CI_ENV_SENTINEL=keep /etc/environment
+          test "$(docker exec gpu-1 stat -c %a /opt/spur/agent-state)" = 700
+          test "$(docker exec gpu-1 stat -c %a /usr/lib/spur/spur_mpi_pmix.so)" = 755
+          expected=$(sha256sum spur-bin-new/spur_mpi_pmix.so | cut -d ' ' -f1)
+          actual=$(docker exec gpu-1 sha256sum /usr/lib/spur/spur_mpi_pmix.so | cut -d ' ' -f1)
+          test "$actual" = "$expected"
+          expected=$(sha256sum spur-bin-new/spurd | cut -d ' ' -f1)
+          actual=$(docker exec gpu-1 sha256sum /usr/local/bin/spurd | cut -d ' ' -f1)
+          test "$actual" = "$expected"
+          test "$(docker exec gpu-1 stat -c %i /etc/systemd/system/spurd.service)" = "$(cat /tmp/ci-unit-inode)"
+          test "$(docker exec gpu-1 systemctl show spurd -p MainPID --value)" != "$(cat /tmp/ci-agent-pid)"
+          docker exec gpu-1 systemctl is-active --quiet spurd
 
       - name: Assert deploy.yml did NOT overwrite spur.conf on ctl-0 or gpu-1 (sentinel must still be present)
         run: |
@@ -1368,7 +1435,42 @@ jobs:
             && { echo "FAIL: gpu-4 should NOT be registered under its inventory alias"; exit 1; }
           echo "PASS: add_nodes.yml verified gpu-4 by its real hostname, not the inventory alias"
 
-      # TODO(next): manage_accounts.yml / healthcheck.yml
+      # TODO(next): manage_accounts.yml
+
+      - name: A stopped late agent fails preflight before any restart
+        working-directory: ansible
+        run: |
+          set -euo pipefail
+          declare -A before
+          for node in ctl-0 gpu-1 gpu-2; do
+            daemon=spurd; [ "$node" != ctl-0 ] || daemon=spurctld
+            before[$node]=$(docker exec "$node" systemctl show "$daemon" -p MainPID --value)
+          done
+          trap 'docker exec gpu-3 systemctl start spurd' EXIT
+          docker exec gpu-3 systemctl stop spurd
+          set +e
+          ansible-playbook -i inventory/ci.ini playbooks/rolling_upgrade.yml \
+            --limit ctl-0,gpu-1,gpu-2,gpu-3 \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-new" \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
+            -e spur_accounting_enabled=false -e spur_in_place_upgrade=true \
+            -e spur_rolling_batch_size=1 -e spur_ignore_unreachable_agents=true \
+            > /tmp/failed-agent-upgrade.log 2>&1
+          result=$?
+          set -e
+          cat /tmp/failed-agent-upgrade.log
+          test "$result" -eq 2
+          grep -F 'spurd is unhealthy' /tmp/failed-agent-upgrade.log
+          grep -E '^gpu-3 +:.*failed=1' /tmp/failed-agent-upgrade.log
+          for node in ctl-0 gpu-1 gpu-2; do
+            daemon=spurd; [ "$node" != ctl-0 ] || daemon=spurctld
+            test "${before[$node]}" = "$(docker exec "$node" systemctl show "$daemon" -p MainPID --value)"
+            docker exec "$node" systemctl is-active --quiet "$daemon"
+          done
+          if docker exec gpu-3 systemctl is-active --quiet spurd; then
+            echo 'An unhealthy agent unexpectedly entered provisioning'
+            exit 1
+          fi
 
       - name: Dump logs on failure
         if: failure()
@@ -2169,6 +2271,9 @@ jobs:
           ' >/dev/null 2>&1 &
           echo $! > /tmp/ci-inplace.sampler.pid
 
+      - name: Introduce unit, environment, symlink and PMIx drift before in-place upgrade
+        run: python3 .github/scripts/upgrade_convergence.py before "$GITHUB_WORKSPACE/spur-bin-new"
+
       - name: rolling_upgrade.yml -e spur_in_place_upgrade=true
         working-directory: ansible
         env:
@@ -2181,6 +2286,9 @@ jobs:
             -e spur_home=/opt/spur \
             -e spur_in_place_upgrade=true \
             2>&1 | tee /tmp/ci-inplace.ansible.log
+
+      - name: Verify all target artifacts and systemd convergence after in-place upgrade
+        run: python3 .github/scripts/upgrade_convergence.py after "$GITHUB_WORKSPACE/spur-bin-new"
 
       - name: Stop sampling
         if: always()
@@ -3165,6 +3273,58 @@ jobs:
           docker exec ctl-0 grep -q 'plugin = "spur"' /opt/spur/etc/spur.conf || { echo "::error::controller not on native plugin"; exit 1; }
           docker exec gpu-1 grep -q 'plugin = "spur"' /opt/spur/etc/spur.conf || { echo "::error::agent not on native plugin"; exit 1; }
           echo "PASS: both daemons on plugin=spur"
+
+      - name: Reject an incomplete auth build before restarting any service
+        run: |
+          set -euo pipefail
+          source_dir=$(mktemp -d)
+          trap 'rm -rf "$source_dir"' EXIT
+          cp -al spur-bin/. "$source_dir/"
+          rm "$source_dir/spurauthd"
+          snapshot() {
+            for n in $NODES; do
+              daemon=spurd; [ "$n" != ctl-0 ] || daemon=spurctld
+              docker exec "$n" systemctl show "$daemon" spurauthd -p MainPID
+              docker exec "$n" sha256sum /usr/local/bin/spur "/usr/local/bin/$daemon" /usr/local/bin/spurauthd
+            done
+          }
+          before=$(snapshot)
+          cd ansible
+          if ansible-playbook -i "$AUTH_INV" playbooks/rolling_upgrade.yml \
+            -e @inventory/group_vars/all.yml -e spur_binary_src="$source_dir" \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
+            -e spur_accounting_enabled=false -e spur_auth_enabled=true \
+            -e spur_in_place_upgrade=true -e spur_overwrite_conf=false > /tmp/missing-auth-build.log 2>&1; then
+            echo '::error::incomplete auth build was accepted'; exit 1
+          fi
+          grep -E 'Missing Spur artifact: .*spurauthd' /tmp/missing-auth-build.log
+          test "$before" = "$(snapshot)"
+
+      - name: Prepare distinct target artifacts and native-auth provisioning drift
+        run: |
+          set -euo pipefail
+          cp -a spur-bin spur-bin-upgrade
+          # Trailing ELF bytes change every checksum without changing executable behavior.
+          for b in spur spurctld spurd spurstepd spurauthd; do
+            printf '\nci-upgrade-artifact\n' >> "spur-bin-upgrade/$b"
+          done
+          # This fixture tests .so delivery; MPI execution has separate coverage.
+          printf 'int ci_pmix_fixture(void) { return 1; }\n' | cc -shared -fPIC -x c - -o spur-bin-upgrade/spur_mpi_pmix.so
+          python3 .github/scripts/upgrade_convergence.py before "$GITHUB_WORKSPACE/spur-bin-upgrade" --auth
+
+      - name: In-place upgrade reconciles native auth and all target artifacts
+        working-directory: ansible
+        run: |
+          ansible-playbook -i "$AUTH_INV" playbooks/rolling_upgrade.yml \
+            -e @inventory/group_vars/all.yml \
+            -e spur_binary_src="$GITHUB_WORKSPACE/spur-bin-upgrade" \
+            -e spur_install_dir=/usr/local/bin -e spur_home=/opt/spur \
+            -e spur_accounting_enabled=false -e spur_auth_enabled=true \
+            -e spur_in_place_upgrade=true -e spur_overwrite_conf=false \
+            -e spur_verify_enabled=true -e spur_verify_submit_user=ciuser
+
+      - name: Assert native auth, all binaries, PMIx and systemd were reconciled
+        run: python3 .github/scripts/upgrade_convergence.py after "$GITHUB_WORKSPACE/spur-bin-upgrade" --auth
 
       - name: Assert RBAC — normal user denied drain, admin (root) allowed
         run: |

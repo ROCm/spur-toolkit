@@ -176,10 +176,13 @@
   changed_when: false
   when: inventory_hostname in spur_wg_joiners
 
-- name: Capture joiner pubkey
+- name: Publish the public key already read during init or join
+  vars:
+    spur_wireguard_public_key: "{{ wg_ctl_pubkey if inventory_hostname == spur_wg_bootstrap else wg_agent_pubkey }}"
   ansible.builtin.set_fact:
-    spur_wg_pubkey: "{{ wg_agent_pubkey.stdout | trim }}"
-  when: inventory_hostname in spur_wg_joiners
+    spur_wg_pubkey: "{{ spur_wireguard_public_key.stdout | trim }}"
+    spur_wg_selfkey: "{{ spur_wireguard_public_key.stdout | trim }}"
+  when: spur_wireguard_public_key.stdout is defined
 
 # Only joiners in THIS play have a pubkey — add_nodes.yml runs just the new node, so existing
 # nodes have no spur_wg_pubkey in hostvars. Register only those that joined this run.
@@ -209,17 +212,6 @@
 # so `net mesh` programs the remaining node<->node tunnels from a shared membership doc. Built only
 # from members whose pubkey is known this play (spur_wg_selfkey), so it never errors on a node that
 # didn't run. Gated on >1 controller so single-controller clusters are unchanged.
-- name: Read this node's own WG public key (all mesh members)
-  ansible.builtin.command: "wg show {{ spur_wg_interface }} public-key"
-  register: wg_selfkey
-  changed_when: false
-  when: groups['spur_controllers'] | length > 1
-
-- name: Publish own pubkey as a hostvar
-  ansible.builtin.set_fact:
-    spur_wg_selfkey: "{{ wg_selfkey.stdout | trim }}"
-  when: groups['spur_controllers'] | length > 1
-
 - name: Build the set of mesh members whose pubkey is known this play
   # selectattr on spur_wg_selfkey so a node that did NOT run in this play (e.g.
   # the non-bootstrap controllers during add_nodes.yml) is excluded rather than

@@ -1,8 +1,7 @@
 ---
 # Read-only health check for a running Spur cluster. Safe to run anytime — it
-# only inspects state, never changes it. Every probe is failed_when:false so one
-# unhealthy host doesn't abort the report; each play asserts its own hosts at
-# the end (ansible-playbook exits non-zero if any assert fails, so the overall
+# only inspects state, never changes it. Probes return all findings in one
+# remote call per host; each play asserts its own hosts at the end (ansible-playbook exits non-zero if any assert fails, so the overall
 # run still fails when anything is unhealthy — no separate summary pass needed).
 #
 # Run:
@@ -16,250 +15,73 @@
   become: true
   gather_facts: no
   tasks:
-    - name: spurctld active?
-      ansible.builtin.command: systemctl is-active spurctld
-      register: hc_ctld
-      changed_when: false
-      failed_when: false
+    - name: Collect controller health in one remote call
+      spur_health:
+        role: controller
+        port: "{{ spur_controller_port }}"
+        install_dir: "{{ spur_install_dir }}"
+        home: "{{ spur_home }}"
+        auth: "{{ spur_auth_enabled | default(false) | bool }}"
+        cluster: "{{ spur_cluster_name }}"
+        key_dir: "{{ spur_auth_key_dir }}"
+        accounting: "{{ spur_accounting_enabled | default(true) | bool }}"
+      register: hc_result
 
-    - name: Controller reachable + leader elected? (spur nodes)
-      ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
-      register: hc_nodes
-      changed_when: false
-      failed_when: false
-
-    - name: Job queue reachable? (spur queue)
-      ansible.builtin.command: "{{ spur_install_dir }}/spur queue"
-      register: hc_queue
-      changed_when: false
-      failed_when: false
-
-    - name: Accounting reachable? (sacct — only when enabled)
-      ansible.builtin.command: "{{ spur_install_dir }}/sacct --limit 1"
-      register: hc_sacct
-      changed_when: false
-      failed_when: false
-      when: spur_accounting_enabled | default(true) | bool
-
-    - name: spurauthd active? (native auth)
-      ansible.builtin.command: systemctl is-active spurauthd
-      register: hc_ctl_authd
-      changed_when: false
-      failed_when: false
-      when: spur_auth_enabled | default(false) | bool
-
-    - name: Auth mint socket + auth.jwks present? (native auth)
-      ansible.builtin.shell: |
-        set +e
-        probs=""
-        [ -S "/run/spur/{{ spur_cluster_name }}/auth.sock" ] || probs="$probs no-mint-socket"
-        [ -f "{{ spur_auth_key_dir }}/auth.jwks" ] || probs="$probs no-auth.jwks"
-        echo "$probs"
-      args:
-        executable: /bin/bash
-      register: hc_ctl_auth
-      changed_when: false
-      failed_when: false
-      when: spur_auth_enabled | default(false) | bool
-
-    - name: Raft/state dir size + free disk under spur_home
-      ansible.builtin.shell: |
-        set +e
-        avail_kb=$(df -Pk "{{ spur_home }}" 2>/dev/null | awk 'NR==2{print $4}')
-        state_sz=$(du -sh "{{ spur_home }}/state" 2>/dev/null | awk '{print $1}')
-        echo "state=${state_sz:-n/a} free=$(( ${avail_kb:-0} / 1024 ))MB"
-        # Warn if <1GB free where spur_home lives.
-        [ "${avail_kb:-0}" -lt 1048576 ] && echo "LOW_DISK"
-        exit 0
-      args:
-        executable: /bin/bash
-      register: hc_disk
-      changed_when: false
-      failed_when: false
-
-    - name: Controller findings
-      ansible.builtin.set_fact:
-        hc_problems: >-
-          {{ (hc_ctld.stdout | default('') != 'active') | ternary(['spurctld not active'], [])
-             + (hc_nodes.rc != 0) | ternary(['`spur nodes` failed (controller/leader down?)'], [])
-             + (hc_nodes.rc == 0 and (hc_nodes.stdout | regex_search('no leader|not the Raft leader'))) | ternary(['no Raft leader elected'], [])
-             + (hc_queue.rc != 0) | ternary(['`spur queue` failed'], [])
-             + ((spur_accounting_enabled | default(true) | bool) and (hc_sacct.rc | default(0) != 0)) | ternary(['accounting/sacct unreachable'], [])
-             + (hc_disk.stdout is search('LOW_DISK')) | ternary(['low disk (<1GB free) under ' ~ spur_home], [])
-             + ((spur_auth_enabled | default(false) | bool) and ((hc_ctl_authd.stdout | default('')) != 'active')) | ternary(['spurauthd not active'], [])
-             + ((spur_auth_enabled | default(false) | bool) and ((hc_ctl_auth.stdout | default('') | trim) | length > 0)) | ternary(['auth:' ~ (hc_ctl_auth.stdout | default('') | trim)], []) }}
-
-    - name: Per-host status
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}:
-          {{ (hc_problems | length == 0) | ternary('OK', (hc_problems | join('; '))) }}
-
-    - name: Fail if this host reported a problem
+    - name: Report controller health
       ansible.builtin.assert:
-        that:
-          - hc_problems | length == 0
-        fail_msg: "{{ inventory_hostname }}: {{ hc_problems | join('; ') }}"
-        quiet: true
+        that: hc_result.problems | length == 0
+        success_msg: "{{ inventory_hostname }}: OK"
+        fail_msg: "{{ inventory_hostname }}: {{ hc_result.problems | join('; ') }}"
 
 - name: Agent health
   hosts: spur_agents
   become: true
   gather_facts: no
-  # Skip unreachable agents when spur_ignore_unreachable_agents=true (they're
-  # simply not reported); a reachable-but-unhealthy agent still fails its own
-  # assert below without aborting the check of the rest of the fleet.
   ignore_unreachable: "{{ spur_ignore_unreachable_agents | default(false) | bool }}"
   tasks:
-    - name: spurd active?
-      ansible.builtin.command: systemctl is-active spurd
-      register: hc_spurd
-      changed_when: false
-      failed_when: false
-
-    - name: Agent port {{ spur_agent_port }} listening?
-      ansible.builtin.wait_for:
+    - name: Collect agent health in one remote call
+      spur_health:
+        role: agent
+        install_dir: "{{ spur_install_dir }}"
+        home: "{{ spur_home }}"
         port: "{{ spur_agent_port }}"
-        host: "127.0.0.1"
-        timeout: 3
-      register: hc_port
-      failed_when: false
+        auth: "{{ spur_auth_enabled | default(false) | bool }}"
+        cluster: "{{ spur_cluster_name }}"
+        key_dir: "{{ spur_auth_key_dir }}"
+        cgroup: "{{ (spur_cgroup_manage | default(true) | bool) and (spur_cgroup_enabled | default(true) | bool) }}"
+        require_stepd: "{{ spur_require_stepd | default(false) | bool }}"
+      register: hc_result
 
-    - name: spurauthd active? (native auth)
-      ansible.builtin.command: systemctl is-active spurauthd
-      register: hc_authd
-      changed_when: false
-      failed_when: false
-      when: spur_auth_enabled | default(false) | bool
-
-    - name: Auth mint socket + auth.jwks present? (native auth)
-      ansible.builtin.shell: |
-        set +e
-        probs=""
-        [ -S "/run/spur/{{ spur_cluster_name }}/auth.sock" ] || probs="$probs no-mint-socket"
-        [ -f "{{ spur_auth_key_dir }}/auth.jwks" ] || probs="$probs no-auth.jwks"
-        echo "$probs"
-      args:
-        executable: /bin/bash
-      register: hc_agent_auth
-      changed_when: false
-      failed_when: false
-      when: spur_auth_enabled | default(false) | bool
-
-    - name: cgroup v2 ready? (native-host job enforcement)
-      ansible.builtin.shell: |
-        set +e
-        probs=""
-        [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ] || probs="not-cgroup2"
-        if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
-          grep -qw memory /sys/fs/cgroup/cgroup.controllers || probs="$probs no-memory-controller"
-        fi
-        echo "${probs:-OK}"
-      args:
-        executable: /bin/bash
-      register: hc_cgroup
-      changed_when: false
-      failed_when: false
-      when:
-        - spur_cgroup_manage | default(true) | bool
-        - spur_cgroup_enabled | default(true) | bool
-
-    # Only probed when the operator has said this build ships spurstepd — a
-    # build that predates it has none, and reporting every such cluster as
-    # unhealthy would be noise. Where it IS expected, its absence fails every
-    # job launch on the node, which is squarely a health problem: spurd
-    # resolves it beside its own executable and never searches $PATH.
-    - name: spurstepd installed beside spurd?
-      ansible.builtin.stat:
-        path: "{{ spur_install_dir }}/spurstepd"
-      register: hc_stepd
-      failed_when: false
-      when: spur_require_stepd | default(false) | bool
-
-    - name: Raft/state dir size + free disk under spur_home
-      ansible.builtin.shell: |
-        set +e
-        avail_kb=$(df -Pk "{{ spur_home }}" 2>/dev/null | awk 'NR==2{print $4}')
-        state_sz=$(du -sh "{{ spur_home }}/state" 2>/dev/null | awk '{print $1}')
-        echo "state=${state_sz:-n/a} free=$(( ${avail_kb:-0} / 1024 ))MB"
-        # Warn if <1GB free where spur_home lives.
-        [ "${avail_kb:-0}" -lt 1048576 ] && echo "LOW_DISK"
-        exit 0
-      args:
-        executable: /bin/bash
-      register: hc_disk
-      changed_when: false
-      failed_when: false
-
-    # An ignored-unreachable host still gets a registered var per probe (its
-    # ansible "unreachable" result dict, not the probe's real output) — gate on
-    # that flag so it's reported as skipped instead of falsely "unhealthy".
-    - name: Agent findings
-      ansible.builtin.set_fact:
-        hc_problems: >-
-          {{ (hc_spurd.stdout | default('') != 'active') | ternary(['spurd not active'], [])
-             + (hc_port.failed | default(false)) | ternary(['agent port ' ~ spur_agent_port ~ ' not listening'], [])
-             + ((spur_require_stepd | default(false) | bool) and not (hc_stepd.stat.exists | default(false))) | ternary(['spurstepd missing from ' ~ spur_install_dir ~ ' (every job launch here will fail)'], [])
-             + (hc_disk.stdout | default('') is search('LOW_DISK')) | ternary(['low disk (<1GB free) under ' ~ spur_home], [])
-             + ((spur_auth_enabled | default(false) | bool) and ((hc_authd.stdout | default('')) != 'active')) | ternary(['spurauthd not active'], [])
-             + ((spur_auth_enabled | default(false) | bool) and ((hc_agent_auth.stdout | default('') | trim) | length > 0)) | ternary(['auth:' ~ (hc_agent_auth.stdout | default('') | trim)], [])
-             + (((spur_cgroup_manage | default(true) | bool) and (spur_cgroup_enabled | default(true) | bool)) and ((hc_cgroup.stdout | default('OK') | trim) != 'OK')) | ternary(['cgroup:' ~ (hc_cgroup.stdout | default('') | trim)], []) }}
-      when: not (hc_spurd.unreachable | default(false))
-
-    - name: Per-host status
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}:
-          {{ (hc_problems | length == 0) | ternary('OK', (hc_problems | join('; '))) }}
-      when: not (hc_spurd.unreachable | default(false))
+    - name: Report agent health
+      ansible.builtin.assert:
+        that: hc_result.problems | length == 0
+        success_msg: "{{ inventory_hostname }}: OK"
+        fail_msg: "{{ inventory_hostname }}: {{ hc_result.problems | join('; ') }}"
+      when: not (hc_result.unreachable | default(false))
 
     - name: Note unreachable agent was skipped
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }}: SKIPPED (unreachable, spur_ignore_unreachable_agents=true)"
-      when: hc_spurd.unreachable | default(false)
-
-    - name: Fail if this host reported a problem
-      ansible.builtin.assert:
-        that:
-          - hc_problems | length == 0
-        fail_msg: "{{ inventory_hostname }}: {{ hc_problems | join('; ') }}"
-        quiet: true
-      when: not (hc_spurd.unreachable | default(false))
+      when: hc_result.unreachable | default(false)
 
 - name: Accounting host (PostgreSQL) health
-  hosts: "{{ spur_accounting_host | default(groups['spur_accounting_node'][0] if (groups['spur_accounting_node'] | default([]) | length > 0) else groups['spur_controllers'][0]) }}"
+  hosts: >-
+    {%- set acct = spur_accounting_host | default(groups['spur_accounting_node'][0]
+        if (groups['spur_accounting_node'] | default([]) | length > 0)
+        else groups['spur_controllers'][0]) -%}
+    {{ acct if (hostvars[acct].spur_accounting_enabled | default(true) | bool) else 'all:!all' }}
   become: true
   gather_facts: no
   tasks:
-    - name: postgresql active + accepting connections?
-      ansible.builtin.shell: |
-        set +e
-        systemctl is-active postgresql >/dev/null 2>&1 || { echo "postgresql not active"; exit 0; }
-        command -v pg_isready >/dev/null 2>&1 && ! pg_isready -q && echo "postgresql not accepting connections (pg_isready)"
-        exit 0
-      args:
-        executable: /bin/bash
-      register: hc_pg
-      changed_when: false
-      failed_when: false
-      when: spur_accounting_enabled | default(true) | bool
+    - name: Collect PostgreSQL health
+      spur_health:
+        role: accounting
+        install_dir: "{{ spur_install_dir }}"
+        home: "{{ spur_home }}"
+      register: hc_result
 
-    - name: Accounting-host findings
-      ansible.builtin.set_fact:
-        hc_problems: >-
-          {{ (hc_pg.stdout | default('') | trim | length > 0) | ternary([hc_pg.stdout | default('') | trim], []) }}
-      when: spur_accounting_enabled | default(true) | bool
-
-    - name: Per-host status
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}:
-          {{ (hc_problems | default([]) | length == 0) | ternary('OK', (hc_problems | default([]) | join('; '))) }}
-
-    - name: Fail if this host reported a problem
+    - name: Report accounting health
       ansible.builtin.assert:
-        that:
-          - hc_problems | default([]) | length == 0
-        fail_msg: "{{ inventory_hostname }}: {{ hc_problems | default([]) | join('; ') }}"
-        quiet: true
-      when: spur_accounting_enabled | default(true) | bool
+        that: hc_result.problems | length == 0
+        success_msg: "{{ inventory_hostname }}: OK"
+        fail_msg: "{{ inventory_hostname }}: {{ hc_result.problems | join('; ') }}"

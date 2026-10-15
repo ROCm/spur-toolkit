@@ -2,31 +2,18 @@
 # Use spur_node_name (set for every agent by the controller role, with an
 # inventory_hostname fallback) rather than ansible_hostname, which is undefined
 # for an agent that was unreachable during the run.
-- name: Wait for agents to register with controller
-  ansible.builtin.shell: |
-    set -e
-    for i in $(seq 1 30); do
-      missing=0
-      for h in {{ groups['spur_agents'] | map('extract', hostvars, 'spur_node_name') | join(' ') }}; do
-        {{ spur_install_dir }}/spur show node "$h" >/dev/null 2>&1 || missing=$((missing+1))
-      done
-      [ "$missing" -eq 0 ] && exit 0
-      sleep 1
-    done
-    echo "timed out: $missing agents still missing"
-    exit 1
-  args:
-    executable: /bin/bash
+- name: Wait for agents to register using one fleet query per attempt
+  spur_node_snapshot:
+    binary: "{{ spur_install_dir }}/spur"
+    expected: "{{ groups['spur_agents'] | map('extract', hostvars, 'spur_node_name') | list }}"
+    timeout: 30
   register: spur_verify_wait
-  changed_when: false
-  # Don't hard-fail: an intentionally-skipped (unreachable) agent will never
-  # register. Report and continue instead of failing the whole verify.
   failed_when: false
 
 - name: Note if some agents never registered
   ansible.builtin.debug:
-    msg: "{{ spur_verify_wait.stdout }}"
-  when: spur_verify_wait.rc != 0
+    msg: "{{ spur_verify_wait.msg | default('Agents still missing: ' ~ (spur_verify_wait.pending | default([]) | join(', '))) }}"
+  when: spur_verify_wait.pending is not defined or spur_verify_wait.pending | length > 0
 
 # Job output lands in spur_home (spurd's WorkingDirectory); sticky 1777 (like
 # /tmp) lets the submit user write there without letting users clobber each other's files.

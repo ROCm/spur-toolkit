@@ -1,0 +1,36 @@
+---
+# CLI configuration is host-local and outside spur_home, so wipe it separately.
+- name: Remove native-auth CLI config (only when -e wipe=true)
+  ansible.builtin.file:
+    path: "{{ spur_auth_conf_dir }}/spur.conf"
+    state: absent
+  when:
+    - spur_auth_enabled | default(false) | bool
+    - (wipe | default(false) | bool)
+    - spur_ok_to_disrupt
+
+# A limited teardown must not wipe a shared key directory used by surviving hosts.
+- name: Remove native-auth keys (only when -e wipe=true; skipped on a shared key dir)
+  ansible.builtin.shell: |
+    rm -f {{ spur_auth_key_dir }}/*.jwks
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+  when:
+    - spur_auth_enabled | default(false) | bool
+    - (wipe | default(false) | bool)
+    - spur_ok_to_disrupt
+    - spur_auth_key_dir == spur_auth_conf_dir
+
+- name: Note native-auth keys were left in place (spur_auth_key_dir looks shared)
+  ansible.builtin.debug:
+    msg: >-
+      {{ spur_auth_key_dir }} differs from spur_auth_conf_dir — treating it as a
+      shared/relocated key location and leaving its *.jwks files in place. Wipe it
+      manually only once you're sure no surviving host still needs those keys.
+  when:
+    - spur_auth_enabled | default(false) | bool
+    - (wipe | default(false) | bool)
+    - spur_ok_to_disrupt
+    - spur_auth_key_dir != spur_auth_conf_dir

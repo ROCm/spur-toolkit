@@ -1,0 +1,31 @@
+---
+- name: Gather facts if missing
+  ansible.builtin.setup:
+    gather_subset: "{{ spur_gather_subset }}"
+  when: ansible_default_ipv4 is not defined
+
+- name: Apply spur_install
+  vars:
+    spur_force_reinstall: true  # noqa var-naming[no-role-prefix]
+  ansible.builtin.include_role:
+    name: spur_install
+
+- name: Apply spur_auth
+  when: spur_auth_enabled | default(false) | bool
+  ansible.builtin.include_role:
+    name: spur_auth
+
+- name: Apply spur_controller
+  vars:
+    spur_controller_skip_conf: "{{ not (spur_overwrite_conf | default(false) | bool) }}"
+    spur_controller_gather_missing_agent_facts: false
+  ansible.builtin.include_role:
+    name: spur_controller
+
+- name: Collect controller verification facts
+  ansible.builtin.include_tasks: collect_verification_facts.yml
+  when: spur_install_staged_artifact is not defined
+  vars:
+    spur_verify_daemon_name: spurctld
+    spur_verify_daemon_port: "{{ spur_controller_port }}"
+    spur_verify_role_label: controller

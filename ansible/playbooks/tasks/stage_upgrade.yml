@@ -1,0 +1,33 @@
+---
+- name: Stage binary bundles before the serial restart window
+  ansible.builtin.copy:
+    src: "{{ item.value.archive }}"
+    dest: "{{ spur_install_dir }}/.spur-upgrade-{{ item.key }}.tar.gz"
+    mode: '0600'
+  loop: "{{ hostvars['localhost'].ru_prepared.artifacts.get(inventory_hostname, {}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: ru_staged
+
+- name: Validate staged archives and service health before the restart window
+  spur_validate_upgrade:
+    role: "{{ item.key }}"
+    auth: "{{ spur_auth_enabled }}"
+    archive: "{{ spur_install_dir }}/.spur-upgrade-{{ item.key }}.tar.gz"
+    manifest: "{{ item.value.manifest }}"
+    stepd_path: "{{ (spur_install_dir ~ '/spurstepd') if item.key == 'agent' else omit }}"
+  loop: "{{ hostvars['localhost'].ru_prepared.artifacts.get(inventory_hostname, {}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: ru_validated
+  when:
+    - not ansible_check_mode
+    - not (ru_staged.unreachable | default(false))
+    - ru_staged.results | default([]) | selectattr('unreachable', 'defined') | selectattr('unreachable') | list | length == 0
+
+- name: Record staging reachability across supported Ansible versions
+  # Ansible 2.14 reports loop unreachability only on individual results.
+  ansible.builtin.set_fact:
+    ru_stage_unreachable: >-
+      {{ ([ru_staged, ru_validated] + (ru_staged.results | default([])) + (ru_validated.results | default([])))
+         | selectattr('unreachable', 'defined') | selectattr('unreachable') | list | length > 0 }}
