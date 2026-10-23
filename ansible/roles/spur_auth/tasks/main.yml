@@ -93,6 +93,10 @@
     mode: "0700"
   delegate_to: localhost
   become: false
+  vars:
+    # Fetch and copy access local keys as the account running Ansible.
+    ansible_connection: local
+    ansible_become: false
   run_once: true
 
 - name: Check which key files already exist on the control node
@@ -102,6 +106,10 @@
   register: spur_auth_local_keys
   delegate_to: localhost
   become: false
+  vars:
+    # Check readability with the same account that will distribute the keys.
+    ansible_connection: local
+    ansible_become: false
   run_once: true
 
 - name: Decide whether key material must be generated

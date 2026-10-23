@@ -3279,7 +3279,8 @@ jobs:
           set -euo pipefail
           source_dir=$(mktemp -d)
           trap 'rm -rf "$source_dir"' EXIT
-          cp -al spur-bin/. "$source_dir/"
+          # /tmp may be a different filesystem from the build directory.
+          cp -a spur-bin/. "$source_dir/"
           rm "$source_dir/spurauthd"
           snapshot() {
             for n in $NODES; do

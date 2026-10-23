@@ -605,6 +605,8 @@ Existing `spur.conf` files remain unchanged unless `spur_overwrite_conf=true`; m
 
 Local archives are cached under `~/.cache/spur-ansible-install` and `~/.cache/spur-ansible-upgrade`; matching archives are validated and reused. Remote `.spur-upgrade-<role>.tar.gz` files remain in `spur_install_dir` for reuse and may be removed between runs. Staged extraction retains ordinary `.bins-*.tar.gz` install caches. Neither cache is cluster state.
 
+Local artifact preparation, build inspection, and auth-key directory checks run as the account launching Ansible, even when inventory enables remote sudo with `ansible_become=true`. That account must be able to read the binary source and read/write `spur_auth_keys_dir`; use an absolute path for an existing keys directory. If a previous run created a root-owned local keys directory, restore ownership to the Ansible account while preserving its keys and restrictive permissions. Command-line extra vars still override task variables: avoid global `-e ansible_become=true`; the plays already enable remote sudo.
+
 Controller query errors in `add_nodes.yml` registration discovery and `remove_nodes.yml` drain polling are fatal, rather than being interpreted as unregistered or busy nodes.
 
 For staged in-place upgrades, `--check` prepares artifacts locally and compares installed files and running daemon hashes without staging remote files or restarting services. It is a binary comparison, not a full provisioning/readiness preview; those checks run when applying the upgrade.

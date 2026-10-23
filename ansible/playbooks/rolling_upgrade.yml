@@ -246,6 +246,10 @@
       delegate_to: localhost
       delegate_facts: true
       become: false
+      vars:
+        # Keep local preparation under the account that reads bundles for upload.
+        ansible_connection: local
+        ansible_become: false
       run_once: true  # noqa run-once -- this play explicitly uses linear strategy
 
     - name: Record the hosts targeted by this upgrade

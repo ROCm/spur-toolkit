@@ -20,6 +20,10 @@
     get_checksum: false
   delegate_to: localhost
   become: false
+  vars:
+    # Inspect the build as the account that prepares its local archive.
+    ansible_connection: local
+    ansible_become: false
   register: ru_src_stepd
   when:
     - spur_binary_src | default('') | length > 0
