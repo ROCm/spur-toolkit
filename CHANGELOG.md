@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/ROCm/spur-toolkit/compare/v0.1.0...v0.1.1) (2026-10-23)
+
+
+### Bug Fixes
+
+* **ansible:** prepare local bundles without inventory sudo ([#61](https://github.com/ROCm/spur-toolkit/issues/61)) ([90bb691](https://github.com/ROCm/spur-toolkit/commit/90bb6916d4862344b04f5f0c2b7b8a9fe2460b57))
+
 ## 0.1.0 (2026-10-15)
 
 
