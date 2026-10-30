@@ -6,6 +6,18 @@
     spur_needs_ctld: "{{ inventory_hostname in groups['spur_controllers'] }}"
     spur_needs_agent_bin: "{{ inventory_hostname in groups['spur_agents'] }}"
 
+    # Older releases omit spurstepd/spurauthd; require them only when requested.
+    # When present, they must match the release alongside the required binaries.
+    spur_needed_bins: >-
+      {{ ['spur']
+         + (['spurctld'] if inventory_hostname in groups['spur_controllers'] else [])
+         + (['spurd'] if inventory_hostname in groups['spur_agents'] else [])
+         + (['spurstepd'] if (inventory_hostname in groups['spur_agents'] and (spur_require_stepd | default(false) | bool)) else [])
+         + (['spurauthd'] if ((spur_auth_enabled | default(false) | bool) and (spur_require_authd | default(false) | bool)) else []) }}
+    spur_optional_bins: >-
+      {{ (['spurstepd'] if (inventory_hostname in groups['spur_agents'] and not (spur_require_stepd | default(false) | bool)) else [])
+         + (['spurauthd'] if ((spur_auth_enabled | default(false) | bool) and not (spur_require_authd | default(false) | bool)) else []) }}
+
 # Check prerequisites and prepare the daemon directories before binaries land.
 - name: Preflight — commands, daemons, ports, existing install, directory layout
   ansible.builtin.shell: |
@@ -27,7 +39,6 @@
       echo "non-spur process(es) on spur ports: $bad"
       exit 1
     fi
-    [ -e "{{ spur_install_dir }}/spur" ] && echo MARKER_EXISTS
     mkdir -p "{{ spur_home }}" "{{ spur_home }}/state" "{{ spur_home }}/log" "{{ spur_home }}/etc"
   args:
     executable: /bin/bash
@@ -95,34 +106,49 @@
     - spur_binary_src | default('') | length > 0
     - spur_install_staged_artifact is not defined
 
+- name: Check installed components against the requested release
+  spur_check_release:
+    install_dir: "{{ spur_install_dir }}"
+    version: "{{ spur_version }}"
+    required_bins: "{{ spur_needed_bins }}"
+    optional_bins: "{{ spur_optional_bins }}"
+  register: spur_release_check
+  when:
+    - not (pf_preflight.unreachable | default(false))
+    - spur_binary_src | default('') | length == 0
+
 - name: Install Spur via upstream installer
   ansible.builtin.shell: |
     set -euo pipefail
     curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh \
-      | INSTALL_DIR={{ spur_install_dir }} bash -s -- {{ spur_version }}
+      | INSTALL_DIR={{ spur_install_dir | quote }} bash -s -- {{ spur_release_check.release | quote }}
   args:
     executable: /bin/bash
   when:
     - not (pf_preflight.unreachable | default(false))
     - spur_binary_src | default('') | length == 0
-    - ('MARKER_EXISTS' not in (pf_preflight.stdout | default(''))) or (spur_force_reinstall | default(false) | bool)
+    - not (spur_release_check.unreachable | default(false))
+    - (spur_release_check.needs_install | default(false)) or (spur_force_reinstall | default(false) | bool)
   register: install_run
   changed_when: install_run.rc == 0
+
+- name: Require installed components to satisfy the requested release
+  spur_check_release:
+    install_dir: "{{ spur_install_dir }}"
+    version: "{{ spur_version }}"
+    required_bins: "{{ spur_needed_bins }}"
+    optional_bins: "{{ spur_optional_bins }}"
+    require_match: true
+  when:
+    - not ansible_check_mode
+    - not (pf_preflight.unreachable | default(false))
+    - spur_binary_src | default('') | length == 0
 
 # Combine extraction, obsolete-component cleanup and CLI symlinks in one remote call.
 # Staged upgrades retain ordinary install caches for the next deploy.
 - name: Extract changed binaries, verify components, and maintain CLI symlinks
   vars:
     spur_install_archive: "{{ spur_install_staged_archive | default(spur_bin_copy.dest | default('')) }}"
-    # spurstepd is only *required* when the operator says this build ships it
-    # (spur_require_stepd) — an older release has none, and a hard requirement
-    # would break those deploys. It's reported either way by the task below.
-    spur_needed_bins: >-
-      {{ ['spur']
-         + (['spurctld'] if spur_needs_ctld else [])
-         + (['spurd'] if spur_needs_agent_bin else [])
-         + (['spurstepd'] if (spur_needs_agent_bin and (spur_require_stepd | default(false) | bool)) else [])
-         + (['spurauthd'] if ((spur_auth_enabled | default(false) | bool) and (spur_require_authd | default(false) | bool)) else []) }}
     # A host moved out of [spur_agents] keeps no agent-side binaries, spurstepd
     # included — it is useless without the spurd that spawns it.
     spur_unneeded_bins: >-

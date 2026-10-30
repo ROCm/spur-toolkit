@@ -3,7 +3,7 @@
 spur_cluster_name: spur-cluster
 
 # Install
-spur_version: latest                # latest | nightly | vX.Y.Z
+spur_version: latest                # latest | nightly | vX.Y.Z (X.Y.Z also accepted)
 spur_install_dir: /usr/local/bin
 spur_home: /root/spur
 
@@ -103,9 +103,8 @@ spur_accounting_db_user: spur
 spur_accounting_db_password: spur
 spur_accounting_db_port: 5432
 
-# Set true (per-run, via -e) to force spur_install to re-pull/re-copy binaries onto
-# a host that already has them — used by rolling_upgrade.yml. deploy.yml leaves
-# this false so a fresh-install re-run doesn't needlessly reinstall.
+# Force an upstream refresh, including latest/nightly; used by rolling_upgrade.yml.
+# Pinned-version mismatches reinstall automatically; local sources use checksums.
 spur_force_reinstall: false
 
 # Tolerate unreachable AGENTS and proceed with the rest (per-run, via -e).

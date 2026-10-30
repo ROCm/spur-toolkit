@@ -71,6 +71,10 @@ You have two options: use a published release, or build the binaries yourself.
 
 **Option A — use a published release (no build needed).** ROCm/spur now publishes releases. Check **https://github.com/ROCm/spur/releases** for the latest tag. If a release covers what you need, just omit `spur_binary_src` and the playbook runs upstream `install.sh` to download the binaries for you. By default it installs `spur_version: latest`; set `nightly` for a build off the mainline branch, or pin a specific `vX.Y.Z`.
 
+For a pinned release, such as `spur_version: v0.15.0` (`0.15.0` also works), deployment checks the CLI and each host's required daemons using `--version`. Missing, unexecutable, or mismatched binaries trigger installation even when `spur` already exists. Optional `spurstepd` and enabled-auth `spurauthd` binaries are checked when present. Deployment fails if the installed components still do not satisfy the pin after the installer returns. A matching installation is reused; `spur_force_reinstall=true` forces a refresh.
+
+The moving channels `latest` and `nightly` retain existing complete installations on reruns; use `spur_force_reinstall=true` to fetch their current build. When `spur_binary_src` is set, the supplied local build takes precedence and is not compared with `spur_version`.
+
 **Option B — build locally** (the Quick start path above). Worth it when you need mainline changes not yet in a tagged release, an air-gapped install, or a custom patch. Build on a machine matching your targets' architecture/libc — the lab targets are Ubuntu 22.04 x86-64. You don't need to match the Rust version by hand: the first time you run `cargo` in the repo, rustup auto-selects the toolchain pinned in `rust-toolchain.toml`.
 
 > Already have Rust from somewhere other than rustup (distro package, asdf, …)? Compare `rustc --version` against `rust-toolchain.toml`'s `channel`. A mismatch can fail the build in ways that don't look version-related.
@@ -471,7 +475,7 @@ Node **token admission** (`[admission] mode = "token"`) is deliberately left `op
 |---|---|---|
 | `spur_cluster_name` | `spur-cluster` | Sets `cluster_name` in `spur.conf`. |
 | `spur_binary_src` | *(unset)* | Local dir of pre-built binaries to push. Leave unset to fetch via upstream `install.sh`. |
-| `spur_version` | `latest` | Which `install.sh` channel to pull: `latest` / `nightly` / `vX.Y.Z`. |
+| `spur_version` | `latest` | Upstream source: `latest` / `nightly` / `vX.Y.Z` (also `X.Y.Z`). Pins are checked against installed component versions; applies only when `spur_binary_src` is unset. |
 | `spur_install_dir` | `/usr/local/bin` | Destination on each managed host for binaries and Slurm symlinks; mode `0755` and added to PATH in `/etc/environment`. Custom parent directories must allow users to traverse them. |
 | `spur_home` | `/root/spur` | Per-host root for state, logs, and config. |
 | `spur_agent_state_dir` | `{{ spur_home }}/agent-state` | Each agent's own runtime state — the `spurstepd` sessions a restarted `spurd` re-adopts. Passed to `spurd` as `SPUR_STEPD_STATE_DIR`. Kept out of `{{ spur_home }}/state` (the controller's Raft dir) so a host running both daemons never shares one. |
@@ -487,7 +491,7 @@ Node **token admission** (`[admission] mode = "token"`) is deliberately left `op
 | `spur_controller_port` / `spur_agent_port` / `spur_raft_port` | `6817` / `6818` / `6821` | Daemon listen ports. |
 | `spur_log_level` | `info` | Daemon log verbosity. |
 | `spur_wipe_state` | `false` | Wipe `~/spur/state` (Raft job queue/registrations) on (re)deploy. Safe default for re-runs and upgrades; set `true` for a fresh install or intentional Raft reinit. |
-| `spur_force_reinstall` | `false` | Re-pull/re-copy binaries via `spur_install` even if already present. Used by `rolling_upgrade.yml`. |
+| `spur_force_reinstall` | `false` | Re-fetch upstream binaries even if already satisfactory; refreshes `latest` / `nightly`. Pinned-version mismatches reinstall automatically. Used by `rolling_upgrade.yml`. Local sources converge by checksum. |
 | `spur_rolling_batch_size` | `1` | Agents upgraded per batch in `rolling_upgrade.yml` (`serial`). Controllers always upgrade one at a time regardless. |
 | `spur_controller_upgrade_order` | inventory order | Comma-separated controller names — upgrade them in this order instead of `[spur_controllers]`'s inventory order. Must name every controller exactly once; `rolling_upgrade.yml` fails fast otherwise. |
 | `spur_ignore_unreachable_agents` | `false` | Skip agents unreachable over SSH instead of aborting — `deploy.yml` (all plays, including WireGuard mesh setup and native-auth provisioning), `rolling_upgrade.yml`, `healthcheck.yml`, `teardown.yml`, `add_nodes.yml`, `remove_nodes.yml`. In `rolling_upgrade.yml`, reachable-host failures (including busy refusals) and controller query failures stop subsequent batches with a nonzero exit. Never loosens controller/accounting-host reachability. |
