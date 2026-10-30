@@ -122,7 +122,7 @@ python3 -m pip install --user netaddr
 
 Target hosts need: SSH reachable, sudo or root, `systemd`, and — only for the `install.sh` fallback — `curl` + `tar`.
 
-- Every play runs with `become: true`, so a non-root `ansible_user` with passwordless sudo (or `ansible_become_password` supplied) works the same as `ansible_user=root`. This is required: `spur_home`/`spur_install_dir` default under `/root`, which a non-root user can't write to without becoming root.
+- Every play runs with `become: true`, so a non-root `ansible_user` with passwordless sudo (or `ansible_become_password` supplied) works the same as `ansible_user=root`. Installation needs root to manage system services, write binaries to `/usr/local/bin`, and maintain the daemon state under `spur_home` (default `/root/spur`). Ordinary users can execute the installed CLI.
 - Password-based SSH works too — set `ansible_user`/`ansible_password` (via `sshpass`) in `[all:vars]` or per-host. `ansible.cfg` deliberately omits `-o BatchMode=yes`. That flag suppresses SSH's password prompt outright and silently breaks password auth even when `sshpass` is supplying the answer.
 
 ---
@@ -472,7 +472,7 @@ Node **token admission** (`[admission] mode = "token"`) is deliberately left `op
 | `spur_cluster_name` | `spur-cluster` | Sets `cluster_name` in `spur.conf`. |
 | `spur_binary_src` | *(unset)* | Local dir of pre-built binaries to push. Leave unset to fetch via upstream `install.sh`. |
 | `spur_version` | `latest` | Which `install.sh` channel to pull: `latest` / `nightly` / `vX.Y.Z`. |
-| `spur_install_dir` | `/root/.local/bin` | Where binaries and Slurm symlinks land (added to `/etc/environment`). |
+| `spur_install_dir` | `/usr/local/bin` | Destination on each managed host for binaries and Slurm symlinks; mode `0755` and added to PATH in `/etc/environment`. Custom parent directories must allow users to traverse them. |
 | `spur_home` | `/root/spur` | Per-host root for state, logs, and config. |
 | `spur_agent_state_dir` | `{{ spur_home }}/agent-state` | Each agent's own runtime state — the `spurstepd` sessions a restarted `spurd` re-adopts. Passed to `spurd` as `SPUR_STEPD_STATE_DIR`. Kept out of `{{ spur_home }}/state` (the controller's Raft dir) so a host running both daemons never shares one. |
 | `spur_require_stepd` | `false` | Treat a missing `spurstepd` as a hard failure in `spur_install` and a reported problem in `healthcheck.yml`. Default `false` because builds that predate it ship none; set `true` on a cluster whose build does. |
@@ -535,6 +535,8 @@ The day-2 admin playbooks take their own inputs — `spur_accounts` / `spur_qos`
 ---
 
 ## Upgrading
+
+**Existing install paths:** the default `spur_install_dir` is now `/usr/local/bin`. If your cluster uses the previous `/root/.local/bin` default, explicitly retain `spur_install_dir: /root/.local/bin` in inventory for upgrades and admin commands until you plan a path migration. Rolling upgrades check the existing CLI before installing anything; changing this variable alone does not migrate an installation. A retained path under a private `/root` remains inaccessible to ordinary users.
 
 Two ways to roll out newer binaries. Pick based on whether the cluster can take a full-daemon bounce or needs to keep running jobs throughout.
 
@@ -672,7 +674,7 @@ systemctl status postgresql        # on the accounting host
 journalctl -u spurctld -f          # follow logs
 ```
 
-The binaries are on your `PATH` (via `/etc/environment`), so the everyday cluster commands just work:
+The install role adds the binary directory to `PATH` in `/etc/environment`, preserving existing entries and using standard system directories if PATH is missing or empty. Start a new login session to pick up the change; existing shells keep their previous PATH. With the default `/usr/local/bin` destination, ordinary users can run the everyday cluster commands:
 
 ```bash
 spur nodes        # partition/node summary

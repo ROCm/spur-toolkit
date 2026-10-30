@@ -20,7 +20,7 @@ Defaults (override only if the user asks):
 | Var | Default |
 |---|---|
 | `SPUR_HOME` | `/root/spur` |
-| `SPUR_INSTALL_DIR` | `/root/.local/bin` |
+| `SPUR_INSTALL_DIR` | `/usr/local/bin` |
 | `SPUR_VERSION` | `latest` (passed to `install.sh`; or `nightly` / `vX.Y.Z`) |
 | `SPUR_BINARY_SRC` | *(empty)* — local dir with pre-built `spur`/`spurctld`/`spurd` and optionally `spur_mpi_pmix.so`; used when set, else `install.sh` |
 | `SPUR_MPI_PLUGIN_DIR` | `/usr/lib/spur` — where `spur_mpi_pmix.so` is installed on **agents** (matches `spurd` default) |
@@ -37,10 +37,12 @@ Defaults (override only if the user asks):
 | `ROLLING_BATCH_SIZE` | `1` (agents upgraded per batch in Step 12; controllers are always one at a time) |
 | SSH user | `root` (unless the user specifies otherwise) |
 
-> Every command below is written to work whether the SSH user is `root` or a non-root user with (passwordless) `sudo` — confirm `sudo -n true` succeeds during Step 1's preflight. `SPUR_HOME`/`SPUR_INSTALL_DIR` default under `/root`, which is mode `0700`: a non-root user cannot even `cd`/execute/`test -x` into it, let alone write there, and **no `chown` of a subdirectory fixes this** (the block is on traversing `/root` itself). So:
+> Every command below is written to work whether the SSH user is `root` or a non-root user with (passwordless) `sudo` — confirm `sudo -n true` succeeds during Step 1's preflight. Binaries default to `/usr/local/bin` so ordinary users can execute them. `SPUR_HOME` still defaults under `/root`, which is normally mode `0700`: a non-root user cannot traverse it, and changing a subdirectory's ownership does not fix that. So:
 > - Every remote command that reads/writes under `/root`, `/etc/systemd/system`, or runs `spur`/`sbatch`/`sacct`/etc. must be `sudo`-prefixed — not just the file-writing steps. This applies uniformly (as root, `sudo` is a harmless no-op).
 > - `scp` and heredoc redirects (`cat > /path <<EOF`) run as the plain SSH user and cannot land a file directly under `/root` even with the SSH user later `sudo`-reading it. Copy to `/tmp` first, then `sudo install`/`sudo mv` it into place.
-> - Alternatively, set `SPUR_INSTALL_DIR`/`SPUR_HOME` to a world-traversable path (e.g. `/opt/spur`) up front to sidestep all of this — but then every install/`sudo` note below is still harmless, just unnecessary.
+> - Custom install directories must have traversable parents for ordinary users to execute the CLI. Keep daemon state private; do not open `/root` to make binaries accessible.
+>
+> For an existing cluster, retain its current `SPUR_INSTALL_DIR` during upgrades. A cluster using the previous `/root/.local/bin` default needs that explicit override until a path migration is planned.
 >
 > **Password-based SSH works too** — every `ssh`/`scp` command in this skill is a plain invocation with no auth-method assumptions baked in, so if key-based auth isn't set up, prefix each one with `sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no ...` (and the `scp` equivalent). Do **not** add `-o BatchMode=yes` anywhere — it disables SSH's password prompt outright and silently breaks password auth even with `sshpass` supplying the answer.
 
@@ -85,7 +87,7 @@ ACCOUNTING=true                                      # or false
 ACCT_HOST="${CONTROLLERS[0]}"                         # accounting host: default first controller; may be ANY host — a controller, an agent, or a dedicated node (add it to HOSTS_ALL if dedicated)
 
 SPUR_HOME=/root/spur
-SPUR_INSTALL_DIR=/root/.local/bin
+SPUR_INSTALL_DIR=/usr/local/bin
 SPUR_VERSION=latest
 SPUR_BINARY_SRC=                                     # e.g. /tmp/spur-bin to push pre-built binaries
 SPUR_MPI_PLUGIN_DIR=/usr/lib/spur

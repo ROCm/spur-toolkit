@@ -4,7 +4,7 @@ spur_cluster_name: spur-cluster
 
 # Install
 spur_version: latest                # latest | nightly | vX.Y.Z
-spur_install_dir: /root/.local/bin
+spur_install_dir: /usr/local/bin
 spur_home: /root/spur
 
 # spurstepd — the per-(job, step) supervisor spurd spawns. It MUST sit in the

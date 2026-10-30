@@ -9,7 +9,7 @@ set -uo pipefail
 umask 077
 
 SPUR_HOME="${SPUR_HOME:-/root/spur}"
-SPUR_INSTALL_DIR="${SPUR_INSTALL_DIR:-/root/.local/bin}"
+SPUR_INSTALL_DIR="${SPUR_INSTALL_DIR:-/usr/local/bin}"
 # Deployments that don't follow the $SPUR_HOME/{etc,state} layout (e.g. FHS
 # installs with config in /etc/spur and state in /var/lib/...) can override
 # these two directly instead of via SPUR_HOME.

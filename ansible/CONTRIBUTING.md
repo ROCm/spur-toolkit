@@ -11,6 +11,7 @@ These are hard-won findings from validation: real bugs and non-obvious Spur/Ansi
 - **Stop-before-wipe ordering.** The controller role stops spurctld *before* wiping `~/spur/state`, so the daemon can't rewrite the Raft log mid-delete.
 
 ## Install
+- **System PATH is managed by `spur_configure_path`.** `/etc/environment` may be missing, empty, or use quoted/unquoted assignments. Compare exact colon-separated entries, preserve unrelated settings, and propagate failures; a successful `sed` exit does not prove it changed anything. The module also sets the install directory to `0755`, without opening private parent directories.
 - **`spur --version` is not a supported flag** — it errors. The roles check for the binary with `stat`, not by running `--version`.
 - **All 18 Slurm-compat symlink names** the `spur` multi-call binary recognizes via argv[0] dispatch are created regardless of install source: `sbatch`, `squeue`, `sinfo`, `scancel`, `sacct`, `sacctmgr`, `scontrol`, `salloc`, `srun`, `sattach`, `scrontab`, `sdiag`, `smd`, `sprio`, `sreport`, `sshare`, `sstat`, `strigger`. Keep this list in sync with upstream's dispatch table if it changes.
 - **`install.sh` and `spur_binary_src` are two interchangeable install sources** — the symlink + verify tasks run identically on both paths. `spur_binary_src` reads only the named files (`spur`/`spurctld`/`spurd`/`spurstepd`) out of the directory, never globs it, so an extra `spurdbd` sitting alongside them is ignored.

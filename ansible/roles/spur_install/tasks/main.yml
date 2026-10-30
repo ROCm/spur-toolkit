@@ -6,10 +6,8 @@
     spur_needs_ctld: "{{ inventory_hostname in groups['spur_controllers'] }}"
     spur_needs_agent_bin: "{{ inventory_hostname in groups['spur_agents'] }}"
 
-# One round-trip for everything read-only up front (commands present,
-# already-running daemons, port conflicts, existing install marker, PATH) plus
-# the directory layout every host needs before binaries land.
-- name: Preflight — commands, daemons, ports, existing install, PATH, directory layout
+# Check prerequisites and prepare the daemon directories before binaries land.
+- name: Preflight — commands, daemons, ports, existing install, directory layout
   ansible.builtin.shell: |
     set +e
     for c in curl tar bash; do
@@ -30,19 +28,17 @@
       exit 1
     fi
     [ -e "{{ spur_install_dir }}/spur" ] && echo MARKER_EXISTS
-    if grep -q "{{ spur_install_dir }}" /etc/environment 2>/dev/null; then
-      echo PATH_ALREADY_SET
-    else
-      sed -Ei 's#^PATH="(.*)"$#PATH="{{ spur_install_dir }}:\1"#' /etc/environment 2>/dev/null
-      echo PATH_UPDATED
-    fi
-    mkdir -p "{{ spur_home }}" "{{ spur_home }}/state" "{{ spur_home }}/log" "{{ spur_home }}/etc" "{{ spur_install_dir }}"
-    exit 0
+    mkdir -p "{{ spur_home }}" "{{ spur_home }}/state" "{{ spur_home }}/log" "{{ spur_home }}/etc"
   args:
     executable: /bin/bash
   register: pf_preflight
-  changed_when: "'PATH_UPDATED' in pf_preflight.stdout"
+  changed_when: false
   failed_when: pf_preflight.rc != 0
+
+- name: Configure the install directory and system PATH
+  spur_configure_path:
+    install_dir: "{{ spur_install_dir }}"
+    environment_file: /etc/environment
 
 # An ignored-unreachable host (spur_ignore_unreachable_agents=true) still gets
 # a registered var here — its ansible "unreachable" result dict, which has no

@@ -44,7 +44,7 @@ SSH targets are `user@host`. For password auth, set `SSHPASS` instead of putting
 | `--partial` | off | emit the archive even if some collection steps failed (see below) |
 | `--output <dir>` | cwd | directory the `.tar.gz` is written to |
 
-`$SPUR_HOME` (default `/root/spur`), `$SPUR_INSTALL_DIR` (default `/root/.local/bin`), `$ACCT_DB_NAME`/`$ACCT_DB_PORT` (default `spur`/`5432`) follow the same defaults as `ansible/inventory/group_vars/all.yml` — override them if your cluster used non-default values at deploy time.
+`$SPUR_HOME` (default `/root/spur`), `$SPUR_INSTALL_DIR` (default `/usr/local/bin`), `$ACCT_DB_NAME`/`$ACCT_DB_PORT` (default `spur`/`5432`) follow the same defaults as `ansible/inventory/group_vars/all.yml` — override them if your cluster used non-default values at deploy time. For a cluster installed with the previous binary location, set `SPUR_INSTALL_DIR=/root/.local/bin`.
 
 Deployments that don't put config and state under a common `$SPUR_HOME` (e.g. an FHS-style install with `/etc/spur/spur.conf` and state in `/var/lib/...`) can override those two paths directly instead: `SPUR_CONF` (default `$SPUR_HOME/etc/spur.conf`) and `SPUR_STATE_DIR` (default `$SPUR_HOME/state`).
 
