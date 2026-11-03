@@ -103,12 +103,51 @@ class InstallPathTests(unittest.TestCase):
                 )
                 self.assert_rerun_unchanged()
 
-    def test_existing_exact_entry_keeps_format_and_order(self):
+    def test_existing_leading_entry_keeps_format_and_order(self):
         self.destination.mkdir(mode=0o755)
-        original = f"PATH='/custom/bin:{self.destination}:/bin' # keep\nCUSTOM=keep\n"
+        original = f"PATH='{self.destination}:/custom/bin:/bin' # keep\nCUSTOM=keep\n"
         self.environment.write_text(original)
         self.assert_rerun_unchanged()
         self.assertEqual(self.environment.read_text(), original)
+
+    def test_managed_directory_moves_ahead_of_stale_binaries_and_is_deduplicated(self):
+        old = self.root / "old-bin"
+        old.mkdir()
+        self.destination.mkdir()
+        for directory, version in ((old, "0.14.0"), (self.destination, "0.15.0")):
+            binary = directory / "spur"
+            binary.write_text("#!/bin/sh\necho " + version + "\n")
+            binary.chmod(0o755)
+        self.environment.write_text(
+            f'PATH="{old}:{self.destination}:/bin:{self.destination}"\n'
+        )
+        self.assertTrue(self.run_module()["changed"])
+        value = shlex.split(self.environment.read_text().partition("=")[2])[0]
+        self.assertEqual(value, f"{self.destination}:{old}:/bin")
+        result = subprocess.run(
+            ["spur", "--version"],
+            env=dict(os.environ, PATH=value),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(result.stdout, "0.15.0\n")
+        self.assert_rerun_unchanged()
+
+    def test_private_binary_modes_are_repaired_without_changing_unmanaged_files(self):
+        self.destination.mkdir()
+        binary = self.destination / "spur"
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o700)
+        private = self.destination / "unrelated"
+        private.write_text("private")
+        private.chmod(0o600)
+        self.run_module(binaries=["spur"], _ansible_check_mode=True)
+        self.assertEqual(stat.S_IMODE(binary.stat().st_mode), 0o700)
+        self.assertTrue(self.run_module(binaries=["spur"])["changed"])
+        self.assertEqual(stat.S_IMODE(binary.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600)
+        self.assertFalse(self.run_module(binaries=["spur"])["changed"])
 
     def test_last_path_assignment_is_the_effective_one(self):
         prefix = f'PATH="{self.destination}:/bin"\n'
@@ -210,6 +249,8 @@ class InstallPathTests(unittest.TestCase):
                         "gather_facts": False,
                         "vars": {
                             "spur_install_dir": str(self.destination),
+                            "spur_needed_bins": ["spur"],
+                            "spur_optional_bins": [],
                             "ansible_python_interpreter": sys.executable,
                         },
                         "tasks": [task],

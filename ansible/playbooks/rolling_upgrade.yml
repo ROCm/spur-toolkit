@@ -126,6 +126,11 @@
         - spur_controller_upgrade_order | default('') | length > 0
         - (requested_order | sort) != (groups['spur_controllers'] | sort)
 
+    - name: Guard against an accidental install directory migration
+      spur_check_install_path:
+        install_dir: "{{ spur_install_dir }}"
+      when: spur_install_dir == '/usr/local/bin'
+
     - name: Check the cluster is healthy before starting
       ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
       register: spur_pre_upgrade_health

@@ -1,4 +1,12 @@
 ---
+- name: Guard against an accidental install directory migration
+  spur_check_install_path:
+    install_dir: "{{ spur_install_dir }}"
+    allow_migration: >-
+      {{ (spur_allow_install_dir_migration | default(false) | bool)
+         and (spur_install_path_migration | default(false) | bool) }}
+  when: spur_install_dir == '/usr/local/bin'
+
 - name: Determine which Spur components this host needs
   # Every host this role runs on (controller, agent, or login) gets the `spur`
   # CLI — squeue/sinfo/etc. work locally on any node regardless of spur_transport.
@@ -50,6 +58,7 @@
   spur_configure_path:
     install_dir: "{{ spur_install_dir }}"
     environment_file: /etc/environment
+    binaries: "{{ spur_needed_bins + spur_optional_bins }}"
 
 # An ignored-unreachable host (spur_ignore_unreachable_agents=true) still gets
 # a registered var here — its ansible "unreachable" result dict, which has no
@@ -202,6 +211,13 @@
   register: spur_ver
   changed_when: "'SYMLINKS_UPDATED' in spur_ver.stdout or 'BINARIES_EXTRACTED' in spur_ver.stdout"
   failed_when: spur_ver.rc != 0
+
+- name: Ensure newly installed upstream binaries are accessible to ordinary users
+  spur_configure_path:
+    install_dir: "{{ spur_install_dir }}"
+    environment_file: /etc/environment
+    binaries: "{{ spur_needed_bins + spur_optional_bins }}"
+  when: install_run.changed | default(false)
 
 # Loud, because the failure mode it predicts is total and looks unrelated:
 # spurd resolves spurstepd beside its own executable and never searches $PATH,

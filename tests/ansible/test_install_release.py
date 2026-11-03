@@ -1,5 +1,7 @@
 """Exercise release selection using real modules and isolated install-role runs."""
 
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -7,14 +9,21 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 ANSIBLE = ROOT / "ansible"
 COMPONENTS = ("spur", "spurctld", "spurd", "spurstepd", "spurauthd")
+SPEC = importlib.util.spec_from_file_location(
+    "release", ANSIBLE / "library/spur_check_release.py"
+)
+release = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(release)
 
 
 def binary(directory, name, version="0.15.0", status=0):
@@ -28,6 +37,95 @@ def binary(directory, name, version="0.15.0", status=0):
     )
     path.chmod(0o755)
     return path
+
+
+def legacy_archive(root):
+    source = root / "legacy-source"
+    source.mkdir()
+    for name in COMPONENTS:
+        binary(source, name, "0.14.0")
+    # v0.14.0 helpers reject --version; their bytes must come from the release archive.
+    (source / "spurstepd").write_text(
+        "#!/bin/sh\necho 'usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>' >&2\nexit 1\n"
+    )
+    (source / "spurauthd").write_text(
+        "#!/bin/sh\necho \"error: unexpected argument '--version' found\" >&2\nexit 2\n"
+    )
+    archive = root / "spur-v0.14.0-linux-amd64.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        for path in source.iterdir():
+            bundle.add(path, arcname="spur-v0.14.0-linux-amd64/bin/" + path.name)
+    checksum = Path(str(archive) + ".sha256")
+    checksum.write_text(
+        hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n"
+    )
+    return source, archive
+
+
+class LegacyManifestTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source, self.archive = legacy_archive(self.root)
+        self.destination = self.root / "installed"
+        self.destination.mkdir()
+
+    def download(self, url, destination):
+        expected = (
+            "https://github.com/ROCm/spur/releases/download/v0.14.0/"
+            + self.archive.name
+        )
+        self.assertIn(url, (expected, expected + ".sha256"))
+        shutil.copyfile(
+            Path(str(self.archive) + (".sha256" if url.endswith(".sha256") else "")),
+            destination,
+        )
+
+    def test_verified_archive_is_cached_without_extracting_files(self):
+        with patch.object(release, "download", side_effect=self.download) as download:
+            hashes = release.release_manifest(self.destination, "v0.14.0")
+            self.assertEqual(download.call_count, 2)
+        self.assertEqual(
+            hashes["spurstepd"],
+            hashlib.sha256((self.source / "spurstepd").read_bytes()).hexdigest(),
+        )
+        with patch.object(
+            release,
+            "download",
+            side_effect=AssertionError("must reuse verified receipt"),
+        ):
+            self.assertEqual(
+                release.release_manifest(self.destination, "v0.14.0"), hashes
+            )
+        self.assertEqual(
+            [p.name for p in self.destination.iterdir()], [".spur-release-v0.14.0.json"]
+        )
+
+    def test_corrupt_archive_fails_without_publishing_a_receipt(self):
+        self.archive.write_bytes(b"damaged release archive")
+        with patch.object(release, "download", side_effect=self.download):
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                release.release_manifest(self.destination, "v0.14.0")
+        self.assertEqual(list(self.destination.iterdir()), [])
+
+    def test_missing_checksum_and_network_errors_do_not_trust_installed_files(self):
+        for error in (OSError("offline"), ValueError("checksum download failed")):
+            with self.subTest(error=error), patch.object(
+                release, "download", side_effect=error
+            ):
+                with self.assertRaises(type(error)):
+                    release.release_manifest(self.destination, "v0.14.0")
+        self.assertEqual(list(self.destination.iterdir()), [])
+
+    def test_check_mode_does_not_write_a_receipt_and_damaged_cache_is_rebuilt(self):
+        with patch.object(release, "download", side_effect=self.download):
+            release.release_manifest(self.destination, "v0.14.0", cache=False)
+            self.assertEqual(list(self.destination.iterdir()), [])
+            receipt = self.destination / ".spur-release-v0.14.0.json"
+            receipt.write_text('{"schema": 1, "release": "v0.14.0", "binaries": {}}')
+            hashes = release.release_manifest(self.destination, "v0.14.0")
+        self.assertEqual(json.loads(receipt.read_text())["binaries"], hashes)
 
 
 class ReleaseCheckTests(unittest.TestCase):
@@ -188,9 +286,11 @@ cat "$FIXTURE_INSTALLER"
         shutil.copytree(ANSIBLE / "roles/spur_install", role)
         tasks_file = role / "tasks/main.yml"
         tasks = yaml.safe_load(tasks_file.read_text())
-        next(t for t in tasks if "spur_configure_path" in t)["spur_configure_path"][
-            "environment_file"
-        ] = "{{ spur_home }}/environment"
+        for task in tasks:
+            if "spur_configure_path" in task:
+                task["spur_configure_path"][
+                    "environment_file"
+                ] = "{{ spur_home }}/environment"
         tasks_file.write_text(yaml.safe_dump(tasks))
         self.playbook = self.root / "install.yml"
         self.playbook.write_text(
@@ -213,8 +313,8 @@ cat "$FIXTURE_INSTALLER"
             ansible_become=False,
             ansible_python_interpreter=sys.executable,
             spur_version="0.15.0",
-            **overrides,
         )
+        defaults.update(overrides)
         self.hosts = ["ctl", "worker", "login", "dual"] if fleet else ["dual"]
         for name in self.hosts:
             (self.root / name).mkdir(exist_ok=True)
@@ -320,6 +420,77 @@ cat "$FIXTURE_INSTALLER"
         self.seed("0.15.0")
         self.run_play()
         self.assertTrue(self.downloads.exists())
+
+    def configure_legacy_release(self):
+        source, archive = legacy_archive(self.root)
+        self.env["FIXTURE_RELEASE_ARCHIVE"] = str(archive)
+        self.env["FIXTURE_RELEASE_FETCHES"] = str(self.root / "release-fetches")
+        self.command(
+            "curl",
+            """#!/usr/bin/env python3
+import os, pathlib, shutil, sys
+args = sys.argv[1:]
+if args == ['-fsSL', 'https://raw.githubusercontent.com/ROCm/spur/main/install.sh']:
+    print(pathlib.Path(os.environ['FIXTURE_INSTALLER']).read_text())
+else:
+    archive = pathlib.Path(os.environ['FIXTURE_RELEASE_ARCHIVE'])
+    expected = 'https://github.com/ROCm/spur/releases/download/v0.14.0/' + archive.name
+    assert len(args) == 4 and args[:2] == ['-fsSL', '--output']
+    assert args[3] in (expected, expected + '.sha256')
+    with open(os.environ['FIXTURE_RELEASE_FETCHES'], 'a') as stream:
+        stream.write(args[3] + '\\n')
+    shutil.copyfile(str(archive) + ('.sha256' if args[3].endswith('.sha256') else ''), args[2])
+""",
+        )
+        self.installer.write_text("""#!/bin/bash
+set -eu
+printf '%s %s\\n' "$INSTALL_DIR" "$1" >> "$FIXTURE_DOWNLOADS"
+test "$1" = v0.14.0
+tar -xzf "$FIXTURE_RELEASE_ARCHIVE" --strip-components=2 -C "$INSTALL_DIR"
+""")
+        self.inventory(spur_version="0.14.0", spur_auth_enabled=True)
+        shutil.copytree(source, self.root / "dual/bin")
+        return source
+
+    def test_legacy_helpers_are_verified_by_artifact_and_rerun_offline(self):
+        self.configure_legacy_release()
+        self.run_play()
+        self.assertFalse(self.downloads.exists())
+        self.assertEqual(
+            len((self.root / "release-fetches").read_text().splitlines()), 2
+        )
+        self.command("curl", "#!/bin/sh\necho 'offline' >&2\nexit 22\n")
+        output = self.run_play()
+        self.assertRegex(output, r"dual\s+: ok=\d+\s+changed=0")
+
+    def test_wrong_legacy_helper_reinstalls_then_checks_again(self):
+        source = self.configure_legacy_release()
+        binary(self.root / "dual/bin", "spurstepd", "0.14.0")
+        self.run_play()
+        self.assertTrue(self.downloads.exists())
+        self.assertEqual(
+            (self.root / "dual/bin/spurstepd").read_bytes(),
+            (source / "spurstepd").read_bytes(),
+        )
+
+    def test_legacy_installer_cannot_leave_wrong_helper_bytes(self):
+        self.configure_legacy_release()
+        binary(self.root / "dual/bin", "spurstepd", "0.14.0")
+        self.installer.write_text("#!/bin/sh\nexit 0\n")
+        output = self.run_play(success=False)
+        self.assertIn("does not match the v0.14.0 release artifact", output)
+        self.assertNotIn("Show install result", output)
+
+    def test_matching_private_binaries_are_repaired_without_download(self):
+        self.inventory()
+        self.seed("0.15.0")
+        for name in COMPONENTS:
+            (self.root / "dual/bin" / name).chmod(0o700)
+        self.run_play()
+        self.assertFalse(self.downloads.exists())
+        self.assertEqual((self.root / "dual/bin/spur").stat().st_mode & 0o777, 0o755)
+        output = self.run_play()
+        self.assertRegex(output, r"dual\s+: ok=\d+\s+changed=0")
 
     def test_local_source_overrides_release_pin(self):
         source = self.root / "local-build"

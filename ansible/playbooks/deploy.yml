@@ -49,6 +49,8 @@
   any_errors_fatal: true
   roles:
     - role: spur_install
+      vars:
+        spur_install_path_migration: true
 
 - name: Preflight + install Spur on all hosts (tolerate unreachable agents)
   # A down agent is skipped when spur_ignore_unreachable_agents=true; a down
@@ -61,6 +63,8 @@
   any_errors_fatal: false
   roles:
     - role: spur_install
+      vars:
+        spur_install_path_migration: true
 
 # Gated on the play's hosts: pattern (zero-match skips the whole play with no
 # per-task cost), not a role-level when: — see commit message for the measured
