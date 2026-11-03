@@ -141,6 +141,13 @@
   register: install_run
   changed_when: install_run.rc == 0
 
+- name: Ensure newly installed upstream binaries are accessible to ordinary users
+  spur_configure_path:
+    install_dir: "{{ spur_install_dir }}"
+    environment_file: /etc/environment
+    binaries: "{{ spur_needed_bins + spur_optional_bins }}"
+  when: install_run.changed | default(false)
+
 - name: Require installed components to satisfy the requested release
   spur_check_release:
     install_dir: "{{ spur_install_dir }}"
@@ -211,13 +218,6 @@
   register: spur_ver
   changed_when: "'SYMLINKS_UPDATED' in spur_ver.stdout or 'BINARIES_EXTRACTED' in spur_ver.stdout"
   failed_when: spur_ver.rc != 0
-
-- name: Ensure newly installed upstream binaries are accessible to ordinary users
-  spur_configure_path:
-    install_dir: "{{ spur_install_dir }}"
-    environment_file: /etc/environment
-    binaries: "{{ spur_needed_bins + spur_optional_bins }}"
-  when: install_run.changed | default(false)
 
 # Loud, because the failure mode it predicts is total and looks unrelated:
 # spurd resolves spurstepd beside its own executable and never searches $PATH,

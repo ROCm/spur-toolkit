@@ -547,6 +547,8 @@ The day-2 admin playbooks take their own inputs — `spur_accounts` / `spur_qos`
 
 Installation and rolling-upgrade preflight guard against an accidental switch to the new default: if the old CLI exists and the new CLI is missing, or a managed daemon unit still starts from the old directory, the playbook stops with the required inventory override. To migrate intentionally, drain workloads and run `deploy.yml` with `spur_install_dir=/usr/local/bin` and `spur_allow_install_dir_migration=true` during a maintenance window. Keep `/usr/local/bin` in inventory afterward. This restarts daemons using the new location; old binaries are retained, and each user's existing shell must pick up the updated PATH.
 
+Rolling upgrades check all targeted controllers and agents before any staging, upgrades, or drains, including when `--limit` excludes the first controller. A reachable host's path error always stops the rollout. Unreachable controllers also stop it; unreachable agents are tolerated only when `spur_ignore_unreachable_agents=true`.
+
 Two ways to roll out newer binaries. Pick based on whether the cluster can take a full-daemon bounce or needs to keep running jobs throughout.
 
 | Path | Use when | Downtime |

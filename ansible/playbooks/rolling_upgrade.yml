@@ -85,6 +85,47 @@
 # spur_install role called by the agent play below copies it conditionally
 # (present in the source: install; absent: warn), no special-casing needed.
 
+- name: Validate install paths before any rolling upgrade
+  hosts: spur_controllers:spur_agents
+  become: true
+  gather_facts: false
+  strategy: linear
+  any_errors_fatal: false
+  tasks:
+    - name: Collect each targeted host's install path result
+      spur_check_install_path:
+        install_dir: "{{ spur_install_dir }}"
+      register: ru_install_path_check
+      ignore_errors: true
+      ignore_unreachable: true
+      when: spur_install_dir == '/usr/local/bin'
+
+    # Aggregate on localhost so an unreachable host cannot skip the fatal barrier.
+    - name: Reject failed install path preflight before upgrading or draining
+      ansible.builtin.fail:
+        msg: "{{ ru_install_path_problems | join('; ') }}"
+      vars:
+        ansible_connection: local
+        ansible_become: false
+        ru_install_path_problems: >-
+          {%- set problems = [] -%}
+          {%- for name in ansible_play_hosts_all -%}
+          {%- set h = hostvars[name] -%}
+          {%- set result = h.ru_install_path_check | default({}) -%}
+          {%- if (result.failed | default(false) | bool)
+              or ((result.unreachable | default(false) | bool)
+                  and (name in groups['spur_controllers']
+                       or not (h.spur_ignore_unreachable_agents | default(false) | bool))) -%}
+          {%- set _ = problems.append(name ~ ': ' ~ (result.msg | default('Install path preflight failed'))) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ problems }}
+      delegate_to: localhost
+      become: false
+      run_once: true  # noqa run-once -- this play explicitly uses linear strategy
+      any_errors_fatal: true
+      when: ru_install_path_problems | length > 0
+
 - name: Guard rails — refuse to start against a wipe-flagged or unhealthy cluster
   hosts: spur_controllers[0]
   become: true
@@ -125,11 +166,6 @@
       when:
         - spur_controller_upgrade_order | default('') | length > 0
         - (requested_order | sort) != (groups['spur_controllers'] | sort)
-
-    - name: Guard against an accidental install directory migration
-      spur_check_install_path:
-        install_dir: "{{ spur_install_dir }}"
-      when: spur_install_dir == '/usr/local/bin'
 
     - name: Check the cluster is healthy before starting
       ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"

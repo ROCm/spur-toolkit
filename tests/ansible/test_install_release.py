@@ -492,6 +492,21 @@ tar -xzf "$FIXTURE_RELEASE_ARCHIVE" --strip-components=2 -C "$INSTALL_DIR"
         output = self.run_play()
         self.assertRegex(output, r"dual\s+: ok=\d+\s+changed=0")
 
+    def test_fresh_nonexecutable_install_is_repaired_before_version_verification(self):
+        self.inventory()
+        self.installer.write_text(
+            self.installer.read_text().replace(
+                "binary.chmod(0o755)", "binary.chmod(0o600)"
+            )
+        )
+        self.run_play()
+        for name in ("spur", "spurctld", "spurd", "spurstepd"):
+            self.assertEqual(
+                (self.root / "dual/bin" / name).stat().st_mode & 0o777, 0o755
+            )
+        output = self.run_play()
+        self.assertRegex(output, r"dual\s+: ok=\d+\s+changed=0")
+
     def test_local_source_overrides_release_pin(self):
         source = self.root / "local-build"
         source.mkdir()
