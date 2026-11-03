@@ -851,16 +851,21 @@ class LocalPlaybooks(unittest.TestCase):
         task = next(
             t for t in tasks if t["name"].startswith("Extract changed binaries")
         )
+        components = next(
+            t
+            for t in tasks
+            if t["name"] == "Determine which Spur components this host needs"
+        )
         self.inventory_file(
             {"ctl": {}, "worker": {}},
             spur_binary_src="/unused/local/build",
             spur_bin_copy={"unreachable": True},
-            spur_needs_ctld=False,
-            spur_needs_agent_bin=True,
         )
         playbook = self.root / "unreachable-copy.yml"
         playbook.write_text(
-            yaml.safe_dump([dict(hosts="worker", gather_facts=False, tasks=[task])])
+            yaml.safe_dump(
+                [dict(hosts="worker", gather_facts=False, tasks=[components, task])]
+            )
         )
         self.run_play(playbook, "--check")
 
