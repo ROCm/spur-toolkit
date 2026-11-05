@@ -80,6 +80,7 @@ on:
     paths:
       - 'ansible/**'
       - 'tests/ansible/**'
+      - 'tests/integration/nonroot_upgrade/**'
       - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
       - '.github/scripts/upgrade_convergence.py'
@@ -87,6 +88,7 @@ on:
     paths:
       - 'ansible/**'
       - 'tests/ansible/**'
+      - 'tests/integration/nonroot_upgrade/**'
       - 'techsupport/**'
       - '.github/workflows/playbook-ci.yml'
       - '.github/scripts/upgrade_convergence.py'
@@ -151,6 +153,41 @@ jobs:
           for pb in playbooks/*.yml; do
             ../.venv/bin/ansible-playbook --syntax-check -i inventory/ci.ini \
               -e new_nodes=ctl-0 -e remove_nodes=ctl-0 "$pb"
+          done
+
+  integration-nonroot-upgrade:
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ansible: '2.14.18'
+            ubuntu: '22.04'
+          - ansible: '2.17.14'
+            ubuntu: '24.04'
+          - ansible: '2.19.14'
+            ubuntu: '24.04'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Integration and end-to-end upgrade as ubuntu over SSH and sudo
+        env:
+          ANSIBLE_CORE: ${{ matrix.ansible }}
+          UBUNTU_VERSION: ${{ matrix.ubuntu }}
+        run: |
+          python3 tests/integration/nonroot_upgrade/run.py \
+            --ansible-core "$ANSIBLE_CORE" --ubuntu "$UBUNTU_VERSION"
+      - name: Show scenario logs on failure
+        if: failure()
+        run: |
+          for log in nonroot-upgrade-logs/*.log; do
+            [ -f "$log" ] || continue
+            echo "::group::$log"
+            tail -n 100 "$log"
+            echo '::endgroup::'
           done
 
   # ---------------------------------------------------------------------------
