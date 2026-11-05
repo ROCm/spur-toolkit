@@ -11,6 +11,8 @@ python3 tests/integration/nonroot_upgrade/run.py --logs /tmp/nonroot-upgrade-log
 The driver downloads the published v0.14.0 and v0.15.0 Linux amd64 archives,
 checks their published SHA-256 sums, and builds a test image. Downloads and package
 installation happen during setup; the scenarios use local binary sources.
+The image defaults to `ubuntu`; the driver explicitly uses root to boot systemd
+on the managed hosts and to provision the runner's files before testing.
 No SSH port is published to the host. A generated key is limited to the fixture,
 and known host keys are obtained from the newly created containers. Containers
 and their network are removed in `finally`, including after test failures.

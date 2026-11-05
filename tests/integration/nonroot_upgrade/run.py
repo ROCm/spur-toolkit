@@ -160,7 +160,10 @@ def main():
                     role,
                 ]
                 if role != "runner":
+                    # Only the managed hosts need root to boot systemd.
                     command += [
+                        "--user",
+                        "root",
                         "--privileged",
                         "--cgroupns=host",
                         "-v",
@@ -173,8 +176,8 @@ def main():
                         "/tmp",
                     ]
                 command += [image]
-                if role == "runner":
-                    command += ["sleep", "infinity"]
+                if role != "runner":
+                    command += ["/sbin/init"]
                 nodes.append(name)
                 run(*command)
                 if role != "runner":
@@ -267,6 +270,8 @@ def main():
             run(
                 "docker",
                 "exec",
+                "--user",
+                "root",
                 runner,
                 "install",
                 "-d",
@@ -285,7 +290,15 @@ def main():
                     runner + ":/home/ubuntu/.ssh/" + name,
                 )
             run(
-                "docker", "exec", runner, "chown", "-R", "ubuntu:ubuntu", "/home/ubuntu"
+                "docker",
+                "exec",
+                "--user",
+                "root",
+                runner,
+                "chown",
+                "-R",
+                "ubuntu:ubuntu",
+                "/home/ubuntu",
             )
             run(
                 "docker",

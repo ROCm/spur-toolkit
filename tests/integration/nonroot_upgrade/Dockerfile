@@ -18,4 +18,5 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 ENV container=docker
 ENV PATH=/opt/ansible/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 STOPSIGNAL SIGRTMIN+3
-CMD ["/sbin/init"]
+USER ubuntu
+CMD ["sleep", "infinity"]
