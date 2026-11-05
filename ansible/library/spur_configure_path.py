@@ -30,10 +30,18 @@ def configure_path(content, install_dir):
         if len(words) > 1:
             raise ValueError("PATH must contain one quoted or unquoted value")
         value = (words[0] if words else "") or DEFAULT_PATH
-        if install_dir in value.split(":") and words and words[0]:
+        entries = value.split(":")
+        if (
+            entries[0] == install_dir
+            and entries.count(install_dir) == 1
+            and words
+            and words[0]
+        ):
             return content, before, before
-    if install_dir not in value.split(":"):
-        value = install_dir + ":" + value
+    # The selected installation must win over dangling binaries in earlier entries.
+    value = ":".join(
+        [install_dir] + [entry for entry in value.split(":") if entry != install_dir]
+    )
     if any(character in value for character in '"\r\n\x00'):
         raise ValueError("PATH cannot contain double quotes or line breaks")
     after = 'PATH="' + value + '"\n'
@@ -51,6 +59,12 @@ def main():
         argument_spec={
             "install_dir": {"type": "path", "required": True},
             "environment_file": {"type": "path", "required": True},
+            "binaries": {
+                "type": "list",
+                "elements": "str",
+                "choices": ["spur", "spurctld", "spurd", "spurstepd", "spurauthd"],
+                "default": [],
+            },
         },
         supports_check_mode=True,
     )
@@ -82,6 +96,10 @@ def main():
                 destination.mkdir(mode=0o755, parents=True)
         if destination.exists():
             changed = module.set_mode_if_different(install_dir, 0o755, changed)
+        for name in module.params["binaries"]:
+            binary = destination / name
+            if binary.is_file():
+                changed = module.set_mode_if_different(str(binary), 0o755, changed)
         if updated != content:
             changed = True
             if not module.check_mode:

@@ -5,6 +5,8 @@ spur_cluster_name: spur-cluster
 # Install
 spur_version: latest                # latest | nightly | vX.Y.Z (X.Y.Z also accepted)
 spur_install_dir: /usr/local/bin
+# Only deploy.yml can migrate the former default during a planned restart.
+spur_allow_install_dir_migration: false
 spur_home: /root/spur
 
 # spurstepd — the per-(job, step) supervisor spurd spawns. It MUST sit in the

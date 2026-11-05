@@ -71,7 +71,9 @@ You have two options: use a published release, or build the binaries yourself.
 
 **Option A — use a published release (no build needed).** ROCm/spur now publishes releases. Check **https://github.com/ROCm/spur/releases** for the latest tag. If a release covers what you need, just omit `spur_binary_src` and the playbook runs upstream `install.sh` to download the binaries for you. By default it installs `spur_version: latest`; set `nightly` for a build off the mainline branch, or pin a specific `vX.Y.Z`.
 
-For a pinned release, such as `spur_version: v0.15.0` (`0.15.0` also works), deployment checks the CLI and each host's required daemons using `--version`. Missing, unexecutable, or mismatched binaries trigger installation even when `spur` already exists. Optional `spurstepd` and enabled-auth `spurauthd` binaries are checked when present. Deployment fails if the installed components still do not satisfy the pin after the installer returns. A matching installation is reused; `spur_force_reinstall=true` forces a refresh.
+For a pinned release, such as `spur_version: v0.15.0` (`0.15.0` also works), deployment checks the CLI and each host's required daemons using `--version`. Missing, broken, or mismatched binaries trigger installation even when `spur` already exists. Optional `spurstepd` and enabled-auth `spurauthd` binaries are checked when present. Deployment fails if the installed components still do not satisfy the pin after the installer returns. A matching installation is reused; `spur_force_reinstall=true` forces a refresh.
+
+Before v0.15.0, `spurstepd` and `spurauthd` do not support `--version`. For these helpers, deployment compares SHA-256 hashes against the requested release archive after verifying its published checksum. The first check needs network access to the archive and its `.sha256` file; the verified hashes are cached in `spur_install_dir/.spur-release-vX.Y.Z.json` for subsequent offline runs. Check mode does not create this cache. Missing or invalid release checksums fail verification rather than accepting unverified binaries.
 
 The moving channels `latest` and `nightly` retain existing complete installations on reruns; use `spur_force_reinstall=true` to fetch their current build. When `spur_binary_src` is set, the supplied local build takes precedence and is not compared with `spur_version`.
 
@@ -476,7 +478,8 @@ Node **token admission** (`[admission] mode = "token"`) is deliberately left `op
 | `spur_cluster_name` | `spur-cluster` | Sets `cluster_name` in `spur.conf`. |
 | `spur_binary_src` | *(unset)* | Local dir of pre-built binaries to push. Leave unset to fetch via upstream `install.sh`. |
 | `spur_version` | `latest` | Upstream source: `latest` / `nightly` / `vX.Y.Z` (also `X.Y.Z`). Pins are checked against installed component versions; applies only when `spur_binary_src` is unset. |
-| `spur_install_dir` | `/usr/local/bin` | Destination on each managed host for binaries and Slurm symlinks; mode `0755` and added to PATH in `/etc/environment`. Custom parent directories must allow users to traverse them. |
+| `spur_install_dir` | `/usr/local/bin` | Destination on each managed host for binaries and Slurm symlinks; directory and managed binaries converge to mode `0755`, including existing matching binaries. Placed first in PATH in `/etc/environment`. Custom parent directories must allow users to traverse them. |
+| `spur_allow_install_dir_migration` | `false` | Allow `deploy.yml` to switch an existing installation from the former `/root/.local/bin` default to `/usr/local/bin`. Requires a planned maintenance window; does not remove old binaries or change private parent permissions. Rolling upgrades still require the existing path. |
 | `spur_home` | `/root/spur` | Per-host root for state, logs, and config. |
 | `spur_agent_state_dir` | `{{ spur_home }}/agent-state` | Each agent's own runtime state — the `spurstepd` sessions a restarted `spurd` re-adopts. Passed to `spurd` as `SPUR_STEPD_STATE_DIR`. Kept out of `{{ spur_home }}/state` (the controller's Raft dir) so a host running both daemons never shares one. |
 | `spur_require_stepd` | `false` | Treat a missing `spurstepd` as a hard failure in `spur_install` and a reported problem in `healthcheck.yml`. Default `false` because builds that predate it ship none; set `true` on a cluster whose build does. |
@@ -541,6 +544,10 @@ The day-2 admin playbooks take their own inputs — `spur_accounts` / `spur_qos`
 ## Upgrading
 
 **Existing install paths:** the default `spur_install_dir` is now `/usr/local/bin`. If your cluster uses the previous `/root/.local/bin` default, explicitly retain `spur_install_dir: /root/.local/bin` in inventory for upgrades and admin commands until you plan a path migration. Rolling upgrades check the existing CLI before installing anything; changing this variable alone does not migrate an installation. A retained path under a private `/root` remains inaccessible to ordinary users.
+
+Installation and rolling-upgrade preflight guard against an accidental switch to the new default: if the old CLI exists and the new CLI is missing, or a managed daemon unit still starts from the old directory, the playbook stops with the required inventory override. To migrate intentionally, drain workloads and run `deploy.yml` with `spur_install_dir=/usr/local/bin` and `spur_allow_install_dir_migration=true` during a maintenance window. Keep `/usr/local/bin` in inventory afterward. This restarts daemons using the new location; old binaries are retained, and each user's existing shell must pick up the updated PATH.
+
+Rolling upgrades check all targeted controllers and agents before any staging, upgrades, or drains, including when `--limit` excludes the first controller. A reachable host's path error always stops the rollout. Unreachable controllers also stop it; unreachable agents are tolerated only when `spur_ignore_unreachable_agents=true`.
 
 Two ways to roll out newer binaries. Pick based on whether the cluster can take a full-daemon bounce or needs to keep running jobs throughout.
 
@@ -678,7 +685,7 @@ systemctl status postgresql        # on the accounting host
 journalctl -u spurctld -f          # follow logs
 ```
 
-The install role adds the binary directory to `PATH` in `/etc/environment`, preserving existing entries and using standard system directories if PATH is missing or empty. Start a new login session to pick up the change; existing shells keep their previous PATH. With the default `/usr/local/bin` destination, ordinary users can run the everyday cluster commands:
+The install role puts the binary directory first in `PATH` in `/etc/environment`, removes duplicate entries for that directory, and preserves the relative order of other entries. It uses standard system directories if PATH is missing or empty. Existing managed binaries also get mode `0755` when no download is needed. Start a new login session to pick up the change; existing shells keep their previous PATH, and personal shell startup files can override the system PATH. Use `type -a spur` to check which installation your shell selects. With the default `/usr/local/bin` destination, ordinary users can run the everyday cluster commands:
 
 ```bash
 spur nodes        # partition/node summary
