@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.1](https://github.com/ROCm/spur-toolkit/compare/v0.1.0...v0.1.1) (2026-11-05)
+
+
+### Bug Fixes
+
+* **ansible:** honor release pins and expose installed CLIs ([#63](https://github.com/ROCm/spur-toolkit/issues/63)) ([5ded706](https://github.com/ROCm/spur-toolkit/commit/5ded706bc18adeacdca82a4635ba51281ab9a967))
+* **ansible:** prepare local bundles without inventory sudo ([#61](https://github.com/ROCm/spur-toolkit/issues/61)) ([90bb691](https://github.com/ROCm/spur-toolkit/commit/90bb6916d4862344b04f5f0c2b7b8a9fe2460b57))
+* **ansible:** verify legacy helpers and repair CLI access ([#64](https://github.com/ROCm/spur-toolkit/issues/64)) ([c4a7370](https://github.com/ROCm/spur-toolkit/commit/c4a7370f357fc0ed9e098096733fb8a212bff341))
+
 ## 0.1.0 (2026-10-15)
 
 
